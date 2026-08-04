@@ -1,0 +1,27 @@
+packages:
+  - 'apps/*'
+  - 'services/*'
+  - 'packages/*'
+
+nodeVersion: 24.14.1
+engineStrict: true
+pmOnFail: error
+
+allowBuilds:
+  '@bufbuild/buf': true
+  esbuild: true
+  workerd: true
+
+catalog:
+  '@bufbuild/buf': 1.72.0
+  '@bufbuild/protobuf': 2.13.0
+  '@bufbuild/protoc-gen-es': 2.13.0
+  oxfmt: 0.59.0
+  oxlint: 1.74.0
+  typescript: 7.0.2
+  vite: 8.2.0
+  wrangler: 4.118.0
+
+disallowWorkspaceCycles: true
+saveWorkspaceProtocol: rolling
+strictPeerDependencies: true

@@ -1,0 +1,20 @@
+{
+  "name": "storya",
+  "private": true,
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "check": "pnpm -r --if-present typecheck",
+    "format": "oxfmt -c ./.oxfmtrc.json .",
+    "format:check": "oxfmt -c ./.oxfmtrc.json . --check",
+    "lint": "oxlint -c ./.oxlintrc.json . --deny-warnings"
+  },
+  "devDependencies": {
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:"
+  },
+  "engines": {
+    "node": "24.14.1",
+    "pnpm": "11.20.0"
+  },
+  "packageManager": "pnpm@11.20.0"
+}

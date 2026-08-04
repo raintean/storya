@@ -1,0 +1,24 @@
+.DS_Store
+
+# Rust
+/target/
+
+# Node.js
+node_modules/
+dist/
+
+# Cloudflare Workers
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Generated code
+/packages/storya-protocol/generated/
+/packages/storya-protocol/typescript/generated/
+/services/storya-playback-relay/worker-configuration.d.ts
+
+# Editors
+.idea/
+.vscode/
+*.swp

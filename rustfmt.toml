@@ -1,0 +1,68 @@
+# pantheon 项目的 rustfmt 配置
+
+# ==================== 基础配置 ====================
+edition = "2024"
+style_edition = "2024"
+
+# ==================== 缩进与换行 ====================
+max_width = 100
+tab_spaces = 4
+hard_tabs = false
+indent_style = "Block"
+newline_style = "Auto"
+
+# ==================== 函数与代码块 ====================
+fn_single_line = false
+fn_call_width = 60
+fn_params_layout = "Tall"
+brace_style = "SameLineWhere"
+control_brace_style = "AlwaysSameLine"
+force_multiline_blocks = false
+
+# ==================== 导入与模块 ====================
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# ==================== 字符串与字面量 ====================
+format_strings = false
+use_field_init_shorthand = true
+use_try_shorthand = true
+struct_lit_single_line = true
+struct_lit_width = 18
+array_width = 60
+short_array_element_width_threshold = 10
+hex_literal_case = "Preserve"
+
+# ==================== 逗号与分号 ====================
+trailing_comma = "Vertical"
+trailing_semicolon = true
+match_block_trailing_comma = true
+
+# ==================== Match 表达式 ====================
+match_arm_blocks = true
+match_arm_leading_pipes = "Never"
+
+# ==================== 空格与空白 ====================
+space_after_colon = true
+space_before_colon = false
+spaces_around_ranges = false
+remove_nested_parens = true
+
+# ==================== 注释与文档 ====================
+format_code_in_doc_comments = true
+normalize_comments = false
+normalize_doc_attributes = false
+wrap_comments = false
+
+# ==================== 宏与代码生成 ====================
+format_macro_matchers = true
+format_generated_files = true
+
+# ==================== 布局与空白行 ====================
+single_line_if_else_max_width = 50
+chain_width = 60
+blank_lines_lower_bound = 0
+blank_lines_upper_bound = 1
+empty_item_single_line = true

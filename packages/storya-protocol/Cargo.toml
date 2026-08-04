@@ -1,0 +1,11 @@
+[package]
+name = "storya-protocol"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+prost.workspace = true

@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc", "node"],
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/build/**",
+    "**/coverage/**",
+    "packages/storya-protocol/typescript/generated/**",
+    "services/storya-playback-relay/worker-configuration.d.ts"
+  ]
+}

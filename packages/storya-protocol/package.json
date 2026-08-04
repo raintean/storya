@@ -1,0 +1,23 @@
+{
+  "name": "storya-protocol",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./typescript/index.ts",
+      "import": "./typescript/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "catalog:"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "catalog:",
+    "@bufbuild/protoc-gen-es": "catalog:",
+    "typescript": "catalog:"
+  }
+}
