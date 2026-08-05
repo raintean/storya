@@ -12,7 +12,8 @@ import { WebSocketHttpTransport } from 'storya-transport'
 
 import { VirtualStreamMap } from './virtual-stream-map'
 
-const defaultSource = 'https://v.gsuus.com/play/bkRrAora/index.m3u8'
+const defaultSource =
+  'https://cdn.radiantmediatechs.com/rmp/media/samples-for-rmp-site/04052024-lac-de-bimont/hls/playlist.m3u8'
 
 interface PlaybackMetrics {
   bandwidth: number
