@@ -284,6 +284,7 @@ async function testConnectionDiagnostics(): Promise<void> {
   assert(closed.initiator === 'local', 'WebSocket 主动关闭方记录错误')
   assert(closed.reason === 'max-requests', 'WebSocket 请求次数退休原因记录错误')
   assert(closed.requestCount === 1, 'WebSocket 关闭时请求次数记录错误')
+  assert(closed.error === undefined, 'WebSocket 正常退休不应记录 error')
   transport.destroy()
 }
 

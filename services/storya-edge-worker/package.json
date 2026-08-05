@@ -4,15 +4,19 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:connections": "tsx scripts/connection-storm-benchmark.ts",
     "build": "wrangler deploy --dry-run --outdir dist",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p scripts/tsconfig.json --noEmit"
   },
   "dependencies": {
     "@bufbuild/protobuf": "catalog:",
     "storya-protocol": "workspace:*"
   },
   "devDependencies": {
+    "storya-transport": "workspace:*",
+    "tsx": "catalog:",
     "typescript": "catalog:",
     "wrangler": "catalog:"
   }

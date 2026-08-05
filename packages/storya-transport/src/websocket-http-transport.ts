@@ -236,7 +236,7 @@ export class WebSocketHttpTransport implements HttpTransport {
           this.channels.delete(closed)
           this.emitDebug(closed, 'connection-closed', {
             ...details,
-            error: error.message,
+            ...(details.code === 1000 ? {} : { error: error.message }),
           })
           if (!opened) {
             const pending = this.pending.shift()

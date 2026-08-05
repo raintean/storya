@@ -3,4 +3,13 @@
   "name": "storya-edge-worker",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-05",
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true,
+    },
+  },
 }

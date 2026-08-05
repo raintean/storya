@@ -4,6 +4,7 @@ import {
   encodeTransportFrame,
   HttpResponseHeadSchema,
   HttpRequestHeadSchema,
+  TRANSPORT_FRAME_HEADER_SIZE,
   TransportErrorCode,
   TransportErrorSchema,
   TransportFrameKind,
@@ -12,13 +13,15 @@ import type { HttpRequestHead } from 'storya-protocol'
 
 interface RelayTransaction {
   readonly controller: AbortController
-  reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  reader: ReadableStreamBYOBReader | undefined
   readonly sequence: number
+  readonly startedAt: number
   terminal: boolean
+  transferredBytes: number
 }
 
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-const RESPONSE_FRAME_SIZE = 64 * 1024
+const RESPONSE_FRAME_SIZE = 128 * 1024
 const blockedRequestHeaders = new Set([
   'connection',
   'content-length',
@@ -38,13 +41,13 @@ function json(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), { ...init, headers })
 }
 
-function createTransportResponse(request: Request): Response {
+function createTransportResponse(request: Request, ctx: ExecutionContext): Response {
   const pair = new WebSocketPair()
   const client = pair[0]
   const server = pair[1]
   const clientHeaders = createClientHeaders(request)
-  server.accept()
   server.binaryType = 'arraybuffer'
+  server.accept()
 
   let active: RelayTransaction | undefined
 
@@ -52,17 +55,68 @@ function createTransportResponse(request: Request): Response {
     server.send(encodeTransportFrame(kind, sequence, payload))
   }
 
+  const sendResponseBody = (sequence: number, payload: Uint8Array<ArrayBuffer>): void => {
+    const frame = new Uint8Array(
+      payload.buffer,
+      payload.byteOffset - TRANSPORT_FRAME_HEADER_SIZE,
+      payload.byteLength + TRANSPORT_FRAME_HEADER_SIZE,
+    )
+    frame[0] = TransportFrameKind.RESPONSE_BODY
+    new DataView(frame.buffer, frame.byteOffset, TRANSPORT_FRAME_HEADER_SIZE).setUint32(1, sequence)
+    server.send(frame)
+  }
+
   const sendError = (sequence: number, code: TransportErrorCode, message: string): void => {
     const error = create(TransportErrorSchema, { code, message })
     send(TransportFrameKind.ERROR, sequence, toBinary(TransportErrorSchema, error))
+  }
+
+  const stopActive = async (): Promise<void> => {
+    const transaction = active
+    active = undefined
+    if (transaction === undefined) {
+      return
+    }
+    transaction.terminal = true
+    transaction.controller.abort()
+    try {
+      await transaction.reader?.cancel()
+    } catch {
+      // 上游流可能已经因 WebSocket 关闭而终止
+    }
+  }
+
+  const trackTask = (name: string, task: Promise<void>): void => {
+    ctx.waitUntil(
+      task.catch(async cause => {
+        console.error({
+          activeSequence: active?.sequence,
+          message: cause instanceof Error ? cause.message : String(cause),
+          name,
+          type: 'transport-async-task-error',
+        })
+        await stopActive()
+        if (server.readyState === WebSocket.OPEN) {
+          try {
+            server.close(1011, 'transport task failed')
+          } catch (closeCause) {
+            console.error({
+              message: closeCause instanceof Error ? closeCause.message : String(closeCause),
+              name,
+              type: 'transport-websocket-close-error',
+            })
+          }
+        }
+      }),
+    )
   }
 
   const finish = (transaction: RelayTransaction, kind: TransportFrameKind): void => {
     if (active !== transaction || transaction.terminal) {
       return
     }
-    transaction.terminal = true
     send(kind, transaction.sequence)
+    transaction.terminal = true
     active = undefined
   }
 
@@ -70,8 +124,8 @@ function createTransportResponse(request: Request): Response {
     if (active !== transaction || transaction.terminal) {
       return
     }
-    transaction.terminal = true
     sendError(transaction.sequence, code, message)
+    transaction.terminal = true
     active = undefined
   }
 
@@ -87,10 +141,11 @@ function createTransportResponse(request: Request): Response {
     } catch {
       // 上游流已经结束时不需要再次处理取消错误
     }
-    send(TransportFrameKind.CANCELED, sequence)
-    if (active === transaction) {
-      active = undefined
+    if (active !== transaction) {
+      return
     }
+    send(TransportFrameKind.CANCELED, sequence)
+    active = undefined
   }
 
   const proxy = async (transaction: RelayTransaction, head: HttpRequestHead): Promise<void> => {
@@ -177,22 +232,22 @@ function createTransportResponse(request: Request): Response {
         return
       }
 
-      const reader = response.body.getReader()
+      const reader = response.body.getReader({ mode: 'byob' })
       transaction.reader = reader
-      let transferred = 0
       while (true) {
-        const result = await reader.read()
+        const readBuffer = new Uint8Array(
+          new ArrayBuffer(TRANSPORT_FRAME_HEADER_SIZE + RESPONSE_FRAME_SIZE),
+          TRANSPORT_FRAME_HEADER_SIZE,
+        )
+        const result = await reader.readAtLeast(RESPONSE_FRAME_SIZE, readBuffer)
         if (active !== transaction || transaction.terminal) {
           await reader.cancel()
           return
         }
-        if (result.done) {
-          finish(transaction, TransportFrameKind.RESPONSE_END)
-          return
-        }
 
-        transferred += result.value.byteLength
-        if (transferred > maxResponseBytes) {
+        const payload = result.value
+        transaction.transferredBytes += payload?.byteLength ?? 0
+        if (transaction.transferredBytes > maxResponseBytes) {
           transaction.controller.abort()
           await reader.cancel()
           fail(
@@ -202,16 +257,12 @@ function createTransportResponse(request: Request): Response {
           )
           return
         }
-        for (let offset = 0; offset < result.value.byteLength; offset += RESPONSE_FRAME_SIZE) {
-          if (active !== transaction || transaction.terminal) {
-            await reader.cancel()
-            return
-          }
-          send(
-            TransportFrameKind.RESPONSE_BODY,
-            transaction.sequence,
-            result.value.subarray(offset, offset + RESPONSE_FRAME_SIZE),
-          )
+        if (payload !== undefined && payload.byteLength !== 0) {
+          sendResponseBody(transaction.sequence, payload)
+        }
+        if (result.done) {
+          finish(transaction, TransportFrameKind.RESPONSE_END)
+          return
         }
       }
     } catch (cause) {
@@ -265,19 +316,47 @@ function createTransportResponse(request: Request): Response {
       controller: new AbortController(),
       reader: undefined,
       sequence: frame.sequence,
+      startedAt: Date.now(),
       terminal: false,
+      transferredBytes: 0,
     }
     active = transaction
-    void proxy(transaction, head)
+    await proxy(transaction, head)
   }
 
   server.addEventListener('message', event => {
-    void acceptMessage(event.data)
+    trackTask('message', acceptMessage(event.data))
   })
-  server.addEventListener('close', () => {
-    active?.controller.abort()
-    void active?.reader?.cancel()
-    active = undefined
+  server.addEventListener('close', event => {
+    console.info({
+      activeAgeMs: active === undefined ? undefined : Date.now() - active.startedAt,
+      activeSequence: active?.sequence,
+      activeTransferredBytes: active?.transferredBytes,
+      code: event.code,
+      readyState: server.readyState,
+      reason: event.reason,
+      type: 'transport-websocket-close',
+      wasClean: event.wasClean,
+    })
+    trackTask('close-cleanup', stopActive())
+  })
+  server.addEventListener('error', event => {
+    console.error({
+      activeSequence: active?.sequence,
+      message: event.message,
+      type: 'transport-websocket-error',
+    })
+    trackTask('error-cleanup', stopActive())
+    if (server.readyState === WebSocket.OPEN) {
+      try {
+        server.close(1011, 'transport error')
+      } catch (cause) {
+        console.error({
+          message: cause instanceof Error ? cause.message : String(cause),
+          type: 'transport-websocket-close-error',
+        })
+      }
+    }
   })
 
   return new Response(null, { status: 101, webSocket: client })
@@ -318,7 +397,7 @@ function parseContentLength(headers: Headers): number | undefined {
 }
 
 export default {
-  fetch(request): Response {
+  fetch(request, _env, ctx): Response {
     const url = new URL(request.url)
 
     if (url.pathname === '/health') {
@@ -331,7 +410,7 @@ export default {
           { status: 426 },
         )
       }
-      return createTransportResponse(request)
+      return createTransportResponse(request, ctx)
     }
 
     return json({ error: 'not_found', message: 'Edge capability was not found.' }, { status: 404 })

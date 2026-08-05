@@ -63,7 +63,7 @@ idle -> requesting -> streaming -> idle
 - `PING` / `PONG`
 - `ERROR`
 
-Frame 使用 1 字节 kind、4 字节大端 sequence 和 payload。控制 payload 使用 Protobuf，`RESPONSE_BODY` payload 是原始响应字节。响应体按不超过 64 KiB 的 Frame 连续发送。
+Frame 使用 1 字节 kind、4 字节大端 sequence 和 payload。控制 payload 使用 Protobuf，`RESPONSE_BODY` payload 是原始响应字节。relay 使用 BYOB reader 将上游响应聚合成不超过 128 KiB 的 Frame；流结束时发送不足 128 KiB 的尾帧。聚合不对首帧做特殊处理，也不保留上游流原始分块边界。
 
 HTTP 4xx、5xx 仍然是正常 `RESPONSE_HEAD`，只有协议错误、上游 Fetch 失败或资源限制才发送 `ERROR`。每个事务只能以 `RESPONSE_END`、`CANCELED` 或 `ERROR` 中的一种状态结束。
 
@@ -73,11 +73,13 @@ Request 的 AbortSignal 或 response body cancel 会立即使本地消费者结�
 
 取消确认超过 10 秒时直接关闭连接。连接关闭或协议错误会使当前事务产生 Transport failure，HLS 加载器继续按原有策略决定是否重试。
 
+relay 使用 Cloudflare runtime 的标准 WebSocket 自动关闭握手。客户端关闭 WebSocket 时，runtime 自动回送 Close，relay 的关闭回调只终止并等待仍在进行的上游事务收敛，不重复调用 `close()`。消息处理、上游代理和取消属于同一条被 ExecutionContext 跟踪的异步任务链；关闭和错误事件会输出结构化 Worker 日志。连接池因请求次数、寿命或空闲回收而发起的 `1000` 关闭属于正常生命周期，客户端诊断事件不记录为 error。
+
 ## 响应界限与流控
 
 WebSocket Transport 不实现应用层 flow control。加载器的 Range 请求本身有明确字节边界，未知长度请求使用 Transport 的响应上限；客户端请求头声明 `max_response_bytes`，relay 还施加 64 MiB 全局硬上限。
 
-relay 边读取 Cloudflare Fetch body 边发送固定大小 Frame，不等待客户端 ACK。客户端和 relay 都统计实际响应字节，源站忽略 Range 或返回超限响应时取消上游请求并返回错误。
+relay 使用 BYOB `readAtLeast()` 读取 Cloudflare Fetch body，读满 128 KiB 或遇到流结束后发送一个 Frame，不等待客户端 ACK。客户端和 relay 都统计实际响应字节，源站忽略 Range 或返回超限响应时取消上游请求并返回错误。
 
 ## 连接池
 
@@ -110,10 +112,17 @@ Fetch 子请求继续使用 Cloudflare 标准 HTTP 缓存语义。relay 当前�
 
 当前 relay 只限制 URL 必须使用 HTTP 或 HTTPS，尚未实现鉴权、请求额度、内网地址拦截或重定向逐跳检查。这些属于公开部署前的安全工作，不改变 Transport 协议。
 
+## 可观测性
+
+Edge Worker 开启持久化 Workers Logs 和 invocation logs，head sampling rate 为 1。Cloudflare Dashboard 会保留全部采样到的 Fetch 和 WebSocket invocation、运行时异常及代码产生的结构化日志；当前不启用 traces。
+
 ## 实现状态
 
 通用接口、Fetch Transport、WebSocket Transport、动态连接池、取消、心跳、连接老化、响应上限、Transport Schema 和 Edge Worker relay 均已实现。HLS 加载器默认使用 Fetch；调用方显式提供 WebSocket Transport 后使用 relay，其他加载与调度逻辑不变。
 
 ## 修改历史
 
+- 2026-08-05: relay 恢复 runtime 标准 WebSocket 自动关闭握手，并将消息处理、上游代理和取消纳入 ExecutionContext 跟踪。
+- 2026-08-05: Edge Worker 开启持久化 Workers Logs 和完整 invocation logs。
+- 2026-08-05: relay 改用 BYOB 聚合读取，将上游小块合并成 128 KiB 响应帧，减少 WebSocket 发送和读取唤醒次数。
 - 2026-08-05: 建立通用 HTTP Transport、HTTP-over-WebSocket 串行连接协议、动态连接池和 `storya-edge-worker` relay。
