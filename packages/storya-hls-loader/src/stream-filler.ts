@@ -1,4 +1,5 @@
 import type { HlsConfig, LoaderConfiguration, LoaderStats } from 'hls.js'
+import type { HttpTransport, HttpTransportResponse } from 'storya-transport'
 import type { HlsLoaderDiagnosticChunk } from './diagnostics'
 import type { HlsLoaderEventHandler } from './events'
 import { SegmentLoader } from './segment-loader'
@@ -11,7 +12,7 @@ export type SegmentFillFailureKind = 'aborted' | 'error' | 'timeout'
 export class SegmentFillFailure extends Error {
   readonly code: number
   readonly kind: SegmentFillFailureKind
-  readonly networkDetails: Response | null
+  readonly networkDetails: HttpTransportResponse | null
   readonly stats: LoaderStats
 
   constructor(
@@ -19,7 +20,7 @@ export class SegmentFillFailure extends Error {
     message: string,
     code: number,
     stats: LoaderStats,
-    networkDetails: Response | null,
+    networkDetails: HttpTransportResponse | null,
   ) {
     super(message)
     this.name = 'SegmentFillFailure'
@@ -43,15 +44,18 @@ export class StreamFiller {
   private readonly onEvent: HlsLoaderEventHandler
   private readonly options: SegmentLoaderOptions
   private readonly scheduler: RequestScheduler
+  private readonly transport: HttpTransport
 
   constructor(
     scheduler: RequestScheduler,
     options: SegmentLoaderOptions,
     onEvent: HlsLoaderEventHandler,
+    transport: HttpTransport,
   ) {
     this.scheduler = scheduler
     this.options = options
     this.onEvent = onEvent
+    this.transport = transport
   }
 
   configure(hlsConfig: HlsConfig): void {
@@ -95,6 +99,7 @@ export class StreamFiller {
       hlsConfig,
       this.scheduler,
       this.options,
+      this.transport,
       stats => {
         segment.updateStats(stats)
       },

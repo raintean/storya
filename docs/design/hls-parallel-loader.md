@@ -9,6 +9,7 @@
 - hls.js 继续负责 ABR、AES 解密、TS transmux、媒体解析和播放状态机。
 - 不同分辨率、独立音轨或其他内容序列不得混合数据和需求状态。
 - fLoader 只表达 hls.js 的读取需求，不直接拥有共享下载任务。
+- 网络执行通过通用 `HttpTransport` 完成，加载与调度逻辑不依赖 Fetch 或 WebSocket。
 
 ## 虚拟流
 
@@ -53,6 +54,12 @@ fLoader 把 Fragment 映射到虚拟流中的 Segment，并注册独立 reader�
 
 当前明确关闭 hls.js 的实验性 progressive 模式，因此 fLoader 只在完整 Segment ready 后交付数据。虚拟流内部仍可按 Chunk 并行填充。
 
+## Transport 边界
+
+单 Segment 下载器负责构造标准 GET、HEAD 和 Range Request，并通过注入的 `HttpTransport` 执行。默认 Transport 使用浏览器 Fetch；调用方也可以传入 `WebSocketHttpTransport`，通过 `storya-edge-worker` 转发相同的 HTTP 请求。
+
+Transport 不参与虚拟流、预填充、请求优先级、慢速检测、补救或抢占。AbortController 取消一次 Chunk attempt 后，Fetch Transport 取消 Fetch，WebSocket Transport 发送 CANCEL；调度器按同一套规则决定后续是否重试。
+
 ## 生命周期
 
 - 播放列表更新时复用内容标识相同的 Segment，并追加或移除元数据。
@@ -68,7 +75,8 @@ fLoader 把 Fragment 映射到虚拟流中的 Segment，并注册独立 reader�
 加载器通过播放会话对象同时提供 fLoader 构造器和 hls.js 事件绑定：
 
 ```ts
-const parallel = createHlsParallelLoader(options)
+const transport = new WebSocketHttpTransport('wss://edge.example.com/transport')
+const parallel = createHlsParallelLoader({ ...options, transport })
 const hls = new Hls({
   fLoader: parallel.fragmentLoader,
   progressive: false,
@@ -80,7 +88,7 @@ hls.loadSource(source)
 parallel.destroy()
 ```
 
-会话对象统一拥有虚拟流集合、流填充器、全局请求调度器和 fLoader 生命周期。
+会话对象统一拥有虚拟流集合、流填充器、全局请求调度器、Transport 和 fLoader 生命周期。传入的 Transport 所有权转移给会话，并在 `destroy()` 时销毁。
 
 ### 诊断边界
 
@@ -90,12 +98,13 @@ parallel.destroy()
 
 ## 实现状态
 
-本文描述的会话接口、虚拟流、每流预填充窗口、跨流全局请求调度、播放需求生命周期和薄 fLoader 均已实现。单 Segment 下载器继续负责 HEAD 探测、顺序 GET、Range 拆分、抢占和慢速补救；流填充器在它之上统一调度不同虚拟流及不同 Segment。
+本文描述的会话接口、虚拟流、每流预填充窗口、跨流全局请求调度、播放需求生命周期、Transport 注入和薄 fLoader 均已实现。单 Segment 下载器继续负责 HEAD 探测、顺序 GET、Range 拆分、抢占和慢速补救；流填充器在它之上统一调度不同虚拟流及不同 Segment。
 
-React 实验台已经接入会话接口，并在加载事件面板中区分即时需求、缓存命中、预填充、请求抢占和慢速补救。实验台还会用虚拟流时间轴显示贯穿所有流的播放线、Segment 缓存和 Chunk 调度状态；流按激活状态优先，再按视频、音频和字幕排列。
+React 实验台已经接入会话接口，并在加载事件面板中区分即时需求、缓存命中、预填充、请求抢占和慢速补救。实验台可以为新播放会话选择 Browser Fetch 或 WebSocket Relay Transport，并在 WebSocket 模式下接受 Worker 根 URL 或完整 Transport endpoint。实验台还会用虚拟流时间轴显示贯穿所有流的播放线、Segment 缓存和 Chunk 调度状态；流按激活状态优先，再按视频、音频和字幕排列。
 
 ## 修改历史
 
+- 2026-08-05: 抽离通用 HTTP Transport，默认保留 Fetch，并支持通过 WebSocket 连接池和 Edge Worker 执行相同请求。
 - 2026-08-05: 虚拟流时间轴移除独立缓冲边界线，缓存状态仅由 Segment 和 Chunk 表达。
 - 2026-08-05: 实验台在首次媒体缓冲前切换清晰度时改为重建播放会话，修复目标流跳过首个 Segment 和缓存命中重试循环。
 - 2026-08-05: 确立并完成虚拟流、每流 6 Segment 预填充窗口、全局 6 路请求调度、跨 reader 的持续播放需求、薄 fLoader 会话接口、只读诊断快照和可视化实验台。

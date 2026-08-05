@@ -1,4 +1,6 @@
 import Hls from 'hls.js'
+import { FetchHttpTransport } from 'storya-transport'
+import type { HttpTransport } from 'storya-transport'
 import type {
   AudioTrackLoadedData,
   FragBufferedData,
@@ -30,6 +32,7 @@ export interface HlsParallelLoaderOptions {
   getPlaybackRate?: () => number
   getPlaybackTime?: () => number
   onEvent?: HlsLoaderEventHandler
+  transport?: HttpTransport
 }
 
 export interface HlsParallelLoader {
@@ -57,11 +60,13 @@ class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSessi
   private reconcilePending = false
   private readonly registry = new VirtualStreamRegistry()
   private readonly scheduler: RequestScheduler
+  private readonly transport: HttpTransport
 
   constructor(options: HlsParallelLoaderOptions) {
     const getPlaybackRate = options.getPlaybackRate ?? (() => 1)
     const getPlaybackTime = options.getPlaybackTime ?? (() => 0)
     this.onEvent = options.onEvent ?? (() => undefined)
+    this.transport = options.transport ?? new FetchHttpTransport()
     this.scheduler = new RequestScheduler({
       getPlaybackRate,
       getPlaybackTime,
@@ -81,7 +86,7 @@ class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSessi
       slowThroughputRatio: 0.35,
       slowThroughputWindowMs: 1_000,
     }
-    this.filler = new StreamFiller(this.scheduler, loaderOptions, this.onEvent)
+    this.filler = new StreamFiller(this.scheduler, loaderOptions, this.onEvent, this.transport)
     this.fragmentLoader = createVirtualFragmentLoader(this)
   }
 
@@ -191,6 +196,7 @@ class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSessi
     this.destroyed = true
     this.detach()
     this.filler.destroy()
+    this.transport.destroy()
     this.activeStreams.clear()
     this.registry.clear()
   }

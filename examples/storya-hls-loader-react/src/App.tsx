@@ -8,6 +8,7 @@ import {
   DEFAULT_PREFETCH_DEPTH,
 } from 'storya-hls-loader'
 import type { HlsLoaderDiagnosticsSnapshot, HlsLoaderSegmentEvent } from 'storya-hls-loader'
+import { WebSocketHttpTransport } from 'storya-transport'
 
 import { VirtualStreamMap } from './virtual-stream-map'
 
@@ -68,6 +69,7 @@ interface PlaybackLevel {
 
 type LoaderMode = 'native' | 'parallel'
 type LogTone = 'default' | 'error' | 'preempted' | 'rescued' | 'success'
+type TransportMode = 'fetch' | 'websocket'
 
 const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
@@ -105,6 +107,9 @@ export function App() {
   const logIdRef = useRef(0)
   const playbackLevelIndexRef = useRef(-1)
   const [loaderMode, setLoaderMode] = useState<LoaderMode>('parallel')
+  const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
+  const [workerUrl, setWorkerUrl] = useState('')
+  const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
   const [source, setSource] = useState(defaultSource)
   const [qualityLevels, setQualityLevels] = useState<QualityLevel[]>([])
   const [selectedLevel, setSelectedLevel] = useState(-2)
@@ -187,6 +192,19 @@ export function App() {
       setStatus('正在加载播放列表')
 
       if (Hls.isSupported()) {
+        let relayEndpoint: string | undefined
+        if (transportMode === 'websocket') {
+          try {
+            relayEndpoint = resolveRelayEndpoint(workerUrl)
+          } catch (cause) {
+            const message = cause instanceof Error ? cause.message : 'Worker URL 无效'
+            setStatus('等待有效的 Worker URL')
+            setError(message)
+            appendLog(message, 'error', { tag: 'Transport' })
+            return
+          }
+        }
+
         const parallelLoader = createHlsParallelLoader({
           getPlaybackRate: () => video.playbackRate,
           getPlaybackTime: () => video.currentTime,
@@ -242,6 +260,13 @@ export function App() {
               },
             )
           },
+          ...(relayEndpoint === undefined
+            ? {}
+            : {
+                transport: new WebSocketHttpTransport(relayEndpoint, {
+                  maxConnections: DEFAULT_MAX_CONCURRENCY * 2,
+                }),
+              }),
         })
         parallelLoader.setEnabled(loaderMode === 'parallel')
         parallelLoaderRef.current = parallelLoader
@@ -356,12 +381,20 @@ export function App() {
 
         hls.attachMedia(video)
         hls.loadSource(normalizedSource)
+        setActiveTransportMode(transportMode)
         appendLog(
           loaderMode === 'parallel'
             ? `启用 ${DEFAULT_MAX_CONCURRENCY} 路并行 Range Loader`
             : '启用 hls.js 原生 FetchLoader',
           'default',
           { tag: '加载器' },
+        )
+        appendLog(
+          relayEndpoint === undefined
+            ? '并行加载器配置为 Browser Fetch Transport'
+            : `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`,
+          'default',
+          { tag: 'Transport' },
         )
         return
       }
@@ -378,7 +411,7 @@ export function App() {
       setError('没有可用的 HLS 播放路径')
       appendLog('没有可用的 HLS 播放路径', 'error', { tag: '错误' })
     },
-    [appendLog, loaderMode, source],
+    [appendLog, loaderMode, source, transportMode, workerUrl],
   )
 
   const handleLoaderModeChange = (value: string) => {
@@ -402,6 +435,16 @@ export function App() {
     appendLog('切换到 hls.js 原生加载, 从后续新 Fragment 生效', 'default', {
       tag: '加载器',
     })
+  }
+
+  const handleTransportModeChange = (value: string) => {
+    const mode: TransportMode = value === 'websocket' ? 'websocket' : 'fetch'
+    setTransportMode(mode)
+    if (hlsRef.current !== null && mode !== activeTransportMode) {
+      appendLog('Transport 设置已改变, 点击 LOAD STREAM 重建加载会话', 'default', {
+        tag: 'Transport',
+      })
+    }
   }
 
   const handleLevelChange = (value: string) => {
@@ -607,10 +650,41 @@ export function App() {
                 <option value="parallel">并行 Range</option>
                 <option value="native">hls.js 原生</option>
               </select>
+              <label htmlFor="transport-mode">TRANSPORT</label>
+              <select
+                id="transport-mode"
+                value={transportMode}
+                onChange={event => handleTransportModeChange(event.target.value)}
+              >
+                <option value="fetch">Browser Fetch</option>
+                <option value="websocket">WebSocket Relay</option>
+              </select>
+              {transportMode === 'websocket' ? (
+                <div className="transport-endpoint">
+                  <label htmlFor="worker-url">WORKER URL</label>
+                  <input
+                    id="worker-url"
+                    type="url"
+                    value={workerUrl}
+                    onChange={event => setWorkerUrl(event.target.value)}
+                    placeholder="https://storya-edge-worker.example.workers.dev"
+                    required
+                  />
+                  <small>可填写 Worker 根 URL 或完整的 wss://.../transport 地址</small>
+                </div>
+              ) : null}
               <dl className="runtime-facts">
                 <div>
-                  <dt>MAX CONNECTIONS</dt>
+                  <dt>REQUEST LIMIT</dt>
                   <dd>{DEFAULT_MAX_CONCURRENCY}</dd>
+                </div>
+                <div>
+                  <dt>SESSION TRANSPORT</dt>
+                  <dd>{formatTransportMode(activeTransportMode)}</dd>
+                </div>
+                <div>
+                  <dt>WS POOL LIMIT</dt>
+                  <dd>{activeTransportMode === 'websocket' ? DEFAULT_MAX_CONCURRENCY * 2 : '—'}</dd>
                 </div>
                 <div>
                   <dt>CHUNK SIZE</dt>
@@ -850,4 +924,37 @@ function formatBytes(value: number | undefined): string {
 
 function formatRange(start: number, endExclusive: number | undefined): string {
   return `${formatBytes(start)} – ${endExclusive === undefined ? 'EOF' : formatBytes(endExclusive)}`
+}
+
+function formatTransportMode(mode: TransportMode | null): string {
+  if (mode === null) {
+    return '—'
+  }
+  return mode === 'websocket' ? 'WebSocket Relay' : 'Browser Fetch'
+}
+
+function resolveRelayEndpoint(value: string): string {
+  const normalized = value.trim()
+  if (normalized.length === 0) {
+    throw new Error('使用 WebSocket Relay 前需要填写 Worker URL')
+  }
+
+  let url: URL
+  try {
+    url = new URL(normalized)
+  } catch {
+    throw new Error('Worker URL 格式无效')
+  }
+  if (url.protocol === 'http:') {
+    url.protocol = 'ws:'
+  } else if (url.protocol === 'https:') {
+    url.protocol = 'wss:'
+  } else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+    throw new Error('Worker URL 必须使用 http、https、ws 或 wss')
+  }
+  if (url.pathname === '' || url.pathname === '/') {
+    url.pathname = '/transport'
+  }
+  url.hash = ''
+  return url.toString()
 }

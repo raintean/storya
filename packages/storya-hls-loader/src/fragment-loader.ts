@@ -7,6 +7,7 @@ import type {
   LoaderConfiguration,
   LoaderStats,
 } from 'hls.js'
+import type { HttpTransportResponse } from 'storya-transport'
 import { SegmentFillFailure } from './stream-filler'
 import type { VirtualSegmentResult } from './virtual-stream'
 import { copyLoaderStats, createLoaderStats } from './stats'
@@ -35,7 +36,7 @@ export function createVirtualFragmentLoader(
     stats: LoaderStats = createLoaderStats()
 
     private callbacks: LoaderCallbacks<FragmentLoaderContext> | undefined
-    private networkDetails: Response | null = null
+    private networkDetails: HttpTransportResponse | null = null
     private progressive = false
     private reader: SegmentReader | undefined
     private settled = false

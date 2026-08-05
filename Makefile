@@ -17,7 +17,7 @@ clean:
 		-type d -name node_modules -prune -o \
 		-type d \( -name dist -o -name .wrangler \) -prune -exec rm -rf {} +
 	rm -rf packages/storya-protocol/generated packages/storya-protocol/typescript/generated
-	rm -f services/storya-playback-relay/worker-configuration.d.ts
+	rm -f services/storya-edge-worker/worker-configuration.d.ts
 
 format: pnpm-install
 	$(CARGO) fmt --all
@@ -31,7 +31,7 @@ format-check: pnpm-install
 
 generate: pnpm-install
 	$(PNPM) --filter storya-protocol exec buf generate
-	CI=true $(PNPM) --filter storya-playback-relay exec wrangler types
+	CI=true $(PNPM) --filter storya-edge-worker exec wrangler types
 
 lint: generate
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings

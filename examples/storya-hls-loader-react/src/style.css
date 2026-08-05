@@ -894,12 +894,56 @@ select:disabled {
 
 .control-body > label {
   display: block;
-  margin-bottom: 7px;
+  margin: 14px 0 7px;
+}
+
+.control-body > label:first-child {
+  margin-top: 0;
 }
 
 .control-body > select {
   width: 100%;
   padding: 9px;
+}
+
+.transport-endpoint {
+  margin-top: 10px;
+}
+
+.transport-endpoint label,
+.transport-endpoint small {
+  display: block;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.transport-endpoint label {
+  margin-bottom: 7px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+}
+
+.transport-endpoint input {
+  width: 100%;
+  padding: 9px;
+  color: #d9e3df;
+  background: #080d10;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.transport-endpoint input:focus {
+  border-color: rgb(98 245 178 / 65%);
+  outline: none;
+}
+
+.transport-endpoint small {
+  margin-top: 6px;
+  color: #52625b;
+  line-height: 1.45;
 }
 
 .runtime-facts {

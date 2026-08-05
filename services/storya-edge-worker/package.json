@@ -1,5 +1,5 @@
 {
-  "name": "storya-playback-relay",
+  "name": "storya-edge-worker",
   "private": true,
   "type": "module",
   "scripts": {
@@ -7,6 +7,10 @@
     "build": "wrangler deploy --dry-run --outdir dist",
     "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "catalog:",
+    "storya-protocol": "workspace:*"
   },
   "devDependencies": {
     "typescript": "catalog:",

@@ -7,6 +7,7 @@ import type {
   LoaderResponse,
   LoaderStats,
 } from 'hls.js'
+import type { HttpTransport, HttpTransportResponse } from 'storya-transport'
 import { splitByteRanges } from './byte-ranges'
 import type { HlsLoaderDiagnosticChunk, HlsLoaderDiagnosticChunkState } from './diagnostics'
 import type { HlsLoaderAbortEvent, HlsLoaderEventHandler } from './events'
@@ -36,7 +37,7 @@ interface Attempt {
   loadTimer: number | undefined
   requestEnd: number | undefined
   requestStart: number
-  response: Response | null
+  response: HttpTransportResponse | null
   startedAt: number
   trafficTimer: number | undefined
   ttfbTimer: number | undefined
@@ -84,17 +85,20 @@ export class SegmentLoader implements Loader<FragmentLoaderContext> {
   private readonly onStats: (stats: LoaderStats) => void
   private readonly options: SegmentLoaderOptions
   private readonly scheduler: RequestScheduler
+  private readonly transport: HttpTransport
 
   constructor(
     hlsConfig: HlsConfig,
     scheduler: RequestScheduler,
     options: SegmentLoaderOptions,
+    transport: HttpTransport,
     onStats: (stats: LoaderStats) => void = () => undefined,
     isHardDemanded: () => boolean = () => false,
   ) {
     this.hlsConfig = hlsConfig
     this.scheduler = scheduler
     this.options = options
+    this.transport = transport
     this.onStats = onStats
     this.isHardDemanded = isHardDemanded
   }
@@ -113,6 +117,7 @@ export class SegmentLoader implements Loader<FragmentLoaderContext> {
       this.hlsConfig,
       this.scheduler,
       this.options,
+      this.transport,
       context,
       config,
       callbacks,
@@ -160,7 +165,7 @@ class SegmentLoadCoordinator {
   private deliveredOffset = 0
   private finalUrl: string
   private firstTask: ChunkLoadTask | null = null
-  private lastResponse: Response | null = null
+  private lastResponse: HttpTransportResponse | null = null
   private logicalTimer: number | undefined
   private pendingProgress: Uint8Array[] = []
   private pendingProgressBytes = 0
@@ -177,11 +182,13 @@ class SegmentLoadCoordinator {
   private readonly hlsConfig: HlsConfig
   private readonly isHardDemanded: () => boolean
   private readonly onStats: (stats: LoaderStats) => void
+  private readonly transport: HttpTransport
 
   constructor(
     hlsConfig: HlsConfig,
     scheduler: RequestScheduler,
     options: SegmentLoaderOptions,
+    transport: HttpTransport,
     context: FragmentLoaderContext,
     loaderConfig: LoaderConfiguration,
     callbacks: LoaderCallbacks<FragmentLoaderContext>,
@@ -192,6 +199,7 @@ class SegmentLoadCoordinator {
     this.hlsConfig = hlsConfig
     this.scheduler = scheduler
     this.options = options
+    this.transport = transport
     this.context = context
     this.loaderConfig = loaderConfig
     this.callbacks = callbacks
@@ -336,7 +344,7 @@ class SegmentLoadCoordinator {
     return timeUntilPlaybackMs - frontierBoost - hardDemandBoost
   }
 
-  async createResponse(task: ChunkLoadTask, attempt: Attempt): Promise<Response> {
+  async createResponse(task: ChunkLoadTask, attempt: Attempt): Promise<HttpTransportResponse> {
     const headers = new Headers(this.context.headers)
     if (attempt.requestEnd !== undefined) {
       headers.set('Range', `bytes=${attempt.requestStart}-${attempt.requestEnd - 1}`)
@@ -362,10 +370,19 @@ class SegmentLoadCoordinator {
       configuredRequest === undefined
         ? new Request(this.context.url, init)
         : await configuredRequest
-    return fetch(request)
+    return this.transport.request(
+      request,
+      attempt.requestEnd === undefined
+        ? undefined
+        : { maxResponseBytes: attempt.requestEnd - attempt.requestStart },
+    )
   }
 
-  async acceptResponse(task: ChunkLoadTask, attempt: Attempt, response: Response): Promise<void> {
+  async acceptResponse(
+    task: ChunkLoadTask,
+    attempt: Attempt,
+    response: HttpTransportResponse,
+  ): Promise<void> {
     if (!response.ok) {
       throw new TransportError(response.statusText || `HTTP ${response.status}`, response.status)
     }
@@ -448,7 +465,7 @@ class SegmentLoadCoordinator {
     }
   }
 
-  acceptData(task: ChunkLoadTask, data: Uint8Array, response: Response): void {
+  acceptData(task: ChunkLoadTask, data: Uint8Array, response: HttpTransportResponse): void {
     if (this.aborted || this.completed || data.byteLength === 0) {
       return
     }
@@ -469,7 +486,7 @@ class SegmentLoadCoordinator {
     this.flushContiguousData()
   }
 
-  markResponseStarted(response: Response): void {
+  markResponseStarted(response: HttpTransportResponse): void {
     const now = performance.now()
     if (this.stats.loading.first === 0) {
       this.stats.loading.first = now
@@ -522,7 +539,7 @@ class SegmentLoadCoordinator {
       : undefined
   }
 
-  private acceptSequentialResponse(task: ChunkLoadTask, response: Response): void {
+  private acceptSequentialResponse(task: ChunkLoadTask, response: HttpTransportResponse): void {
     if (response.status !== 200) {
       throw new TransportError(`顺序请求返回了 HTTP ${response.status}`, response.status)
     }
@@ -683,7 +700,7 @@ class SegmentLoadCoordinator {
     )
   }
 
-  private validateResourceIdentity(response: Response): void {
+  private validateResourceIdentity(response: HttpTransportResponse): void {
     const current = response.headers.get('etag') ?? response.headers.get('last-modified')
     if (this.validator === null) {
       this.validator = current
@@ -694,7 +711,7 @@ class SegmentLoadCoordinator {
     }
   }
 
-  private parseContentRange(response: Response): ContentRange | undefined {
+  private parseContentRange(response: HttpTransportResponse): ContentRange | undefined {
     const value = response.headers.get('content-range')
     if (value === null) {
       return undefined
@@ -715,7 +732,7 @@ class SegmentLoadCoordinator {
     return { start, endExclusive: end + 1, total }
   }
 
-  private inferContentRange(attempt: Attempt, response: Response): ContentRange {
+  private inferContentRange(attempt: Attempt, response: HttpTransportResponse): ContentRange {
     if (this.segmentLength === undefined) {
       throw new TransportError('无法推断 Range 响应范围', response.status)
     }
@@ -762,7 +779,7 @@ class SegmentLoadCoordinator {
       configuredRequest === undefined
         ? new Request(this.context.url, init)
         : await configuredRequest
-    const response = await fetch(request)
+    const response = await this.transport.request(request, { maxResponseBytes: 0 })
     if (!response.ok) {
       throw new TransportError(
         response.statusText || `HEAD 请求返回 HTTP ${response.status}`,
@@ -807,7 +824,7 @@ class SegmentLoadCoordinator {
     }
   }
 
-  private async createHeadResponse(signal: AbortSignal): Promise<Response> {
+  private async createHeadResponse(signal: AbortSignal): Promise<HttpTransportResponse> {
     const headers = new Headers(this.context.headers)
     headers.delete('Range')
     const probeContext: FragmentLoaderContext = {
@@ -828,10 +845,10 @@ class SegmentLoadCoordinator {
       configuredRequest === undefined
         ? new Request(this.context.url, init)
         : await configuredRequest
-    return fetch(request)
+    return this.transport.request(request, { maxResponseBytes: 0 })
   }
 
-  private readContentLength(response: Response): number | undefined {
+  private readContentLength(response: HttpTransportResponse): number | undefined {
     const value = response.headers.get('content-length')
     if (value === null) {
       return undefined
@@ -1078,7 +1095,7 @@ class ChunkLoadTask implements ScheduledRequest {
     }
   }
 
-  private async readResponseBody(attempt: Attempt, response: Response): Promise<void> {
+  private async readResponseBody(attempt: Attempt, response: HttpTransportResponse): Promise<void> {
     if (response.body === null) {
       const data = new Uint8Array(await response.arrayBuffer())
       this.acceptAttemptData(attempt, data, response)
@@ -1099,7 +1116,11 @@ class ChunkLoadTask implements ScheduledRequest {
     }
   }
 
-  private acceptAttemptData(attempt: Attempt, data: Uint8Array, response: Response): void {
+  private acceptAttemptData(
+    attempt: Attempt,
+    data: Uint8Array,
+    response: HttpTransportResponse,
+  ): void {
     if (!this.isCurrentAttempt(attempt) || data.byteLength === 0) {
       return
     }
@@ -1217,7 +1238,7 @@ class ChunkLoadTask implements ScheduledRequest {
     }
   }
 
-  private markAttemptResponseStarted(attempt: Attempt, response: Response): void {
+  private markAttemptResponseStarted(attempt: Attempt, response: HttpTransportResponse): void {
     this.clearTimer(attempt.ttfbTimer)
     attempt.ttfbTimer = undefined
     this.resetTrafficTimer(attempt)

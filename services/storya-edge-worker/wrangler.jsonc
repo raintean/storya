@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "storya-playback-relay",
+  "name": "storya-edge-worker",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-04",
+  "compatibility_date": "2026-08-05",
 }

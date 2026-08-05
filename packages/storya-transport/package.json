@@ -1,5 +1,5 @@
 {
-  "name": "storya-hls-loader",
+  "name": "storya-transport",
   "private": true,
   "type": "module",
   "exports": {
@@ -10,18 +10,15 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsx src/byte-ranges.test.ts && tsx src/scheduler.test.ts && tsx src/virtual-stream.test.ts && tsx src/fragment-loader.test.ts && tsx src/hls-parallel-loader.test.ts",
+    "test": "tsx src/transport.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "storya-transport": "workspace:*"
+    "@bufbuild/protobuf": "catalog:",
+    "storya-protocol": "workspace:*"
   },
   "devDependencies": {
-    "hls.js": "catalog:",
     "tsx": "catalog:",
     "typescript": "catalog:"
-  },
-  "peerDependencies": {
-    "hls.js": "catalog:"
   }
 }

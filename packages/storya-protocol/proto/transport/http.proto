@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package storya.transport;
+
+enum TransportFrameKind {
+  TRANSPORT_FRAME_KIND_UNSPECIFIED = 0;
+  TRANSPORT_FRAME_KIND_REQUEST_HEAD = 1;
+  TRANSPORT_FRAME_KIND_RESPONSE_HEAD = 2;
+  TRANSPORT_FRAME_KIND_RESPONSE_BODY = 3;
+  TRANSPORT_FRAME_KIND_RESPONSE_END = 4;
+  TRANSPORT_FRAME_KIND_CANCEL = 5;
+  TRANSPORT_FRAME_KIND_CANCELED = 6;
+  TRANSPORT_FRAME_KIND_PING = 7;
+  TRANSPORT_FRAME_KIND_PONG = 8;
+  TRANSPORT_FRAME_KIND_ERROR = 9;
+}
+
+enum TransportErrorCode {
+  TRANSPORT_ERROR_CODE_UNSPECIFIED = 0;
+  TRANSPORT_ERROR_CODE_INVALID_REQUEST = 1;
+  TRANSPORT_ERROR_CODE_UNSUPPORTED_METHOD = 2;
+  TRANSPORT_ERROR_CODE_RESPONSE_TOO_LARGE = 3;
+  TRANSPORT_ERROR_CODE_UPSTREAM_FAILURE = 4;
+  TRANSPORT_ERROR_CODE_INTERNAL = 5;
+}
+
+message HttpHeader {
+  string name = 1;
+  string value = 2;
+}
+
+message HttpRequestHead {
+  string method = 1;
+  string url = 2;
+  repeated HttpHeader headers = 3;
+  uint64 max_response_bytes = 4;
+}
+
+message HttpResponseHead {
+  uint32 status = 1;
+  string status_text = 2;
+  string url = 3;
+  repeated HttpHeader headers = 4;
+}
+
+message TransportError {
+  TransportErrorCode code = 1;
+  string message = 2;
+}

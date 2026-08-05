@@ -6,6 +6,7 @@ import type {
   LoaderResponse,
   LoaderStats,
 } from 'hls.js'
+import type { HttpTransportResponse } from 'storya-transport'
 import type { HlsLoaderDiagnosticChunk } from './diagnostics'
 import { copyLoaderStats, createLoaderStats } from './stats'
 
@@ -13,7 +14,7 @@ export type VirtualSegmentState = 'empty' | 'failed' | 'filling' | 'ready'
 export type VirtualStreamKind = 'audio' | 'main' | 'subtitle'
 
 export interface VirtualSegmentResult {
-  networkDetails: Response | null
+  networkDetails: HttpTransportResponse | null
   response: LoaderResponse
   stats: LoaderStats
 }
