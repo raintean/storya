@@ -58,6 +58,18 @@ const scheduler = new ChunkScheduler({
   maxConcurrency: 2,
   scheduleIntervalMs: 60_000,
 })
+if (scheduler.hasThroughputSamples(3)) {
+  throw new Error('没有速率样本时不应满足慢速检测的样本门槛')
+}
+scheduler.reportThroughput(1_000, 1_000)
+scheduler.reportThroughput(1_000, 1_000)
+if (scheduler.hasThroughputSamples(3)) {
+  throw new Error('两个速率样本不应满足三个样本的门槛')
+}
+scheduler.reportThroughput(1_000, 1_000)
+if (!scheduler.hasThroughputSamples(3)) {
+  throw new Error('三个速率样本应满足慢速检测的样本门槛')
+}
 const first = new TestChunk(1, 10)
 const second = new TestChunk(2, 11)
 const third = new TestChunk(3, 12)

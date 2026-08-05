@@ -10,7 +10,7 @@ import type {
 import { splitByteRanges } from './byte-ranges'
 import type { ParallelFragmentLoaderAbortEvent, ParallelFragmentLoaderEventHandler } from './events'
 import { ChunkScheduler } from './scheduler'
-import type { MediaLane, ScheduledChunk } from './scheduler'
+import type { ScheduledChunk } from './scheduler'
 import { createLoaderStats } from './stats'
 
 export interface ParallelFragmentLoaderOptions {
@@ -20,6 +20,7 @@ export interface ParallelFragmentLoaderOptions {
   idleTimeoutMs: number
   maxLookAheadBytes: number
   maxRescueAttempts: number
+  minSlowThroughputSamples: number
   minRequestLifetimeMs: number
   onEvent: ParallelFragmentLoaderEventHandler
   slowThroughputRatio: number
@@ -135,7 +136,6 @@ export class ParallelFragmentLoader implements Loader<FragmentLoaderContext> {
 class SegmentLoadCoordinator {
   readonly callbacks: LoaderCallbacks<FragmentLoaderContext>
   readonly context: FragmentLoaderContext
-  readonly lane: MediaLane
   readonly loaderConfig: LoaderConfiguration
   readonly options: ParallelFragmentLoaderOptions
   readonly scheduler: ChunkScheduler
@@ -181,8 +181,6 @@ class SegmentLoadCoordinator {
     this.finalUrl = context.url
     this.startTime = performance.now()
     this.stats.loading.start = this.startTime
-    this.lane = this.getMediaLane()
-
     const rangeStart = context.rangeStart ?? 0
     const rangeEnd = context.rangeEnd ?? 0
     if (rangeEnd > rangeStart) {
@@ -473,8 +471,8 @@ class SegmentLoadCoordinator {
     this.fail(error)
   }
 
-  reportAttempt(lane: MediaLane, bytes: number, durationMs: number): void {
-    this.scheduler.reportThroughput(lane, bytes, durationMs)
+  reportAttempt(bytes: number, durationMs: number): void {
+    this.scheduler.reportThroughput(bytes, durationMs)
   }
 
   emitEvent(event: ParallelFragmentLoaderAbortEvent): void {
@@ -485,9 +483,9 @@ class SegmentLoadCoordinator {
     }
   }
 
-  getSlowBaseline(lane: MediaLane): number | undefined {
-    return this.scheduler.hasThroughputSample(lane)
-      ? this.scheduler.getEstimatedThroughput(lane)
+  getSlowBaseline(): number | undefined {
+    return this.scheduler.hasThroughputSamples(this.options.minSlowThroughputSamples)
+      ? this.scheduler.getEstimatedThroughput()
       : undefined
   }
 
@@ -815,16 +813,6 @@ class SegmentLoadCoordinator {
     )
   }
 
-  private getMediaLane(): MediaLane {
-    if (this.context.frag.type === 'audio') {
-      return 'audio'
-    }
-    if (this.context.frag.type === 'main') {
-      return 'main'
-    }
-    return 'other'
-  }
-
   private clearLogicalTimer(): void {
     if (this.logicalTimer !== undefined) {
       globalThis.clearTimeout(this.logicalTimer)
@@ -898,12 +886,7 @@ class ChunkLoadTask implements ScheduledChunk {
       return true
     }
 
-    const total = this.getTotalBytes()
-    const ratio = total === undefined || total === 0 ? 0 : this.receivedBytes / total
-    return (
-      ratio >= this.segment.options.finishingRatio ||
-      this.getEstimatedRemainingMs() <= this.segment.options.finishingRemainingMs
-    )
+    return this.isFinishing()
   }
 
   isRunning(): boolean {
@@ -995,7 +978,7 @@ class ChunkLoadTask implements ScheduledChunk {
       return Number.POSITIVE_INFINITY
     }
     const remaining = Math.max(0, total - this.receivedBytes)
-    return (remaining * 1_000) / this.segment.scheduler.getEstimatedThroughput(this.segment.lane)
+    return (remaining * 1_000) / this.segment.scheduler.getEstimatedThroughput()
   }
 
   private async performAttempt(attempt: Attempt): Promise<void> {
@@ -1078,12 +1061,13 @@ class ChunkLoadTask implements ScheduledChunk {
       !this.rangeEnabled ||
       this.rescueAttempts >= this.segment.options.maxRescueAttempts ||
       attempt.bytes < 256 * 1024 ||
-      now - attempt.startedAt < this.segment.options.slowThroughputWindowMs
+      now - attempt.startedAt < this.segment.options.slowThroughputWindowMs ||
+      this.isFinishing()
     ) {
       return
     }
 
-    const baseline = this.segment.getSlowBaseline(this.segment.lane)
+    const baseline = this.segment.getSlowBaseline()
     if (baseline === undefined) {
       return
     }
@@ -1213,7 +1197,7 @@ class ChunkLoadTask implements ScheduledChunk {
       this.emitAbortEvent(attempt, reason, duration, slowConnectionMetrics)
     }
     if (attempt.bytes > 0 && (reason === 'complete' || reason === 'preempted')) {
-      this.segment.reportAttempt(this.segment.lane, attempt.bytes, duration)
+      this.segment.reportAttempt(attempt.bytes, duration)
     }
     this.segment.scheduler.notify()
   }
@@ -1235,7 +1219,6 @@ class ChunkLoadTask implements ScheduledChunk {
       chunkLoadedBytes: this.receivedBytes,
       chunkStart: this.startOffset,
       elapsedMs,
-      lane: this.segment.lane,
       loadedBytes: attempt.bytes,
       reason: reason === 'slow' ? 'slow-connection' : 'preempted',
       remainingBytes: total === undefined ? undefined : Math.max(0, total - this.receivedBytes),
@@ -1274,6 +1257,15 @@ class ChunkLoadTask implements ScheduledChunk {
 
   private getTotalBytes(): number | undefined {
     return this.end === undefined ? undefined : this.end - this.startOffset
+  }
+
+  private isFinishing(): boolean {
+    const total = this.getTotalBytes()
+    const ratio = total === undefined || total === 0 ? 0 : this.receivedBytes / total
+    return (
+      ratio >= this.segment.options.finishingRatio ||
+      this.getEstimatedRemainingMs() <= this.segment.options.finishingRemainingMs
+    )
   }
 
   private segmentResourceOffset(localOffset: number): number {

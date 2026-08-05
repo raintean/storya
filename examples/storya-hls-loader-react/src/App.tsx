@@ -17,13 +17,31 @@ interface PlaybackMetrics {
 }
 
 interface LogEntry {
+  details: LogEntryDetail[]
   id: number
   message: string
+  tag: string
   time: string
-  tone: 'default' | 'error' | 'success'
+  tone: LogTone
+}
+
+interface LogEntryDetail {
+  label: string
+  value: string
+}
+
+interface LogEntryOptions {
+  details?: LogEntryDetail[]
+  tag?: string
+}
+
+interface LoaderEventCounts {
+  preempted: number
+  rescued: number
 }
 
 type LoaderMode = 'native' | 'parallel'
+type LogTone = 'default' | 'error' | 'preempted' | 'rescued' | 'success'
 
 interface QualityLevel {
   bitrate: number
@@ -46,6 +64,11 @@ const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
 }
 
+const initialLoaderEventCounts: LoaderEventCounts = {
+  preempted: 0,
+  rescued: 0,
+}
+
 function formatDuration(value: number): string {
   if (!Number.isFinite(value)) {
     return '直播'
@@ -58,6 +81,27 @@ function formatDuration(value: number): string {
 
 function formatBandwidth(value: number): string {
   return value > 0 ? `${(value / 1_000_000).toFixed(2)} Mbps` : '等待采样'
+}
+
+function formatBytes(value: number | undefined): string {
+  if (value === undefined) {
+    return '未知'
+  }
+  if (value < 1024) {
+    return `${value} B`
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KiB`
+  }
+  return `${(value / (1024 * 1024)).toFixed(2)} MiB`
+}
+
+function formatRange(start: number, endExclusive: number | undefined): string {
+  return `${formatBytes(start)} – ${endExclusive === undefined ? 'EOF' : formatBytes(endExclusive)}`
+}
+
+function formatThroughput(bytesPerSecond: number): string {
+  return formatBandwidth(bytesPerSecond * 8)
 }
 
 function formatLevelLabel(
@@ -94,17 +138,23 @@ export function App() {
   const [status, setStatus] = useState('等待加载')
   const [metrics, setMetrics] = useState(initialMetrics)
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [loaderEventCounts, setLoaderEventCounts] = useState(initialLoaderEventCounts)
 
-  const appendLog = useCallback((message: string, tone: LogEntry['tone'] = 'default') => {
-    logIdRef.current += 1
-    const entry: LogEntry = {
-      id: logIdRef.current,
-      message,
-      time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-      tone,
-    }
-    setLogs(current => [entry, ...current].slice(0, 18))
-  }, [])
+  const appendLog = useCallback(
+    (message: string, tone: LogTone = 'default', options: LogEntryOptions = {}) => {
+      logIdRef.current += 1
+      const entry: LogEntry = {
+        details: options.details ?? [],
+        id: logIdRef.current,
+        message,
+        tag: options.tag ?? '系统',
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        tone,
+      }
+      setLogs(current => [entry, ...current].slice(0, 40))
+    },
+    [],
+  )
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -141,6 +191,7 @@ export function App() {
     video.removeAttribute('src')
     video.load()
     setLogs([])
+    setLoaderEventCounts(initialLoaderEventCounts)
     setQualityLevels([])
     setSelectedLevel(-2)
     setPlaybackLevel(null)
@@ -151,14 +202,61 @@ export function App() {
       const FragmentLoader = createParallelFragmentLoader({
         getPlaybackRate: () => video.playbackRate,
         getPlaybackTime: () => video.currentTime,
-        onEvent: event => console.info('[storya-hls-loader]', event),
+        onEvent: event => {
+          const rescued = event.reason === 'slow-connection'
+          setLoaderEventCounts(current => ({
+            preempted: current.preempted + (rescued ? 0 : 1),
+            rescued: current.rescued + (rescued ? 1 : 0),
+          }))
+          appendLog(
+            rescued ? '慢速请求已中止并重新调度' : '低优先级请求已暂停并让出通道',
+            rescued ? 'rescued' : 'preempted',
+            {
+              tag: rescued ? '慢速补救' : '请求抢占',
+              details: [
+                {
+                  label: 'Segment',
+                  value: `${String(event.segmentSn)} · ${event.segmentStart.toFixed(2)}s`,
+                },
+                {
+                  label: '请求范围',
+                  value: formatRange(event.requestStart, event.requestEnd),
+                },
+                {
+                  label: '本次加载',
+                  value: `${formatBytes(event.loadedBytes)} · Chunk 累计 ${formatBytes(event.chunkLoadedBytes)}`,
+                },
+                {
+                  label: '剩余数据',
+                  value: formatBytes(event.remainingBytes),
+                },
+                {
+                  label: '当前速率',
+                  value: formatThroughput(event.throughputBytesPerSecond),
+                },
+                ...(event.baselineThroughputBytesPerSecond === undefined
+                  ? []
+                  : [
+                      {
+                        label: '参考速率',
+                        value: formatThroughput(event.baselineThroughputBytesPerSecond),
+                      },
+                    ]),
+                {
+                  label: '请求状态',
+                  value: `${event.elapsedMs.toFixed(0)} ms · Attempt ${event.attempt}`,
+                },
+              ],
+            },
+          )
+        },
       })
       parallelLoaderRef.current = FragmentLoader
       const hls = new Hls({
         autoStartLoad: false,
         preferManagedMediaSource: true,
         preserveManualLevelOnError: true,
-        progressive: true,
+        progressive: false,
         ...(loaderMode === 'parallel' ? { fLoader: FragmentLoader } : {}),
       })
 
@@ -185,7 +283,7 @@ export function App() {
         hls.loadLevel = highestLevel
         hls.startLoad()
         setStatus(`固定清晰度: ${highestLabel}`)
-        appendLog(`Manifest 解析完成, 固定 ${highestLabel}`, 'success')
+        appendLog(`Manifest 解析完成, 固定 ${highestLabel}`, 'success', { tag: 'Manifest' })
         void video.play().catch(() => {
           setStatus('已就绪, 请点击播放器开始')
         })
@@ -193,11 +291,23 @@ export function App() {
       hls.on(Hls.Events.FRAG_LOADING, (_, data) => {
         const part =
           data.part === null || data.part === undefined ? '' : `, Part ${data.part.index}`
-        appendLog(`开始加载 Segment ${String(data.frag.sn)}${part}`)
+        appendLog(`开始加载 Segment ${String(data.frag.sn)}${part}`, 'default', {
+          tag: 'Segment',
+          details: [
+            { label: 'Level', value: `L${data.frag.level}` },
+            { label: '时间位置', value: `${data.frag.start.toFixed(2)}s` },
+          ],
+        })
       })
       hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
-        const size = (data.frag.stats.loaded / 1024).toFixed(0)
-        appendLog(`Segment ${String(data.frag.sn)} 完成, ${size} KiB`, 'success')
+        const elapsed = data.frag.stats.loading.end - data.frag.stats.loading.start
+        appendLog(`Segment ${String(data.frag.sn)} 加载完成`, 'success', {
+          tag: '加载完成',
+          details: [
+            { label: '数据量', value: formatBytes(data.frag.stats.loaded) },
+            { label: '耗时', value: `${elapsed.toFixed(0)} ms` },
+          ],
+        })
       })
       hls.on(Hls.Events.FRAG_CHANGED, (_, data) => {
         const levelIndex = data.frag.level
@@ -215,11 +325,15 @@ export function App() {
 
         if (playbackLevelIndexRef.current !== levelIndex) {
           playbackLevelIndexRef.current = levelIndex
-          appendLog(`实际播放切换到 ${level.width}×${level.height}`, 'success')
+          appendLog(`实际播放切换到 ${level.width}×${level.height}`, 'success', {
+            tag: '播放',
+          })
         }
       })
       hls.on(Hls.Events.ERROR, (_, data) => {
-        appendLog(`${data.details}: ${data.error.message}`, 'error')
+        appendLog(`${data.details}: ${data.error.message}`, data.fatal ? 'error' : 'default', {
+          tag: data.fatal ? '错误' : '自动恢复',
+        })
         if (data.fatal) {
           setStatus(`播放失败: ${data.details}`)
         }
@@ -231,6 +345,8 @@ export function App() {
         loaderMode === 'parallel'
           ? `启用 ${DEFAULT_MAX_CONCURRENCY} 路并行 Range Loader`
           : '启用 hls.js 原生 FetchLoader',
+        'default',
+        { tag: '加载器' },
       )
       return
     }
@@ -238,13 +354,13 @@ export function App() {
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = normalizedSource
       setStatus('使用原生 HLS, 不启用并行 Loader')
-      appendLog('当前环境回退到原生 HLS')
+      appendLog('当前环境回退到原生 HLS', 'default', { tag: '加载器' })
       void video.play().catch(() => {})
       return
     }
 
     setStatus('当前浏览器不支持 HLS')
-    appendLog('没有可用的 HLS 播放路径', 'error')
+    appendLog('没有可用的 HLS 播放路径', 'error', { tag: '错误' })
   }, [appendLog, loaderMode, source])
 
   const handleLoaderModeChange = (value: string) => {
@@ -259,12 +375,14 @@ export function App() {
 
     if (mode === 'parallel') {
       hls.config.fLoader = parallelLoader
-      appendLog('切换到并行 Range, 从后续新 Fragment 生效')
+      appendLog('切换到并行 Range, 从后续新 Fragment 生效', 'default', { tag: '加载器' })
       return
     }
 
     delete hls.config.fLoader
-    appendLog('切换到 hls.js 原生加载, 从后续新 Fragment 生效')
+    appendLog('切换到 hls.js 原生加载, 从后续新 Fragment 生效', 'default', {
+      tag: '加载器',
+    })
   }
 
   const handleLevelChange = (value: string) => {
@@ -279,13 +397,13 @@ export function App() {
     hls.nextLevel = level
     if (level === -1) {
       setStatus('自动清晰度')
-      appendLog('重新启用 ABR')
+      appendLog('重新启用 ABR', 'default', { tag: '清晰度' })
       return
     }
 
     const label = qualityLevels.find(option => option.index === level)?.label ?? `Level ${level}`
     setStatus(`固定清晰度: ${label}`)
-    appendLog(`切换固定清晰度到 ${label}`)
+    appendLog(`切换固定清晰度到 ${label}`, 'default', { tag: '清晰度' })
   }
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -403,8 +521,29 @@ export function App() {
 
           <div className="log-panel">
             <div className="log-heading">
-              <h2>加载事件</h2>
-              <span>{logs.length} 条</span>
+              <div className="log-title">
+                <h2>加载事件</h2>
+                <span>{logs.length} 条</span>
+              </div>
+              <div className="log-summary">
+                <span className="event-counter" data-tone="preempted">
+                  抢占 {loaderEventCounts.preempted}
+                </span>
+                <span className="event-counter" data-tone="rescued">
+                  补救 {loaderEventCounts.rescued}
+                </span>
+                <button
+                  className="clear-log"
+                  type="button"
+                  disabled={logs.length === 0}
+                  onClick={() => {
+                    setLogs([])
+                    setLoaderEventCounts(initialLoaderEventCounts)
+                  }}
+                >
+                  清空
+                </button>
+              </div>
             </div>
             <ol aria-live="polite">
               {logs.length === 0 ? (
@@ -412,8 +551,23 @@ export function App() {
               ) : (
                 logs.map(log => (
                   <li key={log.id} data-tone={log.tone}>
-                    <time>{log.time}</time>
-                    <span>{log.message}</span>
+                    <div className="log-meta">
+                      <time>{log.time}</time>
+                      <span className="log-tag">{log.tag}</span>
+                    </div>
+                    <div className="log-content">
+                      <strong>{log.message}</strong>
+                      {log.details.length === 0 ? null : (
+                        <dl>
+                          {log.details.map(detail => (
+                            <div key={detail.label}>
+                              <dt>{detail.label}</dt>
+                              <dd>{detail.value}</dd>
+                            </div>
+                          ))}
+                        </dl>
+                      )}
+                    </div>
                   </li>
                 ))
               )}

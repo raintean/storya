@@ -1,5 +1,3 @@
-export type MediaLane = 'audio' | 'main' | 'other'
-
 export interface SchedulerOptions {
   getPlaybackRate: () => number
   getPlaybackTime: () => number
@@ -29,7 +27,7 @@ const defaultThroughputBytesPerSecond = 2_000_000
 const throughputEwmaAlpha = 0.3
 
 export class ChunkScheduler {
-  private readonly estimates = new Map<MediaLane, ThroughputEstimate>()
+  private estimate: ThroughputEstimate | undefined
   private readonly options: SchedulerOptions
   private readonly tasks = new Set<ScheduledChunk>()
   private schedulePending = false
@@ -57,19 +55,19 @@ export class ChunkScheduler {
     this.requestSchedule()
   }
 
-  getEstimatedThroughput(lane: MediaLane): number {
-    return this.estimates.get(lane)?.bytesPerSecond ?? defaultThroughputBytesPerSecond
+  getEstimatedThroughput(): number {
+    return this.estimate?.bytesPerSecond ?? defaultThroughputBytesPerSecond
   }
 
-  reportThroughput(lane: MediaLane, bytes: number, durationMs: number): void {
+  reportThroughput(bytes: number, durationMs: number): void {
     if (bytes <= 0 || durationMs < 100) {
       return
     }
 
     const sample = (bytes * 1_000) / durationMs
-    const current = this.estimates.get(lane)
+    const current = this.estimate
     if (current === undefined) {
-      this.estimates.set(lane, { bytesPerSecond: sample, samples: 1 })
+      this.estimate = { bytesPerSecond: sample, samples: 1 }
       return
     }
 
@@ -78,8 +76,8 @@ export class ChunkScheduler {
     current.samples += 1
   }
 
-  hasThroughputSample(lane: MediaLane): boolean {
-    return (this.estimates.get(lane)?.samples ?? 0) > 0
+  hasThroughputSamples(minimumSamples: number): boolean {
+    return (this.estimate?.samples ?? 0) >= minimumSamples
   }
 
   private ensureTimer(): void {

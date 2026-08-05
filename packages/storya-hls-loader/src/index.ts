@@ -35,6 +35,7 @@ export function createParallelFragmentLoader(
     idleTimeoutMs: 5_000,
     maxLookAheadBytes: chunkSize * maxConcurrency,
     maxRescueAttempts: 2,
+    minSlowThroughputSamples: 3,
     minRequestLifetimeMs: 300,
     onEvent: options.onEvent ?? (() => undefined),
     slowThroughputRatio: 0.35,

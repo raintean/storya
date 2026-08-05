@@ -1,5 +1,3 @@
-import type { MediaLane } from './scheduler'
-
 export type ParallelFragmentLoaderAbortReason = 'preempted' | 'slow-connection'
 
 export interface ParallelFragmentLoaderAbortEvent {
@@ -9,7 +7,6 @@ export interface ParallelFragmentLoaderAbortEvent {
   chunkLoadedBytes: number
   chunkStart: number
   elapsedMs: number
-  lane: MediaLane
   loadedBytes: number
   reason: ParallelFragmentLoaderAbortReason
   remainingBytes: number | undefined
