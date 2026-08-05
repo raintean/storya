@@ -8,12 +8,17 @@ import {
 } from 'storya-protocol'
 import { FetchHttpTransport } from './fetch-http-transport'
 import { WebSocketHttpTransport } from './websocket-http-transport'
-import type { WebSocketFactory, WebSocketLike } from './websocket-http-transport'
+import type {
+  WebSocketFactory,
+  WebSocketHttpTransportDebugEvent,
+  WebSocketLike,
+} from './websocket-http-transport'
 
 class FakeRelay {
   readonly clients: FakeWebSocket[] = []
   requestCount = 0
   respondToPing = true
+  sendResponseHeadBeforeCancel = false
 
   readonly factory: WebSocketFactory = () => {
     const socket = new FakeWebSocket(this)
@@ -30,6 +35,21 @@ class FakeRelay {
       return
     }
     if (frame.kind === TransportFrameKind.CANCEL) {
+      if (this.sendResponseHeadBeforeCancel) {
+        const response = create(HttpResponseHeadSchema, {
+          headers: [{ name: 'content-length', value: '0' }],
+          status: 200,
+          statusText: 'OK',
+          url: 'https://example.com/hang',
+        })
+        socket.receive(
+          encodeTransportFrame(
+            TransportFrameKind.RESPONSE_HEAD,
+            frame.sequence,
+            toBinary(HttpResponseHeadSchema, response),
+          ),
+        )
+      }
       socket.receive(encodeTransportFrame(TransportFrameKind.CANCELED, frame.sequence))
       return
     }
@@ -196,6 +216,32 @@ async function testCancellation(): Promise<void> {
   transport.destroy()
 }
 
+async function testCancellationResponseHeadRace(): Promise<void> {
+  const relay = new FakeRelay()
+  relay.sendResponseHeadBeforeCancel = true
+  const transport = createTransport(relay)
+  const controller = new AbortController()
+  const response = transport.request(
+    new Request('https://example.com/hang', { signal: controller.signal }),
+  )
+  await waitFor(() => relay.requestCount === 1)
+  controller.abort()
+
+  let aborted = false
+  try {
+    await response
+  } catch (error) {
+    aborted = error instanceof DOMException && error.name === 'AbortError'
+  }
+  assert(aborted, '取消竞态没有返回 AbortError')
+  await waitFor(() => relay.clients[0]?.readyState === 1)
+
+  const next = await transport.request(new Request('https://example.com/after-cancel'))
+  await next.arrayBuffer()
+  assert(relay.clients.length === 1, '取消竞态错误关闭了可复用的 WebSocket')
+  transport.destroy()
+}
+
 async function testRequestAging(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay, 1)
@@ -204,6 +250,40 @@ async function testRequestAging(): Promise<void> {
   const second = await transport.request(new Request('https://example.com/second'))
   await second.arrayBuffer()
   assert(relay.clients.length === 2, '达到请求次数后没有退休旧连接')
+  transport.destroy()
+}
+
+async function testConnectionDiagnostics(): Promise<void> {
+  const relay = new FakeRelay()
+  const events: WebSocketHttpTransportDebugEvent[] = []
+  const transport = new WebSocketHttpTransport('wss://relay.example.com/transport', {
+    connectTimeoutMs: 1_000,
+    debug: event => events.push(event),
+    heartbeatIntervalMs: 60_000,
+    idleConnectionTimeoutMs: 60_000,
+    maxConnectionLifetimeMs: 60_000,
+    maxConnections: 12,
+    maxRequestsPerConnection: 1,
+    webSocketFactory: relay.factory,
+  })
+
+  const response = await transport.request(new Request('https://example.com/diagnostics'))
+  await response.arrayBuffer()
+
+  assert(
+    events.some(event => event.type === 'connection-created'),
+    '没有记录 WebSocket 创建事件',
+  )
+  assert(
+    events.some(event => event.type === 'connection-opened'),
+    '没有记录 WebSocket 建立事件',
+  )
+  const closed = events.find(event => event.type === 'connection-closed')
+  assert(closed !== undefined, '没有记录 WebSocket 关闭事件')
+  assert(closed.code === 1000, 'WebSocket 主动关闭码记录错误')
+  assert(closed.initiator === 'local', 'WebSocket 主动关闭方记录错误')
+  assert(closed.reason === 'max-requests', 'WebSocket 请求次数退休原因记录错误')
+  assert(closed.requestCount === 1, 'WebSocket 关闭时请求次数记录错误')
   transport.destroy()
 }
 
@@ -308,7 +388,9 @@ await testSequentialReuse()
 await testConcurrentGrowth()
 await testHeadContentLength()
 await testCancellation()
+await testCancellationResponseHeadRace()
 await testRequestAging()
+await testConnectionDiagnostics()
 await testHeartbeatTimeout()
 await testConnectionFactoryFailure()
 await testInvalidResponseLimit()

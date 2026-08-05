@@ -264,6 +264,7 @@ export function App() {
             ? {}
             : {
                 transport: new WebSocketHttpTransport(relayEndpoint, {
+                  debug: true,
                   maxConnections: DEFAULT_MAX_CONCURRENCY * 2,
                 }),
               }),

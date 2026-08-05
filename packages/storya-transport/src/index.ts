@@ -19,6 +19,9 @@ export {
 } from './websocket-http-transport'
 export type {
   WebSocketFactory,
+  WebSocketHttpTransportDebugEvent,
+  WebSocketHttpTransportDebugEventType,
+  WebSocketHttpTransportDebugLogger,
   WebSocketHttpTransportOptions,
   WebSocketLike,
 } from './websocket-http-transport'

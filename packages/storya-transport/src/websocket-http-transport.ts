@@ -41,9 +41,33 @@ export interface WebSocketLike {
 
 export type WebSocketFactory = (url: string) => WebSocketLike
 
+export type WebSocketHttpTransportDebugEventType =
+  | 'connection-created'
+  | 'connection-opened'
+  | 'connection-closed'
+
+export interface WebSocketHttpTransportDebugEvent {
+  ageMs: number
+  code?: number
+  connectionId: number
+  error?: string
+  initiator?: 'local' | 'remote'
+  pendingRequestCount: number
+  poolSize: number
+  reason?: string
+  requestCount: number
+  state: ChannelState
+  timestamp: number
+  type: WebSocketHttpTransportDebugEventType
+  wasClean?: boolean
+}
+
+export type WebSocketHttpTransportDebugLogger = (event: WebSocketHttpTransportDebugEvent) => void
+
 export interface WebSocketHttpTransportOptions {
   connectTimeoutMs?: number
   defaultMaxResponseBytes?: number
+  debug?: boolean | WebSocketHttpTransportDebugLogger
   heartbeatIntervalMs?: number
   heartbeatTimeoutMs?: number
   idleConnectionTimeoutMs?: number
@@ -56,6 +80,7 @@ export interface WebSocketHttpTransportOptions {
 interface ResolvedOptions {
   connectTimeoutMs: number
   defaultMaxResponseBytes: number
+  debugLogger: WebSocketHttpTransportDebugLogger | undefined
   heartbeatIntervalMs: number
   heartbeatTimeoutMs: number
   idleConnectionTimeoutMs: number
@@ -84,17 +109,31 @@ interface ActiveTransaction {
   reject: (reason: unknown) => void
   request: Request
   resolve: (response: HttpTransportResponse) => void
+  responseHeadReceived: boolean
   responseSettled: boolean
   sequence: number
 }
 
 interface ChannelCallbacks {
-  onClosed(channel: WebSocketChannel, error: HttpTransportFailure, opened: boolean): void
+  onClosed(
+    channel: WebSocketChannel,
+    error: HttpTransportFailure,
+    opened: boolean,
+    details: ChannelCloseDetails,
+  ): void
   onIdle(channel: WebSocketChannel): void
   onOpen(channel: WebSocketChannel): void
 }
 
 type ChannelState = 'closed' | 'connecting' | 'idle' | 'running'
+type ChannelRetirementReason = 'idle' | 'max-lifetime' | 'max-requests'
+
+interface ChannelCloseDetails {
+  code: number
+  initiator: 'local' | 'remote'
+  reason: string
+  wasClean?: boolean
+}
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
@@ -114,6 +153,7 @@ export class WebSocketHttpTransport implements HttpTransport {
   private readonly maintenanceTimer: number
   private readonly options: ResolvedOptions
   private readonly pending: PendingRequest[] = []
+  private nextChannelId = 0
   private readonly url: string
 
   constructor(url: string, options: WebSocketHttpTransportOptions = {}) {
@@ -187,11 +227,17 @@ export class WebSocketHttpTransport implements HttpTransport {
   }
 
   private createChannel(): void {
+    this.nextChannelId += 1
+    const channelId = this.nextChannelId
     let channel: WebSocketChannel
     try {
-      channel = new WebSocketChannel(this.url, this.options, {
-        onClosed: (closed, error, opened) => {
+      channel = new WebSocketChannel(channelId, this.url, this.options, {
+        onClosed: (closed, error, opened, details) => {
           this.channels.delete(closed)
+          this.emitDebug(closed, 'connection-closed', {
+            ...details,
+            error: error.message,
+          })
           if (!opened) {
             const pending = this.pending.shift()
             if (pending !== undefined) {
@@ -202,7 +248,10 @@ export class WebSocketHttpTransport implements HttpTransport {
           this.drain()
         },
         onIdle: () => this.drain(),
-        onOpen: () => this.drain(),
+        onOpen: opened => {
+          this.emitDebug(opened, 'connection-opened')
+          this.drain()
+        },
       })
     } catch (cause) {
       const pending = this.pending.shift()
@@ -215,6 +264,35 @@ export class WebSocketHttpTransport implements HttpTransport {
       return
     }
     this.channels.add(channel)
+    this.emitDebug(channel, 'connection-created', { reason: 'pending-request' })
+  }
+
+  private emitDebug(
+    channel: WebSocketChannel,
+    type: WebSocketHttpTransportDebugEventType,
+    details: Partial<
+      Pick<WebSocketHttpTransportDebugEvent, 'code' | 'error' | 'initiator' | 'reason' | 'wasClean'>
+    > = {},
+  ): void {
+    const logger = this.options.debugLogger
+    if (logger === undefined) {
+      return
+    }
+    try {
+      logger({
+        ageMs: channel.getAgeMs(),
+        connectionId: channel.getId(),
+        pendingRequestCount: this.pending.length,
+        poolSize: this.channels.size,
+        requestCount: channel.getRequestCount(),
+        state: channel.getState(),
+        timestamp: Date.now(),
+        type,
+        ...details,
+      })
+    } catch {
+      // 调试日志不能影响 Transport 请求
+    }
   }
 
   private drain(): void {
@@ -277,22 +355,32 @@ export class WebSocketHttpTransport implements HttpTransport {
 class WebSocketChannel {
   private active: ActiveTransaction | undefined
   private readonly callbacks: ChannelCallbacks
+  private readonly connectionId: number
   private readonly connectTimer: number
+  private readonly createdAt = performance.now()
   private heartbeatSequence = 0
   private idleSince = performance.now()
   private lastWireActivityAt = performance.now()
   private readonly lifetimeExpiresAt: number
+  private localCloseDetails: ChannelCloseDetails | undefined
   private opened = false
   private readonly options: ResolvedOptions
   private pingSequence: number | undefined
   private pingSentAt: number | undefined
   private requests = 0
+  private retirementReason: ChannelRetirementReason | undefined
   private retiring = false
   private sequence = 0
   private readonly socket: WebSocketLike
   private state: ChannelState = 'connecting'
 
-  constructor(url: string, options: ResolvedOptions, callbacks: ChannelCallbacks) {
+  constructor(
+    connectionId: number,
+    url: string,
+    options: ResolvedOptions,
+    callbacks: ChannelCallbacks,
+  ) {
+    this.connectionId = connectionId
     this.options = options
     this.callbacks = callbacks
     this.lifetimeExpiresAt =
@@ -322,6 +410,22 @@ class WebSocketChannel {
     return this.idleSince
   }
 
+  getAgeMs(): number {
+    return performance.now() - this.createdAt
+  }
+
+  getId(): number {
+    return this.connectionId
+  }
+
+  getRequestCount(): number {
+    return this.requests
+  }
+
+  getState(): ChannelState {
+    return this.state
+  }
+
   execute(request: Request, maxResponseBytes: number): Promise<HttpTransportResponse> {
     if (!this.isAvailable()) {
       return Promise.reject(
@@ -333,6 +437,7 @@ class WebSocketChannel {
     this.requests += 1
     if (this.requests >= this.options.maxRequestsPerConnection) {
       this.retiring = true
+      this.retirementReason = 'max-requests'
     }
     const sequence = this.nextSequence()
 
@@ -348,6 +453,7 @@ class WebSocketChannel {
         reject,
         request,
         resolve,
+        responseHeadReceived: false,
         responseSettled: false,
         sequence,
       }
@@ -376,8 +482,9 @@ class WebSocketChannel {
     }
     if (now >= this.lifetimeExpiresAt) {
       this.retiring = true
+      this.retirementReason ??= 'max-lifetime'
       if (this.state === 'idle') {
-        this.retire('aged')
+        this.retire('max-lifetime')
         return
       }
     }
@@ -407,10 +514,11 @@ class WebSocketChannel {
     }
   }
 
-  retire(reason: 'aged' | 'idle'): void {
+  retire(reason: ChannelRetirementReason): void {
     this.retiring = true
+    this.retirementReason ??= reason
     if (this.state === 'idle') {
-      this.close(1000, reason)
+      this.close(1000, this.retirementReason)
     }
   }
 
@@ -447,11 +555,18 @@ class WebSocketChannel {
   }
 
   private readonly handleClose = (event: CloseEvent): void => {
+    const details = this.localCloseDetails ?? {
+      code: event.code,
+      initiator: 'remote' as const,
+      reason: event.reason,
+      wasClean: event.wasClean,
+    }
     this.finalizeClose(
       new HttpTransportFailure(
         'connection-failed',
         event.reason || `WebSocket 连接已关闭 (${event.code})`,
       ),
+      details,
     )
   }
 
@@ -487,7 +602,11 @@ class WebSocketChannel {
     if (active === undefined || frame.sequence !== active.sequence) {
       return
     }
-    if (active.cancelRequested && frame.kind === TransportFrameKind.RESPONSE_BODY) {
+    if (
+      active.cancelRequested &&
+      (frame.kind === TransportFrameKind.RESPONSE_HEAD ||
+        frame.kind === TransportFrameKind.RESPONSE_BODY)
+    ) {
       return
     }
 
@@ -524,14 +643,14 @@ class WebSocketChannel {
   }
 
   private acceptResponseHead(active: ActiveTransaction, payload: Uint8Array): void {
-    if (active.responseSettled) {
+    if (active.responseHeadReceived) {
       throw new HttpTransportFailure('protocol-error', '重复收到 HTTP response head')
     }
     const head = fromBinary(HttpResponseHeadSchema, payload)
     if (head.status < 100 || head.status > 599) {
       throw new HttpTransportFailure('invalid-response', `无效的 HTTP status: ${head.status}`)
     }
-
+    active.responseHeadReceived = true
     const headers = new Headers()
     for (const header of head.headers) {
       headers.append(header.name, header.value)
@@ -576,7 +695,7 @@ class WebSocketChannel {
   }
 
   private acceptResponseBody(active: ActiveTransaction, payload: Uint8Array): void {
-    if (!active.responseSettled || active.request.method === 'HEAD') {
+    if (!active.responseHeadReceived || active.request.method === 'HEAD') {
       throw new HttpTransportFailure('protocol-error', 'HTTP response body 早于 response head')
     }
     active.bytesReceived += payload.byteLength
@@ -594,7 +713,7 @@ class WebSocketChannel {
   }
 
   private acceptResponseEnd(active: ActiveTransaction): void {
-    if (!active.responseSettled && !active.cancelRequested) {
+    if (!active.responseHeadReceived && !active.cancelRequested) {
       throw new HttpTransportFailure('protocol-error', 'HTTP response 在 response head 前结束')
     }
     if (!active.cancelRequested && !active.bodyCanceled) {
@@ -672,7 +791,7 @@ class WebSocketChannel {
     this.idleSince = performance.now()
     this.state = 'idle'
     if (this.retiring) {
-      this.close(1000, 'retired')
+      this.close(1000, this.retirementReason ?? 'max-lifetime')
       return
     }
     this.callbacks.onIdle(this)
@@ -708,6 +827,8 @@ class WebSocketChannel {
     if (this.state === 'closed') {
       return
     }
+    const details: ChannelCloseDetails = { code, initiator: 'local', reason }
+    this.localCloseDetails = details
     if (
       this.socket.readyState === WEB_SOCKET_CONNECTING ||
       this.socket.readyState === WEB_SOCKET_OPEN
@@ -720,10 +841,11 @@ class WebSocketChannel {
     }
     this.finalizeClose(
       error ?? new HttpTransportFailure('connection-failed', `WebSocket 已关闭: ${reason}`),
+      details,
     )
   }
 
-  private finalizeClose(error: HttpTransportFailure): void {
+  private finalizeClose(error: HttpTransportFailure, details: ChannelCloseDetails): void {
     if (this.state === 'closed') {
       return
     }
@@ -735,7 +857,7 @@ class WebSocketChannel {
     this.socket.removeEventListener('message', this.handleMessage)
     this.socket.removeEventListener('error', this.handleError)
     this.socket.removeEventListener('close', this.handleClose)
-    this.callbacks.onClosed(this, error, opened)
+    this.callbacks.onClosed(this, error, opened, details)
   }
 
   private nextSequence(): number {
@@ -761,6 +883,7 @@ function resolveOptions(options: WebSocketHttpTransportOptions): ResolvedOptions
       options.defaultMaxResponseBytes,
       DEFAULT_MAX_RESPONSE_BYTES,
     ),
+    debugLogger: resolveDebugLogger(options.debug),
     heartbeatIntervalMs: positiveNumber(options.heartbeatIntervalMs, DEFAULT_HEARTBEAT_INTERVAL_MS),
     heartbeatTimeoutMs: positiveNumber(options.heartbeatTimeoutMs, DEFAULT_HEARTBEAT_TIMEOUT_MS),
     idleConnectionTimeoutMs: positiveNumber(
@@ -777,6 +900,25 @@ function resolveOptions(options: WebSocketHttpTransportOptions): ResolvedOptions
       DEFAULT_MAX_REQUESTS_PER_CONNECTION,
     ),
     webSocketFactory: options.webSocketFactory ?? (url => new WebSocket(url)),
+  }
+}
+
+function resolveDebugLogger(
+  debug: boolean | WebSocketHttpTransportDebugLogger | undefined,
+): WebSocketHttpTransportDebugLogger | undefined {
+  if (typeof debug === 'function') {
+    return debug
+  }
+  if (debug !== true) {
+    return undefined
+  }
+  return event => {
+    const labels: Record<WebSocketHttpTransportDebugEventType, string> = {
+      'connection-closed': '连接关闭',
+      'connection-created': '创建连接',
+      'connection-opened': '连接建立',
+    }
+    console.info(`[storya-transport] WebSocket #${event.connectionId} ${labels[event.type]}`, event)
   }
 }
 
