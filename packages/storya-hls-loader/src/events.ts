@@ -1,6 +1,6 @@
-export type ParallelFragmentLoaderAbortReason = 'preempted' | 'slow-connection'
+export type HlsLoaderAbortReason = 'preempted' | 'slow-connection'
 
-export interface ParallelFragmentLoaderAbortEvent {
+export interface HlsLoaderAbortEvent {
   attempt: number
   baselineThroughputBytesPerSecond: number | undefined
   chunkEnd: number | undefined
@@ -8,7 +8,7 @@ export interface ParallelFragmentLoaderAbortEvent {
   chunkStart: number
   elapsedMs: number
   loadedBytes: number
-  reason: ParallelFragmentLoaderAbortReason
+  reason: HlsLoaderAbortReason
   remainingBytes: number | undefined
   requestEnd: number | undefined
   requestStart: number
@@ -21,6 +21,24 @@ export interface ParallelFragmentLoaderAbortEvent {
   url: string
 }
 
-export type ParallelFragmentLoaderEvent = ParallelFragmentLoaderAbortEvent
+export type HlsLoaderSegmentAction =
+  | 'demand-loading'
+  | 'demand-miss'
+  | 'demand-ready'
+  | 'prefetch-cancelled'
+  | 'prefetch-ready'
+  | 'prefetch-started'
 
-export type ParallelFragmentLoaderEventHandler = (event: ParallelFragmentLoaderEvent) => void
+export interface HlsLoaderSegmentEvent {
+  action: HlsLoaderSegmentAction
+  segmentSn: number | string
+  segmentStart: number
+  streamId: string
+  timestamp: number
+  type: 'segment-state'
+  url: string
+}
+
+export type HlsLoaderEvent = HlsLoaderAbortEvent | HlsLoaderSegmentEvent
+
+export type HlsLoaderEventHandler = (event: HlsLoaderEvent) => void

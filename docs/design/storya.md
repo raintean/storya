@@ -15,8 +15,8 @@ Storya 当前包含三类运行端:
 中心服务      storya-api
 边缘服务      storya-playback-relay
 
-共享能力      storya-player      storya-protocol
-              播放器组件          跨语言协议
+共享能力      storya-player      storya-protocol      storya-hls-loader
+              播放器组件          跨语言协议            HLS 并行加载
 ```
 
 - `storya-web` 面向最终用户，负责视频浏览、播放和用户交互。当前仅包含基础页面骨架，并已经使用 `storya-player`。
@@ -25,6 +25,7 @@ Storya 当前包含三类运行端:
 - `storya-playback-relay` 是部署在 Cloudflare Workers 的边缘播放中继。当前实现 `/health`，其他路径返回 `501`，尚未实现回源、鉴权、缓存或流量调度。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
 - `storya-protocol` 是 Rust 和 TypeScript 共用的协议包。当前包含健康检查 Schema 和生成类型，但尚未接入 `storya-api` 的 HTTP 路由。
+- `storya-hls-loader` 是基于 hls.js fLoader 的并行加载包。它通过独立虚拟流维护主画面和音轨的 Segment 需求，以每流 6 Segment 预填充窗口和全局 6 路 GET/Range 并发执行跨 Segment、Segment 内并行加载，不负责媒体解码、解密或 transmux。
 
 目标业务关系是:
 
@@ -54,6 +55,7 @@ storya/
 │   └── storya-playback-relay/
 ├── packages/
 │   ├── storya-player/
+│   ├── storya-hls-loader/
 │   └── storya-protocol/
 └── docs/
     ├── design/
@@ -149,6 +151,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 - Rust 和 pnpm workspace 骨架。
 - Web、Admin、中心 API 和播放中继的最小可运行项目。
 - 框架无关播放器 Web Component。
+- HLS 虚拟流、跨 Segment 预填充、Segment 内 Range 并行、请求抢占和慢速补救。
 - Protobuf/Buf 跨语言生成链路。
 - 统一工具链、Makefile、格式化和 lint 配置。
 
@@ -162,4 +165,5 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 ## 修改历史
 
+- 2026-08-05: 增加 HLS 并行加载器边界，并完成虚拟流、跨 Segment 预填充和全局请求调度。
 - 2026-08-04: 建立 Storya 总体设计，明确 apps/services/packages 边界、Protocol 机制、依赖方向和当前实现范围。

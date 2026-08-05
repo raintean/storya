@@ -8,12 +8,13 @@ import type {
   LoaderStats,
 } from 'hls.js'
 import { splitByteRanges } from './byte-ranges'
-import type { ParallelFragmentLoaderAbortEvent, ParallelFragmentLoaderEventHandler } from './events'
-import { ChunkScheduler } from './scheduler'
-import type { ScheduledChunk } from './scheduler'
+import type { HlsLoaderDiagnosticChunk, HlsLoaderDiagnosticChunkState } from './diagnostics'
+import type { HlsLoaderAbortEvent, HlsLoaderEventHandler } from './events'
+import { RequestScheduler } from './scheduler'
+import type { ScheduledRequest } from './scheduler'
 import { createLoaderStats } from './stats'
 
-export interface ParallelFragmentLoaderOptions {
+export interface SegmentLoaderOptions {
   chunkSize: number
   finishingRatio: number
   finishingRemainingMs: number
@@ -22,7 +23,7 @@ export interface ParallelFragmentLoaderOptions {
   maxRescueAttempts: number
   minSlowThroughputSamples: number
   minRequestLifetimeMs: number
-  onEvent: ParallelFragmentLoaderEventHandler
+  onEvent: HlsLoaderEventHandler
   slowThroughputRatio: number
   slowThroughputWindowMs: number
 }
@@ -56,6 +57,7 @@ type AttemptStopReason = 'complete' | 'failure' | 'preempted' | 'slow'
 type RangeMode = 'probing' | 'supported' | 'unsupported'
 
 const contentRangePattern = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i
+const hardDemandPriorityBoostMs = 1_000_000_000
 const progressiveHighWaterMark = 128 * 1024
 
 let nextChunkId = 0
@@ -72,23 +74,29 @@ class TransportError extends Error {
   }
 }
 
-export class ParallelFragmentLoader implements Loader<FragmentLoaderContext> {
+export class SegmentLoader implements Loader<FragmentLoaderContext> {
   context: FragmentLoaderContext | null = null
   stats: LoaderStats = createLoaderStats()
 
   private coordinator: SegmentLoadCoordinator | null = null
   private readonly hlsConfig: HlsConfig
-  private readonly options: ParallelFragmentLoaderOptions
-  private readonly scheduler: ChunkScheduler
+  private readonly isHardDemanded: () => boolean
+  private readonly onStats: (stats: LoaderStats) => void
+  private readonly options: SegmentLoaderOptions
+  private readonly scheduler: RequestScheduler
 
   constructor(
     hlsConfig: HlsConfig,
-    scheduler: ChunkScheduler,
-    options: ParallelFragmentLoaderOptions,
+    scheduler: RequestScheduler,
+    options: SegmentLoaderOptions,
+    onStats: (stats: LoaderStats) => void = () => undefined,
+    isHardDemanded: () => boolean = () => false,
   ) {
     this.hlsConfig = hlsConfig
     this.scheduler = scheduler
     this.options = options
+    this.onStats = onStats
+    this.isHardDemanded = isHardDemanded
   }
 
   load(
@@ -97,7 +105,7 @@ export class ParallelFragmentLoader implements Loader<FragmentLoaderContext> {
     callbacks: LoaderCallbacks<FragmentLoaderContext>,
   ): void {
     if (this.coordinator !== null) {
-      throw new Error('ParallelFragmentLoader 的实例只能加载一次')
+      throw new Error('SegmentLoader 的实例只能加载一次')
     }
 
     this.context = context
@@ -109,6 +117,8 @@ export class ParallelFragmentLoader implements Loader<FragmentLoaderContext> {
       config,
       callbacks,
       this.stats,
+      this.onStats,
+      this.isHardDemanded,
     )
     this.coordinator.start()
   }
@@ -131,14 +141,18 @@ export class ParallelFragmentLoader implements Loader<FragmentLoaderContext> {
   getResponseHeader(name: string): string | null {
     return this.coordinator?.getResponseHeader(name) ?? null
   }
+
+  getDiagnostics(): HlsLoaderDiagnosticChunk[] {
+    return this.coordinator?.getDiagnostics() ?? []
+  }
 }
 
 class SegmentLoadCoordinator {
   readonly callbacks: LoaderCallbacks<FragmentLoaderContext>
   readonly context: FragmentLoaderContext
   readonly loaderConfig: LoaderConfiguration
-  readonly options: ParallelFragmentLoaderOptions
-  readonly scheduler: ChunkScheduler
+  readonly options: SegmentLoaderOptions
+  readonly scheduler: RequestScheduler
   readonly stats: LoaderStats
 
   private aborted = false
@@ -161,15 +175,19 @@ class SegmentLoadCoordinator {
   private validator: string | null = null
   private wireBytes = 0
   private readonly hlsConfig: HlsConfig
+  private readonly isHardDemanded: () => boolean
+  private readonly onStats: (stats: LoaderStats) => void
 
   constructor(
     hlsConfig: HlsConfig,
-    scheduler: ChunkScheduler,
-    options: ParallelFragmentLoaderOptions,
+    scheduler: RequestScheduler,
+    options: SegmentLoaderOptions,
     context: FragmentLoaderContext,
     loaderConfig: LoaderConfiguration,
     callbacks: LoaderCallbacks<FragmentLoaderContext>,
     stats: LoaderStats,
+    onStats: (stats: LoaderStats) => void,
+    isHardDemanded: () => boolean,
   ) {
     this.hlsConfig = hlsConfig
     this.scheduler = scheduler
@@ -178,9 +196,12 @@ class SegmentLoadCoordinator {
     this.loaderConfig = loaderConfig
     this.callbacks = callbacks
     this.stats = stats
+    this.onStats = onStats
+    this.isHardDemanded = isHardDemanded
     this.finalUrl = context.url
     this.startTime = performance.now()
     this.stats.loading.start = this.startTime
+    this.notifyStats()
     const rangeStart = context.rangeStart ?? 0
     const rangeEnd = context.rangeEnd ?? 0
     if (rangeEnd > rangeStart) {
@@ -272,6 +293,7 @@ class SegmentLoadCoordinator {
     this.resultBuffers.length = 0
     this.stats.aborted = true
     this.stats.loading.end = performance.now()
+    this.notifyStats()
 
     if (notify) {
       this.callbacks.onAbort?.(this.stats, this.context, this.lastResponse)
@@ -292,6 +314,10 @@ class SegmentLoadCoordinator {
     return this.lastResponse?.headers.get(name) ?? null
   }
 
+  getDiagnostics(): HlsLoaderDiagnosticChunk[] {
+    return this.tasks.map(task => task.getDiagnostics())
+  }
+
   getTaskPriority(task: ChunkLoadTask, playbackTime: number, playbackRate: number): number {
     if (this.context.frag.sn === 'initSegment') {
       return Number.NEGATIVE_INFINITY
@@ -306,7 +332,8 @@ class SegmentLoadCoordinator {
     const estimatedMediaTime = segmentStart + segmentDuration * fraction
     const timeUntilPlaybackMs = ((estimatedMediaTime - playbackTime) * 1_000) / playbackRate
     const frontierBoost = task.containsOffset(this.deliveredOffset) ? 500 : 0
-    return timeUntilPlaybackMs - frontierBoost
+    const hardDemandBoost = this.isHardDemanded() ? hardDemandPriorityBoostMs : 0
+    return timeUntilPlaybackMs - frontierBoost - hardDemandBoost
   }
 
   async createResponse(task: ChunkLoadTask, attempt: Attempt): Promise<Response> {
@@ -436,6 +463,7 @@ class SegmentLoadCoordinator {
       this.stats.loaded > 0 && now > this.startTime
         ? (this.stats.loaded * 8_000) / (now - this.startTime)
         : 0
+    this.notifyStats()
     this.lastResponse = response
     task.append(data)
     this.flushContiguousData()
@@ -447,6 +475,7 @@ class SegmentLoadCoordinator {
       this.stats.loading.first = now
     }
     this.lastResponse = response
+    this.notifyStats()
   }
 
   taskCompleted(task: ChunkLoadTask): void {
@@ -475,7 +504,11 @@ class SegmentLoadCoordinator {
     this.scheduler.reportThroughput(bytes, durationMs)
   }
 
-  emitEvent(event: ParallelFragmentLoaderAbortEvent): void {
+  notifyStats(): void {
+    this.onStats(this.stats)
+  }
+
+  emitEvent(event: HlsLoaderAbortEvent): void {
     try {
       this.options.onEvent(event)
     } catch {
@@ -598,6 +631,7 @@ class SegmentLoadCoordinator {
       this.wireBytes > 0 && now > this.startTime
         ? (this.wireBytes * 8_000) / (now - this.startTime)
         : 0
+    this.notifyStats()
 
     const progressive =
       this.callbacks.onProgress !== undefined && Number.isFinite(this.getProgressiveHighWaterMark())
@@ -635,6 +669,7 @@ class SegmentLoadCoordinator {
       this.scheduler.remove(task)
     }
     this.stats.loading.end = performance.now()
+    this.notifyStats()
 
     if (error.timeout) {
       this.callbacks.onTimeout(this.stats, this.context, this.lastResponse)
@@ -821,7 +856,7 @@ class SegmentLoadCoordinator {
   }
 }
 
-class ChunkLoadTask implements ScheduledChunk {
+class ChunkLoadTask implements ScheduledRequest {
   readonly createdAt = performance.now()
   readonly id = ++nextChunkId
   readonly startOffset: number
@@ -837,8 +872,11 @@ class ChunkLoadTask implements ScheduledChunk {
   private end: number | undefined
   private nextRunAt = 0
   private preemptible: boolean
+  private preemptions = 0
   private rescueAttempts = 0
   private retryAttempts = 0
+  private slowRetries = 0
+  private lastStopReason: AttemptStopReason | undefined
   private rangeEnabled: boolean
   private readonly segment: SegmentLoadCoordinator
 
@@ -981,6 +1019,27 @@ class ChunkLoadTask implements ScheduledChunk {
     return (remaining * 1_000) / this.segment.scheduler.getEstimatedThroughput()
   }
 
+  getDiagnostics(): HlsLoaderDiagnosticChunk {
+    const attempt = this.activeAttempt
+    return {
+      attempt: attempt?.id ?? this.attemptSequence,
+      endOffset: this.end,
+      id: this.id,
+      networkRetries: this.retryAttempts,
+      preemptions: this.preemptions,
+      receivedBytes: this.receivedBytes,
+      rescueAttempts: this.rescueAttempts,
+      running: attempt !== null,
+      slowRetries: this.slowRetries,
+      startOffset: this.startOffset,
+      state: this.getDiagnosticState(),
+      throughputBytesPerSecond:
+        attempt === null || attempt.bytes === 0
+          ? 0
+          : (attempt.bytes * 1_000) / Math.max(1, performance.now() - attempt.startedAt),
+    }
+  }
+
   private async performAttempt(attempt: Attempt): Promise<void> {
     try {
       const response = await this.segment.createResponse(this, attempt)
@@ -1080,7 +1139,9 @@ class ChunkLoadTask implements ScheduledChunk {
     attempt.badSince ??= now
     if (now - attempt.badSince >= this.segment.options.slowThroughputWindowMs) {
       this.rescueAttempts += 1
+      this.slowRetries += 1
       this.segment.stats.retry += 1
+      this.segment.notifyStats()
       this.stopActiveAttempt('slow', {
         baselineThroughputBytesPerSecond: baseline,
         throughputBytesPerSecond: speed,
@@ -1101,6 +1162,7 @@ class ChunkLoadTask implements ScheduledChunk {
       this.stopActiveAttempt('failure')
       this.rescueAttempts += 1
       this.segment.stats.retry += 1
+      this.segment.notifyStats()
       const delay = error.timeout ? 0 : 500 * this.rescueAttempts
       this.nextRunAt = performance.now() + delay
       globalThis.setTimeout(() => this.segment.scheduler.notify(), delay)
@@ -1133,6 +1195,7 @@ class ChunkLoadTask implements ScheduledChunk {
 
     this.retryAttempts += 1
     this.segment.stats.retry += 1
+    this.segment.notifyStats()
     const backoff = retryConfig.backoff ?? 'exponential'
     const multiplier = backoff === 'linear' ? this.retryAttempts : 2 ** (this.retryAttempts - 1)
     const delay = Math.min(retryConfig.retryDelayMs * multiplier, retryConfig.maxRetryDelayMs)
@@ -1188,6 +1251,10 @@ class ChunkLoadTask implements ScheduledChunk {
     }
 
     this.activeAttempt = null
+    this.lastStopReason = reason
+    if (reason === 'preempted') {
+      this.preemptions += 1
+    }
     this.clearAttemptTimers(attempt)
     if (reason !== 'complete') {
       attempt.controller.abort()
@@ -1257,6 +1324,28 @@ class ChunkLoadTask implements ScheduledChunk {
 
   private getTotalBytes(): number | undefined {
     return this.end === undefined ? undefined : this.end - this.startOffset
+  }
+
+  private getDiagnosticState(): HlsLoaderDiagnosticChunkState {
+    if (this.cancelled) {
+      return 'cancelled'
+    }
+    if (this.completed) {
+      return 'complete'
+    }
+    if (this.slowRetries > 0 && this.lastStopReason === 'slow') {
+      return 'slow-retrying'
+    }
+    if (this.activeAttempt !== null) {
+      return 'loading'
+    }
+    if (this.lastStopReason === 'preempted') {
+      return 'preempted'
+    }
+    if (this.rescueAttempts > this.slowRetries || this.retryAttempts > 0) {
+      return 'network-retrying'
+    }
+    return 'queued'
   }
 
   private isFinishing(): boolean {

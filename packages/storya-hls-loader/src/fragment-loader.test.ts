@@ -1,5 +1,5 @@
 import type { FragmentLoaderContext, HlsConfig, LoaderConfiguration, LoaderResponse } from 'hls.js'
-import { createParallelFragmentLoader } from './index.ts'
+import { createHlsParallelLoader } from './index.ts'
 
 const payload = new Uint8Array([1, 2, 3, 4])
 const originalFetch = globalThis.fetch
@@ -10,7 +10,8 @@ globalThis.fetch = async () =>
   })
 
 try {
-  const LoaderConstructor = createParallelFragmentLoader()
+  const parallel = createHlsParallelLoader()
+  const LoaderConstructor = parallel.fragmentLoader
   const loader = new LoaderConstructor({} as HlsConfig)
   const progressPayloads: Uint8Array[] = []
   const response = await new Promise<LoaderResponse>((resolve, reject) => {
@@ -27,6 +28,7 @@ try {
     throw new Error('onSuccess 没有收到 ArrayBuffer')
   }
   assertBytes([new Uint8Array(response.data)], 'onSuccess')
+  parallel.destroy()
 } finally {
   globalThis.fetch = originalFetch
 }

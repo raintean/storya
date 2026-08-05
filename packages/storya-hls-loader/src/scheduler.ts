@@ -1,11 +1,11 @@
-export interface SchedulerOptions {
+export interface RequestSchedulerOptions {
   getPlaybackRate: () => number
   getPlaybackTime: () => number
   maxConcurrency: number
   scheduleIntervalMs: number
 }
 
-export interface ScheduledChunk {
+export interface ScheduledRequest {
   readonly createdAt: number
   readonly id: number
 
@@ -26,24 +26,24 @@ interface ThroughputEstimate {
 const defaultThroughputBytesPerSecond = 2_000_000
 const throughputEwmaAlpha = 0.3
 
-export class ChunkScheduler {
+export class RequestScheduler {
   private estimate: ThroughputEstimate | undefined
-  private readonly options: SchedulerOptions
-  private readonly tasks = new Set<ScheduledChunk>()
+  private readonly options: RequestSchedulerOptions
+  private readonly tasks = new Set<ScheduledRequest>()
   private schedulePending = false
   private timer: number | undefined
 
-  constructor(options: SchedulerOptions) {
+  constructor(options: RequestSchedulerOptions) {
     this.options = options
   }
 
-  add(task: ScheduledChunk): void {
+  add(task: ScheduledRequest): void {
     this.tasks.add(task)
     this.ensureTimer()
     this.requestSchedule()
   }
 
-  remove(task: ScheduledChunk): void {
+  remove(task: ScheduledRequest): void {
     this.tasks.delete(task)
     if (this.tasks.size === 0) {
       this.stopTimer()
@@ -57,6 +57,10 @@ export class ChunkScheduler {
 
   getEstimatedThroughput(): number {
     return this.estimate?.bytesPerSecond ?? defaultThroughputBytesPerSecond
+  }
+
+  getActiveRequestCount(): number {
+    return [...this.tasks].filter(task => task.isRunning()).length
   }
 
   reportThroughput(bytes: number, durationMs: number): void {
@@ -117,7 +121,7 @@ export class ChunkScheduler {
     const playbackRate = Math.max(this.readFinite(this.options.getPlaybackRate(), 1), 0.1)
     const available = [...this.tasks].filter(task => !task.isComplete() && task.canRun(now))
     const protectedTasks = available.filter(task => task.isRunning() && task.isProtected(now))
-    const selected = new Set<ScheduledChunk>(protectedTasks)
+    const selected = new Set<ScheduledRequest>(protectedTasks)
 
     const ranked = available
       .filter(task => !selected.has(task))

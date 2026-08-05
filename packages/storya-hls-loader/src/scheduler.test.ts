@@ -1,7 +1,7 @@
-import { ChunkScheduler } from './scheduler.ts'
-import type { ScheduledChunk } from './scheduler.ts'
+import { RequestScheduler } from './scheduler.ts'
+import type { ScheduledRequest } from './scheduler.ts'
 
-class TestChunk implements ScheduledChunk {
+class TestChunk implements ScheduledRequest {
   readonly createdAt = performance.now()
   readonly id: number
   private complete = false
@@ -52,7 +52,7 @@ class TestChunk implements ScheduledChunk {
 }
 
 let playbackTime = 0
-const scheduler = new ChunkScheduler({
+const scheduler = new RequestScheduler({
   getPlaybackRate: () => 1,
   getPlaybackTime: () => playbackTime,
   maxConcurrency: 2,
