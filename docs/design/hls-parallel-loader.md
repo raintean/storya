@@ -33,8 +33,9 @@
 流填充器观察所有虚拟流中的硬需求和预填充窗口，创建 Segment 下载并把完成的数据写回所属虚拟流。
 
 - 所有虚拟流合计最多同时运行 6 个 GET/Range 请求。
-- HEAD 探测不计入该并发上限。
-- 小于等于 2 MiB 或不支持 Range 的 Segment 使用顺序 GET。
+- 首个媒体请求直接发送 Range GET，并优先从 `Content-Range` 得到 Segment 总长度；只有 header 不可读、缺失或总长度为 `*` 时才补发 HEAD。
+- 补救 HEAD 不计入该并发上限。
+- 小于等于 2 MiB 的 Segment 只需要首个 Range GET；源站不支持 Range 并返回 200 时直接顺序读取同一个响应。
 - 较大的 Segment 按 2 MiB Chunk 拆分，并与其他 Segment 的任务共同调度。
 - 硬需求优先于纯预填充，之后按媒体播放截止时间、Segment 内交付前沿和创建顺序排序。
 - 当前音频和主画面不固定分配连接数，而是按播放截止时间竞争同一并发预算。
@@ -56,7 +57,9 @@ fLoader 把 Fragment 映射到虚拟流中的 Segment，并注册独立 reader�
 
 ## Transport 边界
 
-单 Segment 下载器负责构造标准 GET、HEAD 和 Range Request，并通过注入的 `HttpTransport` 执行。默认 Transport 使用浏览器 Fetch；调用方也可以传入 `WebSocketHttpTransport`，通过 `storya-edge-worker` 转发相同的 HTTP 请求。
+单 Segment 下载器负责构造标准 GET、HEAD 和 Range Request，并通过注入的 `HttpTransport` 执行。默认 Transport 使用浏览器 Fetch；调用方也可以传入 `ProxyHttpTransport`，通过多个普通 HTTP Origin 访问 `storya-http-proxy`，或者传入 `WebSocketHttpTransport`，通过 `storya-edge-worker` 转发相同的 HTTP 请求。
+
+未知长度的非原子 Segment 不再先发 HEAD。首个 Chunk 直接请求 `bytes=0-<chunk-end>`：206 且 `Content-Range` 可读时立即记录总长度并规划剩余 Chunk；源站忽略 Range 并返回 200 时把该响应直接作为顺序响应继续读取；只有 206 无法提供总长度时才使用 HEAD 的 `Content-Length` 补救。这样在 Proxy Transport 统一暴露 `Content-Range` 后，正常路径不产生探测请求；直连源站受 CORS 限制时仍有后备路径。
 
 Transport 不参与虚拟流、预填充、请求优先级、慢速检测、补救或抢占。AbortController 取消一次 Chunk attempt 后，Fetch Transport 取消 Fetch，WebSocket Transport 发送 CANCEL；调度器按同一套规则决定后续是否重试。
 
@@ -98,12 +101,13 @@ parallel.destroy()
 
 ## 实现状态
 
-本文描述的会话接口、虚拟流、每流预填充窗口、跨流全局请求调度、播放需求生命周期、Transport 注入和薄 fLoader 均已实现。单 Segment 下载器继续负责 HEAD 探测、顺序 GET、Range 拆分、抢占和慢速补救；流填充器在它之上统一调度不同虚拟流及不同 Segment。
+本文描述的会话接口、虚拟流、每流预填充窗口、跨流全局请求调度、播放需求生命周期、Transport 注入和薄 fLoader 均已实现。单 Segment 下载器继续负责首个 Range 探测、补救 HEAD、顺序 GET、Range 拆分、抢占和慢速补救；流填充器在它之上统一调度不同虚拟流及不同 Segment。
 
-React 实验台已经接入会话接口，并在加载事件面板中区分即时需求、缓存命中、预填充、请求抢占和慢速补救。实验台可以为新播放会话选择 Browser Fetch 或 WebSocket Relay Transport，并在 WebSocket 模式下接受 Worker 根 URL 或完整 Transport endpoint。实验台还会用虚拟流时间轴显示贯穿所有流的播放线、Segment 缓存和 Chunk 调度状态；流按激活状态优先，再按视频、音频和字幕排列。
+React 实验台已经接入会话接口，并在加载事件面板中区分即时需求、缓存命中、预填充、请求抢占和慢速补救。实验台可以为新播放会话选择 Browser Fetch、HTTP Proxy 或 WebSocket Relay Transport；HTTP Proxy 模式接受多个 Origin，WebSocket 模式接受 Worker 根 URL 或完整 Transport endpoint。实验台还会用虚拟流时间轴显示贯穿所有流的播放线、Segment 缓存和 Chunk 调度状态；流按激活状态优先，再按视频、音频和字幕排列。
 
 ## 修改历史
 
+- 2026-08-06: 未知长度 Segment 改为优先从首个 Range 响应读取 `Content-Range`，只在无法取得总长度时补发 HEAD；实验台增加 HTTP Proxy Transport。
 - 2026-08-05: 抽离通用 HTTP Transport，默认保留 Fetch，并支持通过 WebSocket 连接池和 Edge Worker 执行相同请求。
 - 2026-08-05: 虚拟流时间轴移除独立缓冲边界线，缓存状态仅由 Segment 和 Chunk 表达。
 - 2026-08-05: 实验台在首次媒体缓冲前切换清晰度时改为重建播放会话，修复目标流跳过首个 Segment 和缓存命中重试循环。

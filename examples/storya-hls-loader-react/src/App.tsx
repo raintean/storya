@@ -8,7 +8,7 @@ import {
   DEFAULT_PREFETCH_DEPTH,
 } from 'storya-hls-loader'
 import type { HlsLoaderDiagnosticsSnapshot, HlsLoaderSegmentEvent } from 'storya-hls-loader'
-import { WebSocketHttpTransport } from 'storya-transport'
+import { ProxyHttpTransport, WebSocketHttpTransport } from 'storya-transport'
 
 import { VirtualStreamMap } from './virtual-stream-map'
 
@@ -70,7 +70,7 @@ interface PlaybackLevel {
 
 type LoaderMode = 'native' | 'parallel'
 type LogTone = 'default' | 'error' | 'preempted' | 'rescued' | 'success'
-type TransportMode = 'fetch' | 'websocket'
+type TransportMode = 'fetch' | 'proxy' | 'websocket'
 
 const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
@@ -110,6 +110,7 @@ export function App() {
   const [loaderMode, setLoaderMode] = useState<LoaderMode>('parallel')
   const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
   const [workerUrl, setWorkerUrl] = useState('')
+  const [proxyOriginsText, setProxyOriginsText] = useState('')
   const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
   const [source, setSource] = useState(defaultSource)
   const [qualityLevels, setQualityLevels] = useState<QualityLevel[]>([])
@@ -194,6 +195,7 @@ export function App() {
 
       if (Hls.isSupported()) {
         let relayEndpoint: string | undefined
+        let proxyOrigins: string[] | undefined
         if (transportMode === 'websocket') {
           try {
             relayEndpoint = resolveRelayEndpoint(workerUrl)
@@ -204,7 +206,27 @@ export function App() {
             appendLog(message, 'error', { tag: 'Transport' })
             return
           }
+        } else if (transportMode === 'proxy') {
+          try {
+            proxyOrigins = parseProxyOrigins(proxyOriginsText)
+          } catch (cause) {
+            const message = cause instanceof Error ? cause.message : 'Proxy Origins 无效'
+            setStatus('等待有效的 Proxy Origins')
+            setError(message)
+            appendLog(message, 'error', { tag: 'Transport' })
+            return
+          }
         }
+
+        const transport =
+          relayEndpoint === undefined
+            ? proxyOrigins === undefined
+              ? undefined
+              : new ProxyHttpTransport(proxyOrigins)
+            : new WebSocketHttpTransport(relayEndpoint, {
+                debug: true,
+                maxConnections: DEFAULT_MAX_CONCURRENCY * 2,
+              })
 
         const parallelLoader = createHlsParallelLoader({
           getPlaybackRate: () => video.playbackRate,
@@ -261,14 +283,7 @@ export function App() {
               },
             )
           },
-          ...(relayEndpoint === undefined
-            ? {}
-            : {
-                transport: new WebSocketHttpTransport(relayEndpoint, {
-                  debug: true,
-                  maxConnections: DEFAULT_MAX_CONCURRENCY * 2,
-                }),
-              }),
+          ...(transport === undefined ? {} : { transport }),
         })
         parallelLoader.setEnabled(loaderMode === 'parallel')
         parallelLoaderRef.current = parallelLoader
@@ -392,9 +407,11 @@ export function App() {
           { tag: '加载器' },
         )
         appendLog(
-          relayEndpoint === undefined
-            ? '并行加载器配置为 Browser Fetch Transport'
-            : `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`,
+          relayEndpoint !== undefined
+            ? `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`
+            : proxyOrigins !== undefined
+              ? `并行加载器配置为 HTTP Proxy Transport: ${proxyOrigins.length} 个 Origin`
+              : '并行加载器配置为 Browser Fetch Transport',
           'default',
           { tag: 'Transport' },
         )
@@ -413,7 +430,7 @@ export function App() {
       setError('没有可用的 HLS 播放路径')
       appendLog('没有可用的 HLS 播放路径', 'error', { tag: '错误' })
     },
-    [appendLog, loaderMode, source, transportMode, workerUrl],
+    [appendLog, loaderMode, proxyOriginsText, source, transportMode, workerUrl],
   )
 
   const handleLoaderModeChange = (value: string) => {
@@ -440,7 +457,8 @@ export function App() {
   }
 
   const handleTransportModeChange = (value: string) => {
-    const mode: TransportMode = value === 'websocket' ? 'websocket' : 'fetch'
+    const mode: TransportMode =
+      value === 'websocket' ? 'websocket' : value === 'proxy' ? 'proxy' : 'fetch'
     setTransportMode(mode)
     if (hlsRef.current !== null && mode !== activeTransportMode) {
       appendLog('Transport 设置已改变, 点击 LOAD STREAM 重建加载会话', 'default', {
@@ -659,6 +677,7 @@ export function App() {
                 onChange={event => handleTransportModeChange(event.target.value)}
               >
                 <option value="fetch">Browser Fetch</option>
+                <option value="proxy">HTTP Proxy</option>
                 <option value="websocket">WebSocket Relay</option>
               </select>
               {transportMode === 'websocket' ? (
@@ -673,6 +692,20 @@ export function App() {
                     required
                   />
                   <small>可填写 Worker 根 URL 或完整的 wss://.../transport 地址</small>
+                </div>
+              ) : null}
+              {transportMode === 'proxy' ? (
+                <div className="transport-endpoint">
+                  <label htmlFor="proxy-origins">PROXY ORIGINS</label>
+                  <textarea
+                    id="proxy-origins"
+                    rows={3}
+                    value={proxyOriginsText}
+                    onChange={event => setProxyOriginsText(event.target.value)}
+                    placeholder={'https://proxy-1.example.com\nhttps://proxy-2.example.com'}
+                    required
+                  />
+                  <small>填写一个或多个 HTTP(S) Origin, 使用换行、空格或逗号分隔</small>
                 </div>
               ) : null}
               <dl className="runtime-facts">
@@ -932,7 +965,34 @@ function formatTransportMode(mode: TransportMode | null): string {
   if (mode === null) {
     return '—'
   }
-  return mode === 'websocket' ? 'WebSocket Relay' : 'Browser Fetch'
+  if (mode === 'websocket') {
+    return 'WebSocket Relay'
+  }
+  return mode === 'proxy' ? 'HTTP Proxy' : 'Browser Fetch'
+}
+
+function parseProxyOrigins(value: string): string[] {
+  const values = value
+    .split(/[\s,]+/u)
+    .map(item => item.trim())
+    .filter(item => item.length > 0)
+  if (values.length === 0) {
+    throw new Error('使用 HTTP Proxy 前需要填写至少一个 Proxy Origin')
+  }
+
+  const origins = values.map(value => {
+    let url: URL
+    try {
+      url = new URL(value)
+    } catch {
+      throw new Error(`Proxy Origin 格式无效: ${value}`)
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error(`Proxy Origin 必须使用 http 或 https: ${value}`)
+    }
+    return url.origin
+  })
+  return [...new Set(origins)]
 }
 
 function resolveRelayEndpoint(value: string): string {

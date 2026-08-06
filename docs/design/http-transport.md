@@ -1,6 +1,6 @@
 # HTTP Transport 设计
 
-本文描述 Storya 当前采用的通用 HTTP Transport、HTTP-over-WebSocket 线协议、客户端连接池和 Edge Worker relay。Transport 只表达 HTTP 请求与响应，不理解 HLS、Segment、Range 调度或其他媒体业务。
+本文描述 Storya 当前采用的通用 HTTP Transport、基于普通 Fetch 的多域名 HTTP Proxy、HTTP-over-WebSocket 线协议、客户端连接池和 Edge Worker relay。Transport 只表达 HTTP 请求与响应，不理解 HLS、Segment、Range 调度或其他媒体业务。
 
 ## 组件边界
 
@@ -9,21 +9,17 @@ storya-hls-loader
         |
         v
 storya-transport
-  |            |
-  |            +---- WebSocketHttpTransport ----+
-  |                                              |
-  +---- FetchHttpTransport                       v
-                                           storya-edge-worker
-                                                  |
-                                                  v
-                                            Cloudflare fetch
-                                                  |
-                                                  v
-                                               HTTP 源站
+  |
+  +---- FetchHttpTransport --------------------------------------> HTTP 源站
+  |
+  +---- ProxyHttpTransport ----> Cloudflare CDN ----> storya-http-proxy ----> HTTP 源站
+  |
+  +---- WebSocketHttpTransport ---------------------> storya-edge-worker ----> HTTP 源站
 ```
 
-- `storya-transport` 提供统一的 `HttpTransport` 接口，以及 Fetch 和 WebSocket 两种实现。
+- `storya-transport` 提供统一的 `HttpTransport` 接口，以及 Browser Fetch、HTTP Proxy 和 WebSocket 三种实现。
 - `storya-hls-loader` 继续负责 Range 规划、并发调度、抢占、慢速补救和重试，只把构造完成的 HTTP Request 交给 Transport。
+- `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。第一版只接受 GET/HEAD，直接流式转发上游响应，不理解媒体语义，也不建立本地缓存。
 - `storya-edge-worker` 是边缘能力的单一 Cloudflare Worker 部署单元。当前只有 `/transport` HTTP relay 和 `/health`；未来媒体能力必须使用独立模块和接口，不得进入 Transport 协议。
 - Transport 控制消息 Schema 位于 `storya-protocol/proto/transport`。
 
@@ -40,7 +36,27 @@ interface HttpTransport {
 
 响应包含 status、status text、最终 URL、headers、body 和 `arrayBuffer()`。调用方交给 HLS 会话的 Transport 所有权随会话转移；会话销毁时同时销毁 Transport。
 
-当前 WebSocket 实现只接受 GET 和 HEAD，不支持请求体。`Range`、`Content-Range`、缓存控制和条件请求都按普通 HTTP header 传输，relay 不解析媒体含义。Fetch 实现保持浏览器原生请求行为。
+当前 Proxy 和 WebSocket 实现只接受 GET 和 HEAD，不支持请求体。`Range`、`Content-Range`、缓存控制和条件请求都按普通 HTTP header 传输，proxy 和 relay 不解析媒体含义。Fetch 实现保持浏览器原生请求行为。
+
+## HTTP Proxy Transport
+
+`ProxyHttpTransport` 接受一个或多个 HTTP(S) Proxy Origin。每次请求按轮询顺序选择一个 Origin；HLS 调度器的重试、抢占和慢速补救会自然形成新的请求，从而继续轮换 Origin。Transport 不按目标 URL 建立固定映射，也不在 Origin 之间同步缓存状态。
+
+目标 URL 使用 UTF-8 和无 padding 的 Base64URL 编码为以下地址：
+
+```text
+/proxy/<base64url(target-url)>.bin
+```
+
+`.bin` 让该路径保持普通静态二进制资源的 CDN 语义。第一版不加密，也没有签名；该编码只用于把完整目标 URL 安全放入 path，不是访问控制。公开生产部署前需要增加服务端签发或等价的授权机制。
+
+Transport 通过标准 Fetch 发送原请求的 method 和 headers，不发送浏览器 cookie。Rust proxy 解码目标 URL、限制 scheme 为 HTTP/HTTPS、过滤逐跳和代理基础设施 header，并流式返回上游 status、headers 和 body。上游重定向的 `Location` 会被解析并重新编码为同一 Proxy Origin 下的 `/proxy/...bin`，因此浏览器仍按标准 Fetch 重定向流程执行，最终响应 URL 也能由 Transport 还原为真实上游 URL。
+
+Rust proxy 为成功和错误响应统一增加 CORS header，并暴露全部响应 header，使浏览器可以读取 `Content-Range`、`Content-Length`、ETag 和缓存诊断信息。任意目标 URL、无签名和未拦截内网地址的组合只适合当前开发验证，不是公开代理的安全终态。
+
+`storya-http-proxy` 默认监听 `0.0.0.0:80`，部署环境可以通过 `STORYA_HTTP_PROXY_ADDRESS` 覆盖完整监听地址。
+
+多个 Cloudflare for SaaS custom hostname 可以指向同一个 `storya-http-proxy` fallback origin。客户端只需要拿到可用 Origin 列表；域名更换时重建 Transport 即可，不要求 target 到域名的稳定映射。
 
 ## WebSocket 事务
 
@@ -114,16 +130,25 @@ Fetch 子请求继续使用 Cloudflare 标准 HTTP 缓存语义。relay 当前�
 
 当前 relay 只限制 URL 必须使用 HTTP 或 HTTPS，尚未实现鉴权、请求额度、内网地址拦截或重定向逐跳检查。这些属于公开部署前的安全工作，不改变 Transport 协议。
 
+## HTTP Proxy 与缓存
+
+`storya-http-proxy` 第一版是无状态直通服务，不使用 SQLite、稀疏文件或本地分片缓存。Cloudflare 位于 Proxy Origin 和 Rust service 之间时，可以按标准 CDN 规则缓存 `/proxy/...bin` 响应；Rust service 不覆盖上游 Cache-Control，也不手工处理 206 缓存。
+
+对于可缓存的 `.bin` URL，Cloudflare 在 HEAD MISS 时可能向 Rust origin 发送 GET 并缓存完整响应。当前明确接受该行为，将其视为缓存预热；服务和客户端都不增加 HEAD 绕过参数或独立路径。
+
 ## 可观测性
 
 Edge Worker 开启持久化 Workers Logs 和 invocation logs，head sampling rate 为 1。Cloudflare Dashboard 会保留全部采样到的 Fetch 和 WebSocket invocation、运行时异常及代码产生的结构化日志；当前不启用 traces。
 
+Rust proxy 在收到上游响应头后输出一条结构化 INFO 日志，包含 method、目标 host、status、Range、Content-Range、Content-Length 和响应头耗时。日志不记录完整目标 URL、query 或 body chunk；上游请求和响应异常继续使用 WARN。
+
 ## 实现状态
 
-通用接口、Fetch Transport、WebSocket Transport、动态连接池、取消、心跳、连接老化、响应上限、Transport Schema 和 Edge Worker relay 均已实现。HLS 加载器默认使用 Fetch；调用方显式提供 WebSocket Transport 后使用 relay，其他加载与调度逻辑不变。
+通用接口、Fetch Transport、Proxy Transport、WebSocket Transport、Rust HTTP proxy、动态连接池、取消、心跳、连接老化、响应上限、Transport Schema 和 Edge Worker relay 均已实现。HLS 加载器默认使用 Fetch；调用方显式提供 Proxy 或 WebSocket Transport 后切换网络执行路径，其他加载与调度逻辑不变。
 
 ## 修改历史
 
+- 2026-08-06: 增加多 Origin `ProxyHttpTransport` 和无状态 `storya-http-proxy`，采用 `/proxy/<base64url>.bin` 执行标准 GET/HEAD 直通。
 - 2026-08-06: 禁用 WebSocket 压缩，将响应聚合提高到 256 KiB，并减少正常连接关闭日志以降低 relay CPU 消耗。
 - 2026-08-05: relay 恢复 runtime 标准 WebSocket 自动关闭握手，并将消息处理、上游代理和取消纳入 ExecutionContext 跟踪。
 - 2026-08-05: Edge Worker 开启持久化 Workers Logs 和完整 invocation logs。

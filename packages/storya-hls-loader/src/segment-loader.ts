@@ -170,7 +170,6 @@ class SegmentLoadCoordinator {
   private pendingProgress: Uint8Array[] = []
   private pendingProgressBytes = 0
   private planned = false
-  private probeController: AbortController | null = null
   private rangeMode: RangeMode
   private readonly resultBuffers: Uint8Array[] = []
   private readonly resourceStart: number
@@ -231,43 +230,19 @@ class SegmentLoadCoordinator {
       }, maxLoadTimeMs)
     }
 
-    void this.initialize()
+    this.initialize()
   }
 
-  private async initialize(): Promise<void> {
+  private initialize(): void {
     if (this.isAtomicRequest()) {
       this.startAtomicTask()
       return
     }
-
-    if (this.segmentLength === undefined) {
-      const probe = await this.probeSegment()
-      if (this.aborted || this.completed) {
-        return
-      }
-      if (probe !== undefined) {
-        this.setSegmentLength(probe.length)
-        if (probe.rangeSupport === 'unsupported' || probe.length <= this.options.chunkSize) {
-          this.startSequentialTask()
-          return
-        }
-      }
-    }
-
     this.startFirstRangeTask()
   }
 
   private startAtomicTask(): void {
     const task = this.createTask(0, this.segmentLength, this.segmentLength !== undefined)
-    this.firstTask = task
-    this.planned = true
-    this.scheduler.add(task)
-  }
-
-  private startSequentialTask(): void {
-    this.rangeMode = 'unsupported'
-    const task = this.createTask(0, this.segmentLength, false)
-    task.disablePreemption()
     this.firstTask = task
     this.planned = true
     this.scheduler.add(task)
@@ -290,8 +265,6 @@ class SegmentLoadCoordinator {
 
     this.aborted = true
     this.clearLogicalTimer()
-    this.probeController?.abort()
-    this.probeController = null
     for (const task of this.tasks) {
       task.cancel()
       this.scheduler.remove(task)
@@ -439,6 +412,12 @@ class SegmentLoadCoordinator {
       }
       if (attempt.requestEnd !== undefined && contentRange.endExclusive > attempt.requestEnd) {
         throw new TransportError('Content-Range 超出了请求范围', response.status)
+      }
+      if (this.segmentLength === undefined && contentRange.total === undefined) {
+        contentRange = {
+          ...contentRange,
+          total: await this.probeResourceLength(attempt.controller.signal),
+        }
       }
     }
 
@@ -792,60 +771,6 @@ class SegmentLoadCoordinator {
       throw new TransportError('HEAD 响应没有提供 Content-Length', response.status)
     }
     return length
-  }
-
-  private async probeSegment(): Promise<
-    { length: number; rangeSupport: 'supported' | 'unknown' | 'unsupported' } | undefined
-  > {
-    const controller = new AbortController()
-    this.probeController = controller
-    try {
-      const response = await this.createHeadResponse(controller.signal)
-      if (!response.ok) {
-        return undefined
-      }
-      this.lastResponse = response
-      this.finalUrl = response.url || this.finalUrl
-      this.validateResourceIdentity(response)
-      const length = this.readContentLength(response)
-      if (length === undefined) {
-        return undefined
-      }
-      const acceptRanges = response.headers.get('accept-ranges')?.trim().toLowerCase()
-      const rangeSupport =
-        acceptRanges === 'none' ? 'unsupported' : acceptRanges === 'bytes' ? 'supported' : 'unknown'
-      return { length, rangeSupport }
-    } catch {
-      return undefined
-    } finally {
-      if (this.probeController === controller) {
-        this.probeController = null
-      }
-    }
-  }
-
-  private async createHeadResponse(signal: AbortSignal): Promise<HttpTransportResponse> {
-    const headers = new Headers(this.context.headers)
-    headers.delete('Range')
-    const probeContext: FragmentLoaderContext = {
-      ...this.context,
-      headers: Object.fromEntries(headers.entries()),
-      rangeStart: 0,
-      rangeEnd: 0,
-    }
-    const init: RequestInit = {
-      method: 'HEAD',
-      mode: 'cors',
-      credentials: 'same-origin',
-      headers,
-      signal,
-    }
-    const configuredRequest = this.hlsConfig.fetchSetup?.(probeContext, init)
-    const request =
-      configuredRequest === undefined
-        ? new Request(this.context.url, init)
-        : await configuredRequest
-    return this.transport.request(request, { maxResponseBytes: 0 })
   }
 
   private readContentLength(response: HttpTransportResponse): number | undefined {

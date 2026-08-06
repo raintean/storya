@@ -35,15 +35,20 @@ const fragments = Array.from({ length: 9 }, (_, index) => createFragment(index))
 const fetchCounts = new Map<string, number>()
 const originalFetch = globalThis.fetch
 let activeGets = 0
+let headRequests = 0
 let maxActiveGets = 0
 
 globalThis.fetch = async input => {
   const request = input instanceof Request ? input : new Request(input)
   if (request.method === 'HEAD') {
+    headRequests += 1
     return new Response(null, {
       headers: { 'accept-ranges': 'bytes', 'content-length': '4' },
       status: 200,
     })
+  }
+  if (request.headers.get('range') === null) {
+    throw new Error('非原子 Segment 的首个请求必须携带 Range')
   }
 
   fetchCounts.set(request.url, (fetchCounts.get(request.url) ?? 0) + 1)
@@ -55,9 +60,19 @@ globalThis.fetch = async input => {
   if (sn === 100) {
     return new Response('not found', { status: 404, statusText: 'Not Found' })
   }
+  if (sn === 7) {
+    return new Response(new Uint8Array([sn, sn, sn, sn]).buffer, {
+      headers: { 'content-length': '4' },
+      status: 200,
+    })
+  }
+  const headers: Record<string, string> = { 'content-length': '4' }
+  if (sn !== 8) {
+    headers['content-range'] = 'bytes 0-3/4'
+  }
   return new Response(new Uint8Array([sn, sn, sn, sn]).buffer, {
-    headers: { 'content-length': '4' },
-    status: 200,
+    headers,
+    status: 206,
   })
 }
 
@@ -135,18 +150,27 @@ try {
   if (maxActiveGets > 6) {
     throw new Error(`GET/Range 并发超过 6, 实际 ${maxActiveGets}`)
   }
+  if (getHeadRequestCount() !== 0) {
+    throw new Error('Content-Range 可读时不应发送 HEAD')
+  }
 
   const second = await load(parallel.fragmentLoader, fragments[1] as Fragment)
   assertPayload(second, 1)
   await delay(50)
   assertFetchCount(1, 1, 'ready Segment 应复用预填充数据')
   assertFetchCount(7, 1, '窗口推进后应填充新的 Segment')
+  if (getHeadRequestCount() !== 0) {
+    throw new Error('Content-Range 可读时不应发送 HEAD')
+  }
 
   const [sharedLeft, sharedRight] = await Promise.all([
     load(parallel.fragmentLoader, fragments[8] as Fragment),
     load(parallel.fragmentLoader, fragments[8] as Fragment),
   ])
   assertFetchCount(8, 1, '多个 reader 应共享同一 Segment 填充任务')
+  if (getHeadRequestCount() !== 1) {
+    throw new Error(`Content-Range 缺失时应补发一次 HEAD, 实际 ${headRequests}`)
+  }
   assertPayload(sharedLeft, 8)
   assertPayload(sharedRight, 8)
   if (sharedLeft.data === sharedRight.data) {
@@ -189,6 +213,10 @@ try {
 } finally {
   parallel.destroy()
   globalThis.fetch = originalFetch
+}
+
+function getHeadRequestCount(): number {
+  return headRequests
 }
 
 async function load(

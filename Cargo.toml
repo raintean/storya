@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["packages/storya-protocol", "services/storya-api"]
+members = [
+    "packages/storya-protocol",
+    "services/storya-api",
+    "services/storya-http-proxy",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,7 +12,9 @@ edition = "2024"
 
 [workspace.dependencies]
 axum = "0.8"
+base64 = "0.23.1"
 prost = "0.14.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tracing = "0.1"

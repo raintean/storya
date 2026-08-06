@@ -1,11 +1,16 @@
 CARGO ?= cargo
+CROSS ?= cross
 PNPM ?= pnpm
+LINUX_TARGET ?= x86_64-unknown-linux-musl
 
-.PHONY: build check clean format format-check generate lint pnpm-install test
+.PHONY: build build-linux check clean format format-check generate lint pnpm-install test
 
 build: generate
 	$(CARGO) build --workspace --release
 	CI=true $(PNPM) build
+
+build-linux: generate
+	$(CROSS) build --workspace --release --target $(LINUX_TARGET)
 
 check: generate
 	$(CARGO) check --workspace

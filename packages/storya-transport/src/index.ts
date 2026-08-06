@@ -8,6 +8,12 @@ export type {
   HttpTransportResponse,
 } from './http-transport'
 export {
+  createProxyUrl,
+  decodeProxyTargetUrl,
+  encodeProxyTargetUrl,
+  ProxyHttpTransport,
+} from './proxy-http-transport'
+export {
   DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
   DEFAULT_WEBSOCKET_HEARTBEAT_INTERVAL_MS,
   DEFAULT_WEBSOCKET_HEARTBEAT_TIMEOUT_MS,

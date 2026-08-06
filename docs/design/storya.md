@@ -12,7 +12,7 @@ Storya 当前包含三类运行端:
 用户界面      storya-web
 管理界面      storya-admin
 
-中心服务      storya-api
+中心服务      storya-api          storya-http-proxy
 边缘服务      storya-edge-worker
 
 共享能力      storya-player      storya-protocol      storya-hls-loader      storya-transport
@@ -22,11 +22,12 @@ Storya 当前包含三类运行端:
 - `storya-web` 面向最终用户，负责视频浏览、播放和用户交互。当前仅包含基础页面骨架，并已经使用 `storya-player`。
 - `storya-admin` 面向运营和管理人员。当前仅包含基础页面骨架。
 - `storya-api` 是中心 API 服务，负责未来的核心业务接口。当前只实现 `/health`。
+- `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。当前通过 Base64URL path 接受 GET/HEAD 并流式转发任意 HTTP(S) 目标，不建立本地缓存。
 - `storya-edge-worker` 是部署在 Cloudflare Workers 的边缘能力单元。当前实现 `/health` 和 `/transport`，通过 HTTP-over-WebSocket 协议透明转发 GET/HEAD；未来媒体能力可以作为独立模块加入。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
 - `storya-protocol` 是 Rust 和 TypeScript 共用的协议包。当前包含健康检查和 Transport Schema；健康检查类型尚未接入 `storya-api` 的 HTTP 路由。
 - `storya-hls-loader` 是基于 hls.js fLoader 的并行加载包。它通过独立虚拟流维护主画面和音轨的 Segment 需求，以每流 6 Segment 预填充窗口和全局 6 路 GET/Range 并发执行跨 Segment、Segment 内并行加载，不负责媒体解码、解密或 transmux。
-- `storya-transport` 提供通用 HTTP Transport 接口、原生 Fetch 实现和串行复用连接的 WebSocket 实现。
+- `storya-transport` 提供通用 HTTP Transport 接口、原生 Fetch、多 Origin HTTP Proxy 和串行复用连接的 WebSocket 实现。
 
 目标业务关系是:
 
@@ -38,6 +39,8 @@ storya-web ---------> storya-api
                            +----> storya-transport
                                       |
                                       +----> storya-edge-worker ----> HTTP 源站
+                                      |
+                                      +----> Cloudflare CDN ----> storya-http-proxy ----> HTTP 源站
 
 storya-admin -------> storya-api
 
@@ -55,6 +58,7 @@ storya/
 │   └── storya-admin/
 ├── services/
 │   ├── storya-api/
+│   ├── storya-http-proxy/
 │   └── storya-edge-worker/
 ├── packages/
 │   ├── storya-player/
@@ -135,6 +139,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 | ------------------- | ---------------------------------------- |
 | `make pnpm-install` | 安装 pnpm workspace 依赖                 |
 | `make build`        | 构建 Rust release 和所有 TypeScript 项目 |
+| `make build-linux`  | 使用 cross 构建 Linux musl Rust release  |
 | `make check`        | 执行 Cargo check 和 TypeScript typecheck |
 | `make format`       | 运行 Rustfmt、Oxfmt 和 Buf format        |
 | `make generate`     | 生成 Protocol 代码和 Worker 类型         |
@@ -146,7 +151,8 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 - `storya-web` 和 `storya-admin` 生成独立静态前端产物。
 - `storya-api` 生成独立 Rust release 二进制。
-- `storya-edge-worker` 作为 Cloudflare Worker 独立部署，不与中心 API 合并进程。
+- `storya-http-proxy` 生成独立 Rust release 二进制，可以作为 Cloudflare CDN 或 Cloudflare for SaaS fallback origin。
+- `storya-edge-worker` 作为 Cloudflare Worker 独立部署，不与中心 API 或 HTTP proxy 合并进程。
 - `packages` 不独立部署，其代码进入消费者构建产物。
 
 服务之间通过公开协议通信，不通过共享数据库或读取其他服务内部状态形成隐式耦合。具体鉴权、存储、媒体源和部署拓扑尚未确定，在实现相应业务前不提前固化。
@@ -160,6 +166,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 - 框架无关播放器 Web Component。
 - HLS 虚拟流、跨 Segment 预填充、Segment 内 Range 并行、请求抢占和慢速补救。
 - 通用 Fetch/WebSocket HTTP Transport、动态连接池和 Edge Worker relay。
+- 多 Origin HTTP Proxy Transport 和无状态 Rust HTTP proxy。
 - Protobuf/Buf 跨语言生成链路。
 - 统一工具链、Makefile、格式化和 lint 配置。
 
@@ -173,6 +180,8 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 ## 修改历史
 
+- 2026-08-06: 增加基于 cross 的 `x86_64-unknown-linux-musl` Rust workspace release 构建入口。
+- 2026-08-06: 增加 `storya-http-proxy` 和多 Origin HTTP Proxy Transport，Cloudflare 只作为其前置 CDN。
 - 2026-08-05: 将边缘部署单元改为 `storya-edge-worker`，增加通用 HTTP Transport、WebSocket 连接池和透明 relay。
 - 2026-08-05: 增加 HLS 并行加载器边界，并完成虚拟流、跨 Segment 预填充和全局请求调度。
 - 2026-08-04: 建立 Storya 总体设计，明确 apps/services/packages 边界、Protocol 机制、依赖方向和当前实现范围。
