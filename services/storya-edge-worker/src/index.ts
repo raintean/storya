@@ -21,7 +21,7 @@ interface RelayTransaction {
 }
 
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-const RESPONSE_FRAME_SIZE = 128 * 1024
+const RESPONSE_FRAME_SIZE = 256 * 1024
 const blockedRequestHeaders = new Set([
   'connection',
   'content-length',
@@ -234,12 +234,13 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
 
       const reader = response.body.getReader({ mode: 'byob' })
       transaction.reader = reader
+      const responseFrameSize = Math.min(RESPONSE_FRAME_SIZE, maxResponseBytes)
       while (true) {
         const readBuffer = new Uint8Array(
-          new ArrayBuffer(TRANSPORT_FRAME_HEADER_SIZE + RESPONSE_FRAME_SIZE),
+          new ArrayBuffer(TRANSPORT_FRAME_HEADER_SIZE + responseFrameSize),
           TRANSPORT_FRAME_HEADER_SIZE,
         )
-        const result = await reader.readAtLeast(RESPONSE_FRAME_SIZE, readBuffer)
+        const result = await reader.readAtLeast(responseFrameSize, readBuffer)
         if (active !== transaction || transaction.terminal) {
           await reader.cancel()
           return
@@ -328,16 +329,18 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
     trackTask('message', acceptMessage(event.data))
   })
   server.addEventListener('close', event => {
-    console.info({
-      activeAgeMs: active === undefined ? undefined : Date.now() - active.startedAt,
-      activeSequence: active?.sequence,
-      activeTransferredBytes: active?.transferredBytes,
-      code: event.code,
-      readyState: server.readyState,
-      reason: event.reason,
-      type: 'transport-websocket-close',
-      wasClean: event.wasClean,
-    })
+    if (event.code !== 1000 || active !== undefined) {
+      console.info({
+        activeAgeMs: active === undefined ? undefined : Date.now() - active.startedAt,
+        activeSequence: active?.sequence,
+        activeTransferredBytes: active?.transferredBytes,
+        code: event.code,
+        readyState: server.readyState,
+        reason: event.reason,
+        type: 'transport-websocket-close',
+        wasClean: event.wasClean,
+      })
+    }
     trackTask('close-cleanup', stopActive())
   })
   server.addEventListener('error', event => {
@@ -359,7 +362,11 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
     }
   })
 
-  return new Response(null, { status: 101, webSocket: client })
+  return new Response(null, {
+    headers: { 'sec-websocket-extensions': '' },
+    status: 101,
+    webSocket: client,
+  })
 }
 
 function createClientHeaders(request: Request): Headers {

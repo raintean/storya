@@ -63,7 +63,7 @@ idle -> requesting -> streaming -> idle
 - `PING` / `PONG`
 - `ERROR`
 
-Frame 使用 1 字节 kind、4 字节大端 sequence 和 payload。控制 payload 使用 Protobuf，`RESPONSE_BODY` payload 是原始响应字节。relay 使用 BYOB reader 将上游响应聚合成不超过 128 KiB 的 Frame；流结束时发送不足 128 KiB 的尾帧。聚合不对首帧做特殊处理，也不保留上游流原始分块边界。
+Frame 使用 1 字节 kind、4 字节大端 sequence 和 payload。控制 payload 使用 Protobuf，`RESPONSE_BODY` payload 是原始响应字节。relay 使用 BYOB reader 将上游响应聚合成不超过 256 KiB 的 Frame；流结束时发送不足 256 KiB 的尾帧。聚合不对首帧做特殊处理，也不保留上游流原始分块边界。
 
 HTTP 4xx、5xx 仍然是正常 `RESPONSE_HEAD`，只有协议错误、上游 Fetch 失败或资源限制才发送 `ERROR`。每个事务只能以 `RESPONSE_END`、`CANCELED` 或 `ERROR` 中的一种状态结束。
 
@@ -79,7 +79,9 @@ relay 使用 Cloudflare runtime 的标准 WebSocket 自动关闭握手。客户�
 
 WebSocket Transport 不实现应用层 flow control。加载器的 Range 请求本身有明确字节边界，未知长度请求使用 Transport 的响应上限；客户端请求头声明 `max_response_bytes`，relay 还施加 64 MiB 全局硬上限。
 
-relay 使用 BYOB `readAtLeast()` 读取 Cloudflare Fetch body，读满 128 KiB 或遇到流结束后发送一个 Frame，不等待客户端 ACK。客户端和 relay 都统计实际响应字节，源站忽略 Range 或返回超限响应时取消上游请求并返回错误。
+relay 使用 BYOB `readAtLeast()` 读取 Cloudflare Fetch body，读满 256 KiB 或遇到流结束后发送一个 Frame，不等待客户端 ACK。小于 256 KiB 的响应上限会直接作为聚合大小，避免为小请求分配过大的缓冲区。客户端和 relay 都统计实际响应字节，源站忽略 Range 或返回超限响应时取消上游请求并返回错误。
+
+Worker 在 WebSocket upgrade response 中使用空的 `Sec-WebSocket-Extensions`，明确拒绝浏览器自动提供的 `permessage-deflate`。Transport 主要承载已经压缩的媒体字节，重复压缩通常不能减少流量，却会持续消耗 Worker CPU。正常的 `1000` 空闲连接关闭不写结构化日志，异常关闭和仍有活动事务的关闭继续保留诊断信息。
 
 ## 连接池
 
@@ -122,6 +124,7 @@ Edge Worker 开启持久化 Workers Logs 和 invocation logs，head sampling rat
 
 ## 修改历史
 
+- 2026-08-06: 禁用 WebSocket 压缩，将响应聚合提高到 256 KiB，并减少正常连接关闭日志以降低 relay CPU 消耗。
 - 2026-08-05: relay 恢复 runtime 标准 WebSocket 自动关闭握手，并将消息处理、上游代理和取消纳入 ExecutionContext 跟踪。
 - 2026-08-05: Edge Worker 开启持久化 Workers Logs 和完整 invocation logs。
 - 2026-08-05: relay 改用 BYOB 聚合读取，将上游小块合并成 128 KiB 响应帧，减少 WebSocket 发送和读取唤醒次数。
