@@ -7,6 +7,11 @@ import {
   TransportFrameKind,
 } from 'storya-protocol'
 import { FetchHttpTransport } from './fetch-http-transport'
+import {
+  formatTransportStatistics,
+  TransportStatistics,
+  type TransportStatisticsSnapshot,
+} from './transport-statistics'
 import { WebSocketHttpTransport } from './websocket-http-transport'
 import type {
   WebSocketFactory,
@@ -144,6 +149,68 @@ class FakeWebSocket implements WebSocketLike {
       listener(event as never)
     }
   }
+}
+
+async function testTransportStatistics(): Promise<void> {
+  const logs: TransportStatisticsSnapshot[] = []
+  const logMessages: string[] = []
+  const statistics = new TransportStatistics('TestTransport', {
+    intervalMs: 5,
+    logger: (message, snapshot) => {
+      logMessages.push(message)
+      logs.push(snapshot)
+    },
+  })
+
+  const hit = statistics
+    .startRequest()
+    .trackResponse(new Response('fetch', { headers: { 'cf-cache-status': 'HIT' } }))
+  await hit.arrayBuffer()
+  const miss = statistics
+    .startRequest()
+    .trackResponse(new Response('data', { headers: { 'cf-cache-status': 'MISS' } }))
+  await miss.arrayBuffer()
+
+  const pendingBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]))
+    },
+  })
+  const bypass = statistics
+    .startRequest()
+    .trackResponse(new Response(pendingBody, { headers: { 'cf-cache-status': 'BYPASS' } }))
+  const bypassReader = bypass.body?.getReader()
+  await bypassReader?.read()
+  await bypassReader?.cancel()
+
+  const failed = statistics.startRequest()
+  failed.reject(new Error('请求失败'))
+  statistics.startRequest().trackResponse(new Response(null), false)
+
+  const snapshot = statistics.snapshot()
+  assert(snapshot.requestCount === 5, 'Transport 统计请求数量错误')
+  assert(snapshot.successCount === 3, 'Transport 统计成功数量错误')
+  assert(snapshot.failureCount === 1, 'Transport 统计失败数量错误')
+  assert(snapshot.canceledCount === 1, 'Transport 统计取消数量错误')
+  assert(snapshot.activeRequestCount === 0, 'Transport 统计活动请求数量错误')
+  assert(snapshot.responseBytes === 12, 'Transport 统计实际响应字节错误')
+  assert(snapshot.cacheHitCount === 1, 'Transport 统计缓存命中数量错误')
+  assert(snapshot.cacheMissCount === 1, 'Transport 统计缓存未命中数量错误')
+  assert(snapshot.cacheBypassCount === 1, 'Transport 统计缓存绕过数量错误')
+  assert(snapshot.cacheUnknownCount === 1, 'Transport 统计未知缓存数量错误')
+  const formatted = formatTransportStatistics(snapshot)
+  assert(formatted.includes('请求 5'), 'Transport 统计摘要缺少请求数量')
+  assert(formatted.includes('成功 3'), 'Transport 统计摘要缺少成功数量')
+  assert(formatted.includes('数据 12 B'), 'Transport 统计摘要缺少数据量')
+  assert(formatted.includes('命中率 50.0%'), 'Transport 统计摘要缺少缓存命中率')
+  assert(formatted.includes('CF BYPASS=1,HIT=1,MISS=1'), 'Transport 统计摘要缺少 CF 状态')
+
+  await waitForWithin(() => logs.length > 0, 100)
+  assert(logMessages[0] === formatted, 'Transport 定时日志没有使用可读摘要')
+  const logCount = logs.length
+  statistics.destroy()
+  await new Promise(resolve => globalThis.setTimeout(resolve, 10))
+  assert(logs.length === logCount, 'Transport 统计销毁后仍在输出日志')
 }
 
 async function testFetchTransport(): Promise<void> {
@@ -384,6 +451,7 @@ function assert(condition: boolean, message: string): asserts condition {
   }
 }
 
+await testTransportStatistics()
 await testFetchTransport()
 await testSequentialReuse()
 await testConcurrentGrowth()

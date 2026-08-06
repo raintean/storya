@@ -4,6 +4,7 @@ export { createAbortError, HttpTransportFailure } from './http-transport'
 export type {
   HttpTransport,
   HttpTransportFailureCode,
+  HttpTransportRangeRequestMode,
   HttpTransportRequestOptions,
   HttpTransportResponse,
 } from './http-transport'
@@ -13,6 +14,7 @@ export {
   encodeProxyTargetUrl,
   ProxyHttpTransport,
 } from './proxy-http-transport'
+export type { ProxyByteRange } from './proxy-http-transport'
 export {
   DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
   DEFAULT_WEBSOCKET_HEARTBEAT_INTERVAL_MS,

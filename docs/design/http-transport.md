@@ -45,12 +45,12 @@ interface HttpTransport {
 目标 URL 使用 UTF-8 和无 padding 的 Base64URL 编码为以下地址：
 
 ```text
-/proxy/<base64url(target-url)>.bin
+/proxy/<base64url(target-url)>.jpg
 ```
 
-`.bin` 让该路径保持普通静态二进制资源的 CDN 语义。第一版不加密，也没有签名；该编码只用于把完整目标 URL 安全放入 path，不是访问控制。公开生产部署前需要增加服务端签发或等价的授权机制。
+`.jpg` 后缀让 Cloudflare 把该路径当作可缓存静态图片资源，配合 `Content-Type: image/jpeg` 获得更长的边缘缓存有效期。第一版不加密，也没有签名；该编码只用于把完整目标 URL 安全放入 path，不是访问控制。公开生产部署前需要增加服务端签发或等价的授权机制。
 
-Transport 通过标准 Fetch 发送原请求的 method 和 headers，不发送浏览器 cookie。Rust proxy 解码目标 URL、限制 scheme 为 HTTP/HTTPS、过滤逐跳和代理基础设施 header，并流式返回上游 status、headers 和 body。上游重定向的 `Location` 会被解析并重新编码为同一 Proxy Origin 下的 `/proxy/...bin`，因此浏览器仍按标准 Fetch 重定向流程执行，最终响应 URL 也能由 Transport 还原为真实上游 URL。
+Transport 通过标准 Fetch 发送原请求的 method 和 headers，不发送浏览器 cookie。Rust proxy 解码目标 URL、限制 scheme 为 HTTP/HTTPS、过滤逐跳和代理基础设施 header，并流式返回上游 status、headers 和 body。上游重定向的 `Location` 会被解析并重新编码为同一 Proxy Origin 下的 `/proxy/...jpg`，因此浏览器仍按标准 Fetch 重定向流程执行，最终响应 URL 也能由 Transport 还原为真实上游 URL。
 
 Rust proxy 为成功和错误响应统一增加 CORS header，并暴露全部响应 header，使浏览器可以读取 `Content-Range`、`Content-Length`、ETag 和缓存诊断信息。任意目标 URL、无签名和未拦截内网地址的组合只适合当前开发验证，不是公开代理的安全终态。
 
@@ -132,9 +132,9 @@ Fetch 子请求继续使用 Cloudflare 标准 HTTP 缓存语义。relay 当前�
 
 ## HTTP Proxy 与缓存
 
-`storya-http-proxy` 第一版是无状态直通服务，不使用 SQLite、稀疏文件或本地分片缓存。Cloudflare 位于 Proxy Origin 和 Rust service 之间时，可以按标准 CDN 规则缓存 `/proxy/...bin` 响应；Rust service 不覆盖上游 Cache-Control，也不手工处理 206 缓存。
+`storya-http-proxy` 是无状态直通服务，不使用本地缓存。Cloudflare 位于 Proxy Origin 和 Rust service 之间，按 `cloudflare-cdn-cache-control` 缓存 `/proxy/...jpg` 响应。对于 Range chunk（上游返回 206），Rust proxy 把响应包装为 200 可缓存对象：原始 206 状态码移入 `x-storya-proxy-status`、`Content-Range` 移入 `x-storya-proxy-content-range`，浏览器侧输出 `Cache-Control: no-store`，CF 边缘强制 `cloudflare-cdn-cache-control: public, max-age=31536000`（一年），并把 `Content-Type` 改写为 `image/jpeg`、真实类型存入 `x-storya-proxy-content-type` 供客户端还原。HEAD、Range 未命中（非 206）和错误响应统一 `no-store`，不进入边缘缓存；完整 GET（init segment 等）保持上游响应透传。
 
-对于可缓存的 `.bin` URL，Cloudflare 在 HEAD MISS 时可能向 Rust origin 发送 GET 并缓存完整响应。当前明确接受该行为，将其视为缓存预热；服务和客户端都不增加 HEAD 绕过参数或独立路径。
+对于可缓存的 `.jpg` URL，Cloudflare 在 HEAD MISS 时可能向 Rust origin 发送 GET 并缓存完整响应。当前明确接受该行为，将其视为缓存预热；服务和客户端都不增加 HEAD 绕过参数或独立路径。
 
 ## 可观测性
 
@@ -148,6 +148,7 @@ Rust proxy 在收到上游响应头后输出一条结构化 INFO 日志，包含
 
 ## 修改历史
 
+- 2026-08-06: Proxy URL 改用 `.jpg` 后缀以延长 Cloudflare 边缘默认缓存；Range chunk 把 `cloudflare-cdn-cache-control` 强制设为一年，并通过 `x-storya-proxy-content-type` 把 `Content-Type` 改写为 `image/jpeg`、真实类型由客户端还原。
 - 2026-08-06: 增加多 Origin `ProxyHttpTransport` 和无状态 `storya-http-proxy`，采用 `/proxy/<base64url>.bin` 执行标准 GET/HEAD 直通。
 - 2026-08-06: 禁用 WebSocket 压缩，将响应聚合提高到 256 KiB，并减少正常连接关闭日志以降低 relay CPU 消耗。
 - 2026-08-05: relay 恢复 runtime 标准 WebSocket 自动关闭握手，并将消息处理、上游代理和取消纳入 ExecutionContext 跟踪。

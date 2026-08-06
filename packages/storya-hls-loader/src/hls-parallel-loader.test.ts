@@ -8,6 +8,7 @@ import type {
   LoaderConfiguration,
   LoaderResponse,
 } from 'hls.js'
+import type { HttpTransport, HttpTransportResponse } from 'storya-transport'
 import { createHlsParallelLoader } from './index.ts'
 
 class FakeHls {
@@ -213,6 +214,68 @@ try {
 } finally {
   parallel.destroy()
   globalThis.fetch = originalFetch
+}
+
+await testStableRangeRetry()
+
+async function testStableRangeRetry(): Promise<void> {
+  const requestedRanges: string[] = []
+  let attempt = 0
+  const transport: HttpTransport = {
+    rangeRequestMode: 'stable',
+    destroy: () => undefined,
+    request: request => {
+      requestedRanges.push(request.headers.get('range') ?? '')
+      attempt += 1
+      const headers = {
+        'content-length': '4',
+        'content-range': 'bytes 0-3/4',
+      }
+      if (attempt === 1) {
+        let delivered = false
+        const body = new ReadableStream<Uint8Array>({
+          pull: controller => {
+            if (!delivered) {
+              delivered = true
+              controller.enqueue(new Uint8Array([9, 9]))
+              return
+            }
+            controller.error(new Error('模拟响应中断'))
+          },
+        })
+        return Promise.resolve(
+          new Response(body, { headers, status: 206 }) as HttpTransportResponse,
+        )
+      }
+      return Promise.resolve(
+        new Response(new Uint8Array([9, 9, 9, 9]), {
+          headers,
+          status: 206,
+        }) as HttpTransportResponse,
+      )
+    },
+  }
+  const stableParallel = createHlsParallelLoader({ transport })
+  const stableHls = new FakeHls()
+  const fragment = createFragment(9)
+  stableParallel.attach(stableHls as unknown as Hls)
+  stableHls.emit(Hls.Events.LEVEL_LOADED, {
+    details: { fragments: [fragment], url: 'https://example.com/stable/index.m3u8' },
+    level: 0,
+  } as LevelLoadedData)
+
+  try {
+    const response = await load(stableParallel.fragmentLoader, fragment)
+    assertPayload(response, 9)
+    if (
+      requestedRanges.length !== 2 ||
+      requestedRanges.some(range => range !== 'bytes=0-2097151')
+    ) {
+      throw new Error(`稳定 Range 重试改变了 Chunk 边界: ${requestedRanges.join(', ')}`)
+    }
+  } finally {
+    stableParallel.destroy()
+  }
 }
 
 function getHeadRequestCount(): number {

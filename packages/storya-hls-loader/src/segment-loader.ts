@@ -33,6 +33,7 @@ interface Attempt {
   badSince: number | undefined
   bytes: number
   controller: AbortController
+  discardBytes: number
   id: number
   loadTimer: number | undefined
   requestEnd: number | undefined
@@ -518,6 +519,14 @@ class SegmentLoadCoordinator {
       : undefined
   }
 
+  usesStableRangeRequests(): boolean {
+    return this.transport.rangeRequestMode === 'stable'
+  }
+
+  recordDiscardedWireBytes(bytes: number): void {
+    this.wireBytes += bytes
+  }
+
   private acceptSequentialResponse(task: ChunkLoadTask, response: HttpTransportResponse): void {
     if (response.status !== 200) {
       throw new TransportError(`顺序请求返回了 HTTP ${response.status}`, response.status)
@@ -812,6 +821,7 @@ class ChunkLoadTask implements ScheduledRequest {
   private completed = false
   private deliverOffset: number
   private end: number | undefined
+  private readonly stableEnd: number | undefined
   private nextRunAt = 0
   private preemptible: boolean
   private preemptions = 0
@@ -832,6 +842,7 @@ class ChunkLoadTask implements ScheduledRequest {
     this.startOffset = startOffset
     this.deliverOffset = startOffset
     this.end = endOffset
+    this.stableEnd = endOffset
     this.rangeEnabled = useRange
     this.preemptible = useRange
   }
@@ -878,13 +889,20 @@ class ChunkLoadTask implements ScheduledRequest {
       return
     }
 
-    const requestStart = this.segmentResourceOffset(this.startOffset + this.receivedBytes)
+    const restartRange = this.rangeEnabled && this.segment.usesStableRangeRequests()
+    const requestStart = this.segmentResourceOffset(
+      this.startOffset + (restartRange ? 0 : this.receivedBytes),
+    )
+    const requestEndOffset = restartRange ? this.stableEnd : this.end
     const requestEnd =
-      this.rangeEnabled && this.end !== undefined ? this.segmentResourceOffset(this.end) : undefined
+      this.rangeEnabled && requestEndOffset !== undefined
+        ? this.segmentResourceOffset(requestEndOffset)
+        : undefined
     const attempt: Attempt = {
       badSince: undefined,
       bytes: 0,
       controller: new AbortController(),
+      discardBytes: restartRange ? this.receivedBytes : 0,
       id: ++this.attemptSequence,
       loadTimer: undefined,
       requestEnd,
@@ -1057,12 +1075,19 @@ class ChunkLoadTask implements ScheduledRequest {
     }
     attempt.bytes += data.byteLength
     this.resetTrafficTimer(attempt)
-    this.segment.acceptData(this, data, response)
+    const discardedBytes = Math.min(attempt.discardBytes, data.byteLength)
+    attempt.discardBytes -= discardedBytes
+    this.segment.recordDiscardedWireBytes(discardedBytes)
+    const freshData = discardedBytes === 0 ? data : data.subarray(discardedBytes)
+    if (freshData.byteLength > 0) {
+      this.segment.acceptData(this, freshData, response)
+    }
     this.detectSlowAttempt(attempt, now)
   }
 
   private detectSlowAttempt(attempt: Attempt, now: number): void {
     if (
+      this.segment.usesStableRangeRequests() ||
       !this.rangeEnabled ||
       this.rescueAttempts >= this.segment.options.maxRescueAttempts ||
       attempt.bytes < 256 * 1024 ||

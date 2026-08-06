@@ -1,4 +1,4 @@
-use std::{env, error::Error, time::Instant};
+use std::{env, error::Error, fmt, time::Instant};
 
 use axum::{
     Json, Router,
@@ -7,9 +7,9 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
         header::{
-            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+            ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
             ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
-            CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE,
+            CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
         },
     },
     response::{IntoResponse, Response},
@@ -27,6 +27,25 @@ struct ProxyState {
     client: Client,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ByteRange {
+    end_inclusive: u64,
+    start: u64,
+}
+
+impl fmt::Display for ByteRange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "bytes={}-{}", self.start, self.end_inclusive)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProxyTarget {
+    head: bool,
+    range: Option<ByteRange>,
+    url: Url,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     service: &'static str,
@@ -39,6 +58,16 @@ struct ProxyError {
     status: StatusCode,
 }
 
+const PROXY_CONTENT_RANGE_HEADER: &str = "x-storya-proxy-content-range";
+const PROXY_CONTENT_LENGTH_HEADER: &str = "x-storya-proxy-content-length";
+const PROXY_STATUS_HEADER: &str = "x-storya-proxy-status";
+const PROXY_CONTENT_TYPE_HEADER: &str = "x-storya-proxy-content-type";
+const CLOUDFLARE_CDN_CACHE_CONTROL_HEADER: &str = "cloudflare-cdn-cache-control";
+const EDGE_CACHE_CONTROL_VALUE: &str = "public, max-age=31536000";
+const PROXY_CONTENT_TYPE_VALUE: &str = "image/jpeg";
+const HEAD_DESCRIPTOR_PREFIX: &str = "storya-proxy-head-v1\n";
+const RANGE_DESCRIPTOR_PREFIX: &str = "storya-proxy-range-v1\n";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
@@ -49,7 +78,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let address = env::var("STORYA_HTTP_PROXY_ADDRESS").unwrap_or_else(|_| "0.0.0.0:80".to_owned());
     let listener = TcpListener::bind(&address).await?;
-    let client = Client::builder().redirect(Policy::none()).build()?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .http1_only()
+        .build()?;
     let app = create_router(client);
 
     info!(%address, "storya-http-proxy listening");
@@ -89,58 +121,129 @@ async fn proxy_request(
 ) -> Result<Response, ProxyError> {
     let started_at = Instant::now();
     let target = decode_target(&encoded_target)?;
+    log_incoming_request(&method, &request_headers, &target);
+    if target.head && method != Method::GET {
+        warn!(
+            request_method = %method,
+            expected_method = "GET",
+            target_host = target.url.host_str().unwrap_or("-"),
+            target_path = target.url.path(),
+            descriptor_kind = "head",
+            "proxy descriptor method mismatch"
+        );
+        return Err(ProxyError::bad_request(
+            "Proxy HEAD descriptor 必须通过物理 GET 传输",
+        ));
+    }
+    if target.range.is_some() && method != Method::GET {
+        warn!(
+            request_method = %method,
+            expected_method = "GET",
+            target_host = target.url.host_str().unwrap_or("-"),
+            target_path = target.url.path(),
+            descriptor_kind = "range",
+            "proxy descriptor method mismatch"
+        );
+        return Err(ProxyError::bad_request(
+            "Proxy Range descriptor 只允许使用 GET",
+        ));
+    }
+
+    let upstream_method = if target.head {
+        Method::HEAD
+    } else {
+        method.clone()
+    };
+    let mut upstream_headers = copy_request_headers(&request_headers);
+    upstream_headers.remove(RANGE);
+    if let Some(range) = target.range {
+        let value = HeaderValue::from_str(&range.to_string())
+            .map_err(|_| ProxyError::bad_request("Proxy Range 无法转换为 HTTP header"))?;
+        upstream_headers.insert(RANGE, value);
+    }
+    let upstream_range = upstream_headers
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_owned();
+    info!(
+        request_method = %method,
+        upstream_method = %upstream_method,
+        target_host = target.url.host_str().unwrap_or("-"),
+        target_path = target.url.path(),
+        descriptor_kind = descriptor_kind(&target),
+        upstream_range = %upstream_range,
+        "proxy upstream request"
+    );
     let upstream = state
         .client
-        .request(method.clone(), target.clone())
-        .headers(copy_request_headers(&request_headers))
+        .request(upstream_method.clone(), target.url.clone())
+        .headers(upstream_headers)
         .send()
         .await
         .map_err(ProxyError::upstream)?;
 
-    let status = upstream.status();
+    let upstream_status = upstream.status();
+    let upstream_version = upstream.version();
     let mut response_headers = copy_response_headers(upstream.headers());
-    rewrite_redirect_location(status, &target, &mut response_headers)?;
+    rewrite_redirect_location(upstream_status, &target, &mut response_headers)?;
+    let downstream_status =
+        prepare_downstream_response(&target, upstream_status, &mut response_headers)?;
     info!(
-        method = %method,
-        target_host = target.host_str().unwrap_or("-"),
-        status = status.as_u16(),
-        range = request_headers
-            .get(RANGE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("-"),
+        request_method = %method,
+        upstream_method = %upstream_method,
+        target_host = target.url.host_str().unwrap_or("-"),
+        target_path = target.url.path(),
+        descriptor_kind = descriptor_kind(&target),
+        upstream_range = %upstream_range,
+        upstream_status = upstream_status.as_u16(),
+        upstream_version = ?upstream_version,
+        downstream_status = downstream_status.as_u16(),
+        range_wrapped = target.range.is_some() && upstream_status == StatusCode::PARTIAL_CONTENT,
         content_range = response_headers
             .get(CONTENT_RANGE)
+            .or_else(|| response_headers.get(PROXY_CONTENT_RANGE_HEADER))
             .and_then(|value| value.to_str().ok())
             .unwrap_or("-"),
         content_length = response_headers
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("-"),
+        cache_control = response_headers
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        cdn_cache_control = response_headers
+            .get(CLOUDFLARE_CDN_CACHE_CONTROL_HEADER)
+            .or_else(|| response_headers.get("cdn-cache-control"))
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
         response_head_ms = started_at.elapsed().as_millis(),
-        "proxy request"
+        "proxy upstream response"
     );
-    let body = if method == Method::HEAD {
+    let body = if target.head || upstream_method == Method::HEAD {
         Body::empty()
     } else {
         Body::from_stream(upstream.bytes_stream())
     };
     let mut response = Response::new(body);
-    *response.status_mut() = status;
+    *response.status_mut() = downstream_status;
     *response.headers_mut() = response_headers;
     Ok(with_cors(response))
 }
 
-fn decode_target(encoded_target: &str) -> Result<Url, ProxyError> {
+fn decode_target(encoded_target: &str) -> Result<ProxyTarget, ProxyError> {
     let value = encoded_target
-        .strip_suffix(".bin")
-        .ok_or_else(|| ProxyError::bad_request("Proxy URL 必须以 .bin 结尾"))?;
+        .strip_suffix(".jpg")
+        .ok_or_else(|| ProxyError::bad_request("Proxy URL 必须以 .jpg 结尾"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| ProxyError::bad_request("Proxy URL 包含无效的 Base64URL target"))?;
-    let target = String::from_utf8(bytes)
+    let descriptor = String::from_utf8(bytes)
         .map_err(|_| ProxyError::bad_request("Proxy URL target 不是 UTF-8"))?;
-    let mut url = Url::parse(&target)
-        .map_err(|_| ProxyError::bad_request("Proxy URL target 不是有效 URL"))?;
+    let (target, range, head) = decode_target_descriptor(&descriptor)?;
+    let mut url =
+        Url::parse(target).map_err(|_| ProxyError::bad_request("Proxy URL target 不是有效 URL"))?;
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ProxyError::bad_request(
             "Proxy URL target 必须使用 HTTP 或 HTTPS",
@@ -150,17 +253,64 @@ fn decode_target(encoded_target: &str) -> Result<Url, ProxyError> {
         return Err(ProxyError::bad_request("Proxy URL target 不能包含用户信息"));
     }
     url.set_fragment(None);
-    Ok(url)
+    Ok(ProxyTarget { head, range, url })
 }
 
-fn encode_proxy_path(target: &Url) -> String {
-    let encoded = URL_SAFE_NO_PAD.encode(target.as_str());
-    format!("/proxy/{encoded}.bin")
+fn decode_target_descriptor(
+    descriptor: &str,
+) -> Result<(&str, Option<ByteRange>, bool), ProxyError> {
+    if let Some(target) = descriptor.strip_prefix(HEAD_DESCRIPTOR_PREFIX) {
+        return Ok((target, None, true));
+    }
+    let Some(value) = descriptor.strip_prefix(RANGE_DESCRIPTOR_PREFIX) else {
+        return Ok((descriptor, None, false));
+    };
+    let mut fields = value.splitn(3, '\n');
+    let start = fields
+        .next()
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(|| ProxyError::bad_request("Proxy Range 起点无效"))?;
+    let end_inclusive = fields
+        .next()
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(|| ProxyError::bad_request("Proxy Range 终点无效"))?;
+    let target = fields
+        .next()
+        .ok_or_else(|| ProxyError::bad_request("Proxy Range descriptor 缺少 target"))?;
+    if end_inclusive < start {
+        return Err(ProxyError::bad_request("Proxy Range 终点不能小于起点"));
+    }
+    Ok((
+        target,
+        Some(ByteRange {
+            end_inclusive,
+            start,
+        }),
+        false,
+    ))
+}
+
+fn encode_proxy_path(target: &ProxyTarget) -> Result<String, ProxyError> {
+    let descriptor = match (target.head, target.range) {
+        (true, None) => format!("{HEAD_DESCRIPTOR_PREFIX}{}", target.url),
+        (true, Some(_)) => {
+            return Err(ProxyError::bad_request(
+                "HEAD Proxy target 不能同时包含 Range",
+            ));
+        },
+        (false, Some(range)) => format!(
+            "{RANGE_DESCRIPTOR_PREFIX}{}\n{}\n{}",
+            range.start, range.end_inclusive, target.url
+        ),
+        (false, None) => target.url.to_string(),
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(descriptor);
+    Ok(format!("/proxy/{encoded}.jpg"))
 }
 
 fn rewrite_redirect_location(
     status: StatusCode,
-    target: &Url,
+    target: &ProxyTarget,
     headers: &mut HeaderMap,
 ) -> Result<(), ProxyError> {
     if !status.is_redirection() {
@@ -173,6 +323,7 @@ fn rewrite_redirect_location(
         .to_str()
         .map_err(|_| ProxyError::upstream_response("上游 Location 不是有效字符串"))?;
     let redirect_target = target
+        .url
         .join(location)
         .map_err(|_| ProxyError::upstream_response("上游 Location 不是有效 URL"))?;
     if redirect_target.scheme() != "http" && redirect_target.scheme() != "https" {
@@ -180,10 +331,131 @@ fn rewrite_redirect_location(
             "上游 Location 必须使用 HTTP 或 HTTPS",
         ));
     }
-    let value = HeaderValue::from_str(&encode_proxy_path(&redirect_target))
+    let redirect_target = ProxyTarget {
+        head: target.head,
+        range: target.range,
+        url: redirect_target,
+    };
+    let redirect_path = encode_proxy_path(&redirect_target)?;
+    let value = HeaderValue::from_str(&redirect_path)
         .map_err(|_| ProxyError::upstream_response("无法编码上游 Location"))?;
     headers.insert(LOCATION, value);
     Ok(())
+}
+
+fn prepare_downstream_response(
+    target: &ProxyTarget,
+    upstream_status: StatusCode,
+    headers: &mut HeaderMap,
+) -> Result<StatusCode, ProxyError> {
+    if target.head {
+        set_proxy_status(headers, upstream_status)?;
+        if let Some(content_length) = headers.remove(CONTENT_LENGTH) {
+            headers.insert(PROXY_CONTENT_LENGTH_HEADER, content_length);
+        }
+        set_cache_pass(headers);
+        return Ok(upstream_status);
+    }
+    if target.range.is_none() {
+        return Ok(upstream_status);
+    }
+    set_proxy_status(headers, upstream_status)?;
+    if upstream_status != StatusCode::PARTIAL_CONTENT {
+        set_cache_pass(headers);
+        return Ok(upstream_status);
+    }
+
+    if let Some(content_range) = headers.remove(CONTENT_RANGE) {
+        headers.insert(PROXY_CONTENT_RANGE_HEADER, content_range);
+    }
+    swap_content_type(headers);
+    set_edge_cache_policy(headers);
+    Ok(StatusCode::OK)
+}
+
+fn set_proxy_status(headers: &mut HeaderMap, status: StatusCode) -> Result<(), ProxyError> {
+    let status_value = HeaderValue::from_str(status.as_str())
+        .map_err(|_| ProxyError::upstream_response("无法编码上游状态码"))?;
+    headers.insert(PROXY_STATUS_HEADER, status_value);
+    Ok(())
+}
+
+fn swap_content_type(headers: &mut HeaderMap) {
+    if let Some(real_content_type) = headers.remove(CONTENT_TYPE) {
+        headers.insert(
+            HeaderName::from_static(PROXY_CONTENT_TYPE_HEADER),
+            real_content_type,
+        );
+    }
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(PROXY_CONTENT_TYPE_VALUE),
+    );
+}
+
+fn set_edge_cache_policy(headers: &mut HeaderMap) {
+    headers.remove("cdn-cache-control");
+    headers.insert(
+        HeaderName::from_static(CLOUDFLARE_CDN_CACHE_CONTROL_HEADER),
+        HeaderValue::from_static(EDGE_CACHE_CONTROL_VALUE),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.remove(ACCEPT_RANGES);
+}
+
+fn set_cache_pass(headers: &mut HeaderMap) {
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("cdn-cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        HeaderName::from_static(CLOUDFLARE_CDN_CACHE_CONTROL_HEADER),
+        HeaderValue::from_static("no-store"),
+    );
+    headers.remove(ACCEPT_RANGES);
+}
+
+fn log_incoming_request(method: &Method, headers: &HeaderMap, target: &ProxyTarget) {
+    let mut header_names = headers.keys().map(HeaderName::as_str).collect::<Vec<_>>();
+    header_names.sort_unstable();
+    let descriptor_range = target.range.map(|range| range.to_string());
+    info!(
+        request_method = %method,
+        target_scheme = target.url.scheme(),
+        target_host = target.url.host_str().unwrap_or("-"),
+        target_path = target.url.path(),
+        descriptor_kind = descriptor_kind(target),
+        descriptor_range = descriptor_range.as_deref().unwrap_or("-"),
+        incoming_range = header_value(headers, "range"),
+        cf_ray = header_value(headers, "cf-ray"),
+        cf_ew_via = header_value(headers, "cf-ew-via"),
+        cdn_loop = header_value(headers, "cdn-loop"),
+        via = header_value(headers, "via"),
+        x_forwarded_proto = header_value(headers, "x-forwarded-proto"),
+        cache_control = header_value(headers, "cache-control"),
+        accept_encoding = header_value(headers, "accept-encoding"),
+        user_agent = header_value(headers, "user-agent"),
+        header_names = %header_names.join(","),
+        "proxy incoming request"
+    );
+}
+
+fn descriptor_kind(target: &ProxyTarget) -> &'static str {
+    if target.head {
+        "head"
+    } else if target.range.is_some() {
+        "range"
+    } else {
+        "full"
+    }
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
 }
 
 fn copy_request_headers(source: &HeaderMap) -> HeaderMap {
@@ -225,6 +497,16 @@ fn is_blocked_request_header(name: &HeaderName) -> bool {
             | "x-forwarded-for"
             | "x-forwarded-proto"
             | "x-real-ip"
+            | "if-match"
+            | "if-modified-since"
+            | "if-none-match"
+            | "if-range"
+            | "if-unmodified-since"
+            | "range"
+            | PROXY_CONTENT_LENGTH_HEADER
+            | PROXY_CONTENT_RANGE_HEADER
+            | PROXY_STATUS_HEADER
+            | PROXY_CONTENT_TYPE_HEADER
     )
 }
 
@@ -248,6 +530,10 @@ fn is_blocked_response_header(name: &HeaderName) -> bool {
             | "access-control-allow-origin"
             | "access-control-expose-headers"
             | "access-control-max-age"
+            | PROXY_CONTENT_LENGTH_HEADER
+            | PROXY_CONTENT_RANGE_HEADER
+            | PROXY_STATUS_HEADER
+            | PROXY_CONTENT_TYPE_HEADER
     )
 }
 
@@ -292,7 +578,9 @@ impl IntoResponse for ProxyError {
         if self.status.is_server_error() {
             warn!(status = %self.status, error = %self.message, "proxy request failed");
         }
-        with_cors((self.status, self.message).into_response())
+        let mut response = (self.status, self.message).into_response();
+        set_cache_pass(response.headers_mut());
+        with_cors(response)
     }
 }
 
@@ -302,9 +590,13 @@ mod tests {
 
     #[test]
     fn target_round_trip() {
-        let target = Url::parse("https://media.example.com/视频/a.ts?token=a/b+c==")
-            .expect("测试 URL 必须有效");
-        let path = encode_proxy_path(&target);
+        let target = ProxyTarget {
+            head: false,
+            range: None,
+            url: Url::parse("https://media.example.com/视频/a.ts?token=a/b+c==")
+                .expect("测试 URL 必须有效"),
+        };
+        let path = encode_proxy_path(&target).expect("Proxy path 必须可编码");
         let encoded = path
             .strip_prefix("/proxy/")
             .expect("Proxy path 必须有正确前缀");
@@ -313,8 +605,180 @@ mod tests {
     }
 
     #[test]
+    fn range_target_round_trip() {
+        let target = ProxyTarget {
+            head: false,
+            range: Some(ByteRange {
+                end_inclusive: 2_097_151,
+                start: 0,
+            }),
+            url: Url::parse("https://media.example.com/video/segment.m4s?token=test")
+                .expect("测试 URL 必须有效"),
+        };
+        let path = encode_proxy_path(&target).expect("Range Proxy path 必须可编码");
+        let encoded = path
+            .strip_prefix("/proxy/")
+            .expect("Proxy path 必须有正确前缀");
+        let decoded = decode_target(encoded).expect("Range target 必须可解码");
+        assert_eq!(decoded, target);
+    }
+
+    #[test]
+    fn head_target_round_trip() {
+        let target = ProxyTarget {
+            head: true,
+            range: None,
+            url: Url::parse("https://media.example.com/video/segment.m4s")
+                .expect("测试 URL 必须有效"),
+        };
+        let path = encode_proxy_path(&target).expect("HEAD Proxy path 必须可编码");
+        let encoded = path
+            .strip_prefix("/proxy/")
+            .expect("Proxy path 必须有正确前缀");
+        let decoded = decode_target(encoded).expect("HEAD target 必须可解码");
+        assert_eq!(decoded, target);
+    }
+
+    #[test]
+    fn wraps_partial_response_as_cacheable_object() {
+        let target = ProxyTarget {
+            head: false,
+            range: Some(ByteRange {
+                end_inclusive: 2_097_151,
+                start: 0,
+            }),
+            url: Url::parse("https://media.example.com/video/segment.m4s")
+                .expect("测试 URL 必须有效"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-2097151/10485760"),
+        );
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("2097152"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("video/mp2t"));
+
+        let status =
+            prepare_downstream_response(&target, StatusCode::PARTIAL_CONTENT, &mut headers)
+                .expect("Partial Content 包装必须成功");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(PROXY_STATUS_HEADER),
+            Some(&HeaderValue::from_static("206"))
+        );
+        assert_eq!(
+            headers.get(PROXY_CONTENT_RANGE_HEADER),
+            Some(&HeaderValue::from_static("bytes 0-2097151/10485760"))
+        );
+        assert!(!headers.contains_key(CONTENT_RANGE));
+        assert_eq!(
+            headers.get(CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("2097152"))
+        );
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            headers.get(CLOUDFLARE_CDN_CACHE_CONTROL_HEADER),
+            Some(&HeaderValue::from_static("public, max-age=31536000"))
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("image/jpeg"))
+        );
+        assert_eq!(
+            headers.get(PROXY_CONTENT_TYPE_HEADER),
+            Some(&HeaderValue::from_static("video/mp2t"))
+        );
+    }
+
+    #[test]
+    fn bypasses_cache_for_head_and_ignored_range() {
+        for target in [
+            ProxyTarget {
+                head: true,
+                range: None,
+                url: Url::parse("https://media.example.com/video/segment.m4s")
+                    .expect("测试 URL 必须有效"),
+            },
+            ProxyTarget {
+                head: false,
+                range: Some(ByteRange {
+                    end_inclusive: 9,
+                    start: 0,
+                }),
+                url: Url::parse("https://media.example.com/video/segment.m4s")
+                    .expect("测试 URL 必须有效"),
+            },
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
+            let downstream = prepare_downstream_response(&target, StatusCode::OK, &mut headers)
+                .expect("Cache pass 响应处理必须成功");
+            assert_eq!(downstream, StatusCode::OK);
+            assert_eq!(
+                headers.get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+            assert_eq!(
+                headers.get("cdn-cache-control"),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+            assert_eq!(
+                headers.get(PROXY_STATUS_HEADER),
+                Some(&HeaderValue::from_static("200"))
+            );
+            if target.head {
+                assert!(!headers.contains_key(CONTENT_LENGTH));
+                assert_eq!(
+                    headers.get(PROXY_CONTENT_LENGTH_HEADER),
+                    Some(&HeaderValue::from_static("10"))
+                );
+            } else {
+                assert_eq!(
+                    headers.get(CONTENT_LENGTH),
+                    Some(&HeaderValue::from_static("10"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_preserves_range_descriptor() {
+        let target = ProxyTarget {
+            head: false,
+            range: Some(ByteRange {
+                end_inclusive: 99,
+                start: 0,
+            }),
+            url: Url::parse("https://media.example.com/path/segment.m4s")
+                .expect("测试 URL 必须有效"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, HeaderValue::from_static("../final.m4s"));
+        rewrite_redirect_location(StatusCode::FOUND, &target, &mut headers)
+            .expect("Range redirect 必须可重写");
+
+        let location = headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("重写后的 Location 必须存在");
+        let encoded = location
+            .strip_prefix("/proxy/")
+            .expect("重写后的 Location 必须是 Proxy path");
+        let redirected = decode_target(encoded).expect("重写后的 Location 必须可解码");
+        assert_eq!(redirected.range, target.range);
+        assert_eq!(
+            redirected.url.as_str(),
+            "https://media.example.com/final.m4s"
+        );
+    }
+
+    #[test]
     fn rejects_non_http_target() {
-        let encoded = format!("{}.bin", URL_SAFE_NO_PAD.encode("file:///etc/passwd"));
+        let encoded = format!("{}.jpg", URL_SAFE_NO_PAD.encode("file:///etc/passwd"));
         let error = decode_target(&encoded).expect_err("非 HTTP target 必须被拒绝");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
@@ -325,10 +789,7 @@ mod tests {
         request_headers.insert("range", HeaderValue::from_static("bytes=0-9"));
         request_headers.insert("cf-ray", HeaderValue::from_static("test"));
         let copied_request = copy_request_headers(&request_headers);
-        assert_eq!(
-            copied_request.get("range"),
-            Some(&HeaderValue::from_static("bytes=0-9"))
-        );
+        assert!(!copied_request.contains_key("range"));
         assert!(!copied_request.contains_key("cf-ray"));
 
         let mut response_headers = HeaderMap::new();
