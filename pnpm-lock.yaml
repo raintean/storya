@@ -159,6 +159,9 @@ importers:
 
   packages/storya-transport:
     dependencies:
+      '@bufbuild/protobuf':
+        specifier: 'catalog:'
+        version: 2.13.0
       storya-protocol:
         specifier: workspace:*
         version: link:../storya-protocol
@@ -172,6 +175,9 @@ importers:
 
   services/storya-edge-worker:
     dependencies:
+      '@bufbuild/protobuf':
+        specifier: 'catalog:'
+        version: 2.13.0
       storya-protocol:
         specifier: workspace:*
         version: link:../../packages/storya-protocol

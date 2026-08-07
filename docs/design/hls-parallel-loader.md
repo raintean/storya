@@ -57,15 +57,15 @@ fLoader 把 Fragment 映射到虚拟流中的 Segment，并注册独立 reader�
 
 ## Transport 边界
 
-单 Segment 下载器负责构造标准 GET、HEAD 和 Range Request，并通过注入的 `HttpTransport` 执行。默认 Transport 使用浏览器 Fetch；调用方也可以传入 `ProxyHttpTransport`，通过多个普通 HTTP Origin 访问 `storya-http-proxy`，或者传入 `WebSocketHttpTransport`，通过 `storya-edge-worker` 转发相同的 HTTP 请求。WebSocket Transport 使用整包 buffered Response，Fetch 和 Proxy Transport 保持流式 Response。
+单 Segment 下载器负责构造标准 GET、HEAD 和 Range Request，并通过注入的 `HttpTransport` 执行。默认 Transport 使用浏览器 Fetch；调用方也可以传入 `ProxyHttpTransport`，通过多个普通 HTTP Origin 访问 `storya-http-proxy`，或者传入 `WebSocketHttpTransport`，通过 `storya-edge-worker` 转发相同的 HTTP 请求。三种 Transport 都提供流式 Response。
 
 未知长度的非原子 Segment 不再先发 HEAD。首个 Chunk 直接请求 `bytes=0-<chunk-end>`：206 且 `Content-Range` 可读时立即记录总长度并规划剩余 Chunk；源站忽略 Range 并返回 200 时把该响应直接作为顺序响应继续读取；只有 206 无法提供总长度时才使用 HEAD 的 `Content-Length` 补救。这样在 Proxy Transport 统一暴露 `Content-Range` 后，正常路径不产生探测请求；直连源站受 CORS 限制时仍有后备路径。
 
-Transport 不参与虚拟流、预填充、请求优先级或抢占。AbortController 取消一次 Chunk attempt 后，Fetch 和 Proxy Transport 取消 Fetch；WebSocket Transport 不提供远端取消语义，旧 attempt 只在上层失效，完整 Response 到达后丢弃结果。
+Transport 不参与虚拟流、预填充、请求优先级、抢占或“慢连接”判断。AbortController 取消一次 Chunk attempt 后，Fetch 和 Proxy Transport 取消 Fetch；WebSocket Transport 把同一 AbortSignal 映射为当前事务的 `CANCEL`，Worker 取消上游 Fetch 并以 `CANCELED` 确认。
 
-慢速检测只应用于 streaming Transport。buffered WebSocket Transport 在完整 Response 到达前没有可观察字节，因此不启用首字节超时、流量空闲超时和请求内慢速救援，只保留完整加载超时，并在请求完成后记录历史吞吐。
+首字节超时、流量空闲超时、完整加载超时和请求内慢速救援统一应用于所有 Transport。稳定 Range Transport 被补救时保持原 Chunk 请求边界，并丢弃新响应中已经接收过的前缀。
 
-WebSocket Transport 为减少 Worker metadata 编码开销，只暴露 `accept-ranges`、`age`、缓存状态、长度与范围、内容类型以及资源校验相关的固定 response header 集合。Loader 内部读取的 header 全部包含在该集合中；通过 `getResponseHeader()` 查询其他上游 header 时会得到 `null`。
+WebSocket Transport 通过 Protobuf response head 暴露上游 response headers，通过 128 KiB 原始 body frame 向 Web Stream 交付数据。Loader 只通过标准 `HttpTransportResponse` 消费这些信息，不感知 WebSocket frame。
 
 ## 生命周期
 
@@ -83,13 +83,13 @@ WebSocket Transport 为减少 Worker metadata 编码开销，只暴露 `accept-r
 
 ```ts
 const transport = new WebSocketHttpTransport('wss://edge.example.com/transport', {
+  cancelTimeoutMs: 10_000,
   connectTimeoutMs: 10_000,
   defaultMaxResponseBytes: 32 * 1024 * 1024,
   idleConnectionTimeoutMs: 30_000,
   maxConnections: 12,
   maxRequestsPerConnection: 50,
   minIdleConnections: 6,
-  transactionTimeoutMs: 60_000,
 })
 const parallel = createHlsParallelLoader({ ...options, transport })
 const hls = new Hls({
@@ -119,6 +119,7 @@ React 实验台已经接入会话接口，并在加载事件面板中区分即�
 
 ## 修改历史
 
+- 2026-08-07: WebSocket Transport 恢复流式 Response 和远端 CANCEL；移除 `responseMode`，首字节、流量空闲和慢速补救统一应用于 Fetch、Proxy 和 WebSocket，稳定 Range 补救保持原 Chunk 边界并丢弃重复前缀。
 - 2026-08-07: WebSocket Response 收紧为 Loader 实际消费的固定 header 集合，未包含的上游 header 不再通过 `getResponseHeader()` 暴露。
 - 2026-08-07: WebSocket Transport 改为 buffered Response；Loader 对该模式禁用首字节、流量空闲和请求内慢速检测，仅保留完整加载超时与完成后吞吐统计。
 - 2026-08-06: 未知长度 Segment 改为优先从首个 Range 响应读取 `Content-Range`，只在无法取得总长度时补发 HEAD；实验台增加 HTTP Proxy Transport。

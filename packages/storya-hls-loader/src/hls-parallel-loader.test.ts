@@ -223,7 +223,6 @@ async function testStableRangeRetry(): Promise<void> {
   let attempt = 0
   const transport: HttpTransport = {
     rangeRequestMode: 'stable',
-    responseMode: 'streaming',
     destroy: () => undefined,
     request: request => {
       requestedRanges.push(request.headers.get('range') ?? '')

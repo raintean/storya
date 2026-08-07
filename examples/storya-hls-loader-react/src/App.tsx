@@ -72,13 +72,13 @@ type LoaderMode = 'native' | 'parallel'
 type LogTone = 'default' | 'error' | 'preempted' | 'rescued' | 'success'
 type TransportMode = 'fetch' | 'proxy' | 'websocket'
 
+const websocketCancelTimeoutMs = 10_000
 const websocketConnectTimeoutMs = 10_000
 const websocketDefaultMaxResponseBytes = 32 * 1024 * 1024
 const websocketIdleConnectionTimeoutMs = 30_000
 const websocketMaxConnections = DEFAULT_MAX_CONCURRENCY * 2
 const websocketMaxRequestsPerConnection = 50
 const websocketMinIdleConnections = 6
-const websocketTransactionTimeoutMs = 60_000
 
 const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
@@ -232,6 +232,7 @@ export function App() {
               ? undefined
               : new ProxyHttpTransport(proxyOrigins)
             : new WebSocketHttpTransport(relayEndpoint, {
+                cancelTimeoutMs: websocketCancelTimeoutMs,
                 connectTimeoutMs: websocketConnectTimeoutMs,
                 defaultMaxResponseBytes: websocketDefaultMaxResponseBytes,
                 debug: true,
@@ -239,7 +240,6 @@ export function App() {
                 maxConnections: websocketMaxConnections,
                 maxRequestsPerConnection: websocketMaxRequestsPerConnection,
                 minIdleConnections: websocketMinIdleConnections,
-                transactionTimeoutMs: websocketTransactionTimeoutMs,
               })
 
         const parallelLoader = createHlsParallelLoader({

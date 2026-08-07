@@ -37,19 +37,19 @@ const DEFAULT_URL =
 const LONG_CONNECTION_TIMEOUT_MS = 30 * 60 * 1000
 const MAX_REQUESTS_PER_CONNECTION = 1_000_000
 const CONNECT_TIMEOUT_MS = 10_000
+const CANCEL_TIMEOUT_MS = 10_000
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 async function main(): Promise<void> {
   const options = parseOptions(process.argv.slice(2))
   const transport = new WebSocketHttpTransport(options.endpoint, {
+    cancelTimeoutMs: CANCEL_TIMEOUT_MS,
     connectTimeoutMs: CONNECT_TIMEOUT_MS,
     defaultMaxResponseBytes: MAX_RESPONSE_BYTES,
     idleConnectionTimeoutMs: LONG_CONNECTION_TIMEOUT_MS,
     maxConnections: options.concurrency,
     maxRequestsPerConnection: MAX_REQUESTS_PER_CONNECTION,
     minIdleConnections: options.concurrency,
-    transactionTimeoutMs:
-      options.requestTimeoutMs === 0 ? LONG_CONNECTION_TIMEOUT_MS : options.requestTimeoutMs,
   })
 
   console.info('准备 WebSocket Worker CPU benchmark', {
@@ -110,12 +110,18 @@ async function runRound(
   return Promise.all(
     Array.from({ length: options.concurrency }, async (_, lane) => {
       const startedAt = performance.now()
+      const controller = new AbortController()
+      const timeout =
+        options.requestTimeoutMs === 0
+          ? undefined
+          : globalThis.setTimeout(() => controller.abort(), options.requestTimeoutMs)
       try {
         const response = await transport.request(
           new Request(options.url, {
             headers: {
               range: `bytes=0-${rangeBytes - 1}`,
             },
+            signal: controller.signal,
           }),
           { maxResponseBytes: rangeBytes },
         )
@@ -141,13 +147,17 @@ async function runRound(
         }
       } catch (cause) {
         if (
-          cause instanceof Error &&
-          cause.message === 'WebSocket 请求事务超时' &&
+          cause instanceof DOMException &&
+          cause.name === 'AbortError' &&
           options.requestTimeoutMs !== 0
         ) {
           throw new Error(`Lane ${lane + 1} 请求超过 ${options.requestTimeoutMs}ms`, { cause })
         }
         throw cause
+      } finally {
+        if (timeout !== undefined) {
+          globalThis.clearTimeout(timeout)
+        }
       }
     }),
   )

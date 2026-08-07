@@ -1,18 +1,26 @@
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
 import {
-  createHttpRelayResponseBuffer,
-  decodeHttpRelayRequest,
-  encodeHttpRelayError,
+  decodeTransportFrame,
+  encodeTransportFrame,
   HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
-  HTTP_RELAY_RESPONSE_HEADER_NAMES,
-  HttpRelayResponseOutcome,
+  HttpRequestHeadSchema,
+  HttpResponseHeadSchema,
+  TRANSPORT_FRAME_HEADER_SIZE,
+  TransportErrorCode,
+  TransportErrorSchema,
+  TransportFrameKind,
 } from 'storya-protocol'
-import type { HttpRelayHeader, HttpRelayRequest } from 'storya-protocol'
+import type { HttpRequestHead } from 'storya-protocol'
 
 interface RelayTransaction {
   readonly controller: AbortController
   reader: ReadableStreamBYOBReader | undefined
+  readonly sequence: number
+  terminal: boolean
+  transferredBytes: number
 }
 
+const responseBodyFrameBytes = 128 * 1024
 const blockedRequestHeaders = new Set([
   'connection',
   'content-length',
@@ -54,16 +62,36 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
     }
   }
 
-  const sendError = (outcome: HttpRelayResponseOutcome, message: string): void => {
-    server.send(encodeHttpRelayError(outcome, message))
+  const send = (kind: TransportFrameKind, sequence: number, payload?: Uint8Array): void => {
+    server.send(encodeTransportFrame(kind, sequence, payload))
   }
 
-  const stop = (): void => {
-    const transaction = active
-    active = undefined
-    if (transaction === undefined) {
+  const sendResponseBody = (sequence: number, payload: Uint8Array<ArrayBuffer>): void => {
+    if (payload.byteOffset < TRANSPORT_FRAME_HEADER_SIZE) {
+      send(TransportFrameKind.RESPONSE_BODY, sequence, payload)
       return
     }
+    const frame = new Uint8Array(
+      payload.buffer,
+      payload.byteOffset - TRANSPORT_FRAME_HEADER_SIZE,
+      payload.byteLength + TRANSPORT_FRAME_HEADER_SIZE,
+    )
+    frame[0] = TransportFrameKind.RESPONSE_BODY
+    new DataView(frame.buffer, frame.byteOffset, TRANSPORT_FRAME_HEADER_SIZE).setUint32(1, sequence)
+    server.send(frame)
+  }
+
+  const sendError = (sequence: number, code: TransportErrorCode, message: string): void => {
+    const error = create(TransportErrorSchema, { code, message })
+    send(TransportFrameKind.ERROR, sequence, toBinary(TransportErrorSchema, error))
+  }
+
+  const stopTransaction = (transaction: RelayTransaction): boolean => {
+    if (active !== transaction || transaction.terminal) {
+      return false
+    }
+    transaction.terminal = true
+    active = undefined
     const reader = transaction.reader
     transaction.reader = undefined
     if (reader !== undefined) {
@@ -72,140 +100,185 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
       })
     }
     transaction.controller.abort()
+    return true
   }
 
-  const sendUpstreamResponse = async (
-    relayRequest: HttpRelayRequest,
-    transaction: RelayTransaction,
-    response: Response,
-  ): Promise<void> => {
-    const responseHead = {
-      headerValues: collectResponseHeaderValues(response.headers),
-      status: response.status,
-      url: response.url === '' || response.url === relayRequest.url ? '' : response.url,
+  const stopActive = (): void => {
+    const transaction = active
+    if (transaction !== undefined) {
+      stopTransaction(transaction)
     }
-    if (relayRequest.method === 'HEAD' || response.body === null) {
-      server.send(createHttpRelayResponseBuffer(responseHead, 0).finishEmpty())
-      return
-    }
-
-    const declaredLength = parseContentLength(response.headers)
-    if (declaredLength !== undefined && declaredLength > relayRequest.maxResponseBytes) {
-      transaction.controller.abort()
-      sendError(
-        HttpRelayResponseOutcome.RESPONSE_TOO_LARGE,
-        `HTTP 响应超过 ${relayRequest.maxResponseBytes} 字节限制`,
-      )
-      return
-    }
-
-    const capacity = declaredLength ?? relayRequest.maxResponseBytes + 1
-    const output = createHttpRelayResponseBuffer(responseHead, capacity)
-    if (capacity === 0) {
-      transaction.controller.abort()
-      server.send(output.finishEmpty())
-      return
-    }
-
-    const reader = response.body.getReader({ mode: 'byob' })
-    transaction.reader = reader
-    const result = await reader.readAtLeast(capacity, output.body).finally(() => {
-      if (transaction.reader === reader) {
-        transaction.reader = undefined
-      }
-    })
-    const body = result.value
-    if (active !== transaction) {
-      return
-    }
-    if (body === undefined) {
-      server.send(createHttpRelayResponseBuffer(responseHead, 0).finishEmpty())
-      return
-    }
-    if (body.byteLength === 0) {
-      server.send(output.finish(body))
-      return
-    }
-    if (body.byteLength > relayRequest.maxResponseBytes) {
-      transaction.controller.abort()
-      sendError(
-        HttpRelayResponseOutcome.RESPONSE_TOO_LARGE,
-        `HTTP 响应超过 ${relayRequest.maxResponseBytes} 字节限制`,
-      )
-      return
-    }
-    if (declaredLength !== undefined && body.byteLength !== declaredLength) {
-      transaction.controller.abort()
-      sendError(HttpRelayResponseOutcome.UPSTREAM_FAILURE, '上游响应长度与 Content-Length 不一致')
-      return
-    }
-    server.send(output.finish(body))
   }
 
-  const proxy = async (
-    relayRequest: HttpRelayRequest,
-    transaction: RelayTransaction,
-  ): Promise<void> => {
+  const finish = (transaction: RelayTransaction): void => {
+    if (active !== transaction || transaction.terminal) {
+      return
+    }
+    send(TransportFrameKind.RESPONSE_END, transaction.sequence)
+    transaction.terminal = true
+    transaction.reader = undefined
+    active = undefined
+  }
+
+  const fail = (transaction: RelayTransaction, code: TransportErrorCode, message: string): void => {
+    if (active !== transaction || transaction.terminal) {
+      return
+    }
+    sendError(transaction.sequence, code, message)
+    stopTransaction(transaction)
+  }
+
+  const cancel = (sequence: number): void => {
+    const transaction = active
+    if (transaction === undefined || transaction.sequence !== sequence || transaction.terminal) {
+      return
+    }
+    if (stopTransaction(transaction)) {
+      send(TransportFrameKind.CANCELED, sequence)
+    }
+  }
+
+  const proxy = async (transaction: RelayTransaction, head: HttpRequestHead): Promise<void> => {
     try {
-      const target = validateRequest(relayRequest)
-      const headers = createUpstreamHeaders(relayRequest.headers, clientHeaders)
+      const { maxResponseBytes, target } = validateRequestHead(head)
+      const headers = createUpstreamHeaders(head, clientHeaders)
       const response = await fetch(
         new Request(target, {
           headers,
-          method: relayRequest.method,
+          method: head.method,
           redirect: 'follow',
           signal: transaction.controller.signal,
         }),
       )
-      if (active !== transaction) {
-        await response.body?.cancel()
+      if (active !== transaction || transaction.terminal) {
+        void response.body?.cancel()
         return
       }
-      await sendUpstreamResponse(relayRequest, transaction, response)
+
+      const contentLength = parseContentLength(response.headers)
+      if (
+        head.method !== 'HEAD' &&
+        contentLength !== undefined &&
+        contentLength > maxResponseBytes
+      ) {
+        fail(
+          transaction,
+          TransportErrorCode.RESPONSE_TOO_LARGE,
+          `HTTP 响应超过 ${maxResponseBytes} 字节限制`,
+        )
+        return
+      }
+
+      const responseHead = create(HttpResponseHeadSchema, {
+        headers: [...response.headers].map(([name, value]) => ({ name, value })),
+        status: response.status,
+        statusText: response.statusText,
+        url: response.url || target.toString(),
+      })
+      send(
+        TransportFrameKind.RESPONSE_HEAD,
+        transaction.sequence,
+        toBinary(HttpResponseHeadSchema, responseHead),
+      )
+
+      if (head.method === 'HEAD' || response.body === null) {
+        finish(transaction)
+        return
+      }
+
+      const reader = response.body.getReader({ mode: 'byob' })
+      transaction.reader = reader
+      while (active === transaction && !transaction.terminal) {
+        const remainingWithOverflowByte = maxResponseBytes - transaction.transferredBytes + 1
+        const readSize = Math.min(responseBodyFrameBytes, remainingWithOverflowByte)
+        const readBuffer = new Uint8Array(
+          new ArrayBuffer(TRANSPORT_FRAME_HEADER_SIZE + readSize),
+          TRANSPORT_FRAME_HEADER_SIZE,
+        )
+        const result = await reader.readAtLeast(readSize, readBuffer)
+        if (active !== transaction || transaction.terminal) {
+          return
+        }
+
+        const payload = result.value
+        if (payload !== undefined && payload.byteLength !== 0) {
+          transaction.transferredBytes += payload.byteLength
+          if (transaction.transferredBytes > maxResponseBytes) {
+            fail(
+              transaction,
+              TransportErrorCode.RESPONSE_TOO_LARGE,
+              `HTTP 响应超过 ${maxResponseBytes} 字节限制`,
+            )
+            return
+          }
+          sendResponseBody(transaction.sequence, payload)
+        }
+        if (result.done) {
+          finish(transaction)
+          return
+        }
+      }
     } catch (cause) {
-      if (active !== transaction) {
+      if (active !== transaction || transaction.terminal) {
         return
       }
-      sendError(
+      fail(
+        transaction,
         cause instanceof InvalidRelayRequest
-          ? HttpRelayResponseOutcome.INVALID_REQUEST
-          : HttpRelayResponseOutcome.UPSTREAM_FAILURE,
+          ? TransportErrorCode.INVALID_REQUEST
+          : TransportErrorCode.UPSTREAM_FAILURE,
         cause instanceof Error ? cause.message : '未知上游请求错误',
       )
-    } finally {
-      if (active === transaction) {
-        active = undefined
-      }
     }
   }
 
-  const acceptMessage = async (data: string | ArrayBuffer): Promise<void> => {
+  const acceptMessage = (data: string | ArrayBuffer): void => {
     if (typeof data === 'string') {
-      closeServer(1003, 'binary message required')
+      stopActive()
+      closeServer(1003, 'binary frames required')
+      return
+    }
+
+    let frame
+    try {
+      frame = decodeTransportFrame(data)
+    } catch {
+      stopActive()
+      closeServer(1002, 'invalid transport frame')
+      return
+    }
+
+    if (frame.kind === TransportFrameKind.CANCEL) {
+      cancel(frame.sequence)
+      return
+    }
+    if (frame.kind !== TransportFrameKind.REQUEST_HEAD) {
+      stopActive()
+      closeServer(1002, 'unexpected transport frame')
       return
     }
     if (active !== undefined) {
+      stopActive()
       closeServer(1008, 'request already active')
       return
     }
 
-    let relayRequest: HttpRelayRequest
+    let head
     try {
-      relayRequest = decodeHttpRelayRequest(data)
-    } catch (cause) {
-      sendError(
-        HttpRelayResponseOutcome.INVALID_REQUEST,
-        cause instanceof Error ? cause.message : 'HTTP relay request 无效',
-      )
+      head = fromBinary(HttpRequestHeadSchema, frame.payload)
+    } catch {
+      sendError(frame.sequence, TransportErrorCode.INVALID_REQUEST, 'HTTP request head 无效')
       return
     }
-
     const transaction: RelayTransaction = {
       controller: new AbortController(),
       reader: undefined,
+      sequence: frame.sequence,
+      terminal: false,
+      transferredBytes: 0,
     }
     active = transaction
-    await proxy(relayRequest, transaction)
+    track(proxy(transaction, head))
   }
 
   const track = (task: Promise<void>): void => {
@@ -215,7 +288,7 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
           message: cause instanceof Error ? cause.message : String(cause),
           type: 'http-relay-failure',
         })
-        stop()
+        stopActive()
         if (server.readyState === WebSocket.OPEN) {
           closeServer(1011, 'relay failure')
         }
@@ -224,14 +297,13 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
   }
 
   server.addEventListener('message', event => {
-    track(acceptMessage(event.data))
+    acceptMessage(event.data)
   })
   server.addEventListener('close', () => {
-    stop()
-    closeServer()
+    stopActive()
   })
   server.addEventListener('error', () => {
-    stop()
+    stopActive()
     closeServer(1011, 'websocket error')
   })
 
@@ -242,31 +314,37 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
   })
 }
 
-function validateRequest(request: HttpRelayRequest): URL {
+function validateRequestHead(head: HttpRequestHead): {
+  maxResponseBytes: number
+  target: URL
+} {
   let target: URL
   try {
-    target = new URL(request.url)
+    target = new URL(head.url)
   } catch {
     throw new InvalidRelayRequest('HTTP relay URL 无效')
   }
   if (target.protocol !== 'http:' && target.protocol !== 'https:') {
     throw new InvalidRelayRequest(`不支持的 HTTP URL protocol: ${target.protocol}`)
   }
-  if (
-    request.maxResponseBytes > HTTP_RELAY_MAX_RESPONSE_BODY_BYTES ||
-    (request.method === 'GET' && request.maxResponseBytes === 0)
-  ) {
-    throw new InvalidRelayRequest('maxResponseBytes 无效')
+  if (head.method !== 'GET' && head.method !== 'HEAD') {
+    throw new InvalidRelayRequest(`不支持的 HTTP method: ${head.method}`)
   }
-  return target
+  const maxResponseBytes = Number(head.maxResponseBytes)
+  if (
+    !Number.isSafeInteger(maxResponseBytes) ||
+    maxResponseBytes < 0 ||
+    maxResponseBytes > HTTP_RELAY_MAX_RESPONSE_BODY_BYTES ||
+    (head.method === 'GET' && maxResponseBytes === 0)
+  ) {
+    throw new InvalidRelayRequest('max_response_bytes 无效')
+  }
+  return { maxResponseBytes, target }
 }
 
-function createUpstreamHeaders(
-  headers: readonly HttpRelayHeader[],
-  clientHeaders: Headers,
-): Headers {
+function createUpstreamHeaders(head: HttpRequestHead, clientHeaders: Headers): Headers {
   const upstream = new Headers()
-  for (const header of headers) {
+  for (const header of head.headers) {
     const name = header.name.toLowerCase()
     if (!blockedRequestHeaders.has(name) && !name.startsWith('sec-websocket-')) {
       upstream.append(name, header.value)
@@ -278,14 +356,6 @@ function createUpstreamHeaders(
     }
   }
   return upstream
-}
-
-function collectResponseHeaderValues(headers: Headers): (string | null)[] {
-  const values: (string | null)[] = []
-  for (const name of HTTP_RELAY_RESPONSE_HEADER_NAMES) {
-    values.push(headers.get(name))
-  }
-  return values
 }
 
 function createClientHeaders(request: Request): Headers {

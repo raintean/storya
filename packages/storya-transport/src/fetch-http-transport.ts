@@ -9,8 +9,6 @@ import { TransportStatistics } from './transport-statistics'
 export type FetchFunction = (request: Request) => Promise<Response>
 
 export class FetchHttpTransport implements HttpTransport {
-  readonly responseMode = 'streaming' as const
-
   private destroyed = false
   private readonly fetcher: FetchFunction
   private readonly statistics: TransportStatistics

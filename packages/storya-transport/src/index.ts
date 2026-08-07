@@ -7,7 +7,6 @@ export type {
   HttpTransportRangeRequestMode,
   HttpTransportRequestOptions,
   HttpTransportResponse,
-  HttpTransportResponseMode,
 } from './http-transport'
 export {
   createProxyUrl,

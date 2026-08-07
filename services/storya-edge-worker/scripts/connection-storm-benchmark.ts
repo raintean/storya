@@ -38,12 +38,12 @@ const DEFAULT_RANGE_BYTES = 1024 * 1024
 const DEFAULT_REPORT_INTERVAL_MS = 5_000
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_MAX_CONNECTIONS = 12
+const CANCEL_TIMEOUT_MS = 10_000
 const CONNECT_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 const IDLE_CONNECTION_TIMEOUT_MS = 30_000
 const MAX_REQUESTS_PER_CONNECTION = 50
 const MIN_IDLE_CONNECTIONS = 6
-const TRANSACTION_TIMEOUT_MS = 60_000
 const DEFAULT_URL =
   'https://cdn.radiantmediatechs.com/rmp/media/samples-for-rmp-site/04052024-lac-de-bimont/hls/avc_2160p/1.m4s'
 
@@ -64,6 +64,7 @@ async function main(): Promise<void> {
   }
   let measuring = true
   const transport = new WebSocketHttpTransport(options.endpoint, {
+    cancelTimeoutMs: CANCEL_TIMEOUT_MS,
     connectTimeoutMs: CONNECT_TIMEOUT_MS,
     defaultMaxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
     debug: event => {
@@ -76,7 +77,6 @@ async function main(): Promise<void> {
     maxConnections: options.maxConnections,
     maxRequestsPerConnection: MAX_REQUESTS_PER_CONNECTION,
     minIdleConnections: Math.min(MIN_IDLE_CONNECTIONS, options.maxConnections),
-    transactionTimeoutMs: TRANSACTION_TIMEOUT_MS,
   })
 
   console.info('开始 WebSocket 连接风暴 benchmark', options)

@@ -523,10 +523,6 @@ class SegmentLoadCoordinator {
     return this.transport.rangeRequestMode === 'stable'
   }
 
-  usesBufferedResponses(): boolean {
-    return this.transport.responseMode === 'buffered'
-  }
-
   recordDiscardedWireBytes(bytes: number): void {
     this.wireBytes += bytes
   }
@@ -1049,7 +1045,6 @@ class ChunkLoadTask implements ScheduledRequest {
       return
     }
 
-    const bufferedResponse = this.segment.usesBufferedResponses()
     const reader = response.body.getReader()
     while (true) {
       const result = await reader.read()
@@ -1060,11 +1055,7 @@ class ChunkLoadTask implements ScheduledRequest {
       if (result.done) {
         return
       }
-      this.acceptAttemptData(
-        attempt,
-        bufferedResponse ? result.value : result.value.slice(),
-        response,
-      )
+      this.acceptAttemptData(attempt, result.value.slice(), response)
     }
   }
 
@@ -1083,9 +1074,7 @@ class ChunkLoadTask implements ScheduledRequest {
       attempt.ttfbTimer = undefined
     }
     attempt.bytes += data.byteLength
-    if (!this.segment.usesBufferedResponses()) {
-      this.resetTrafficTimer(attempt)
-    }
+    this.resetTrafficTimer(attempt)
     const discardedBytes = Math.min(attempt.discardBytes, data.byteLength)
     attempt.discardBytes -= discardedBytes
     this.segment.recordDiscardedWireBytes(discardedBytes)
@@ -1093,14 +1082,11 @@ class ChunkLoadTask implements ScheduledRequest {
     if (freshData.byteLength > 0) {
       this.segment.acceptData(this, freshData, response)
     }
-    if (!this.segment.usesBufferedResponses()) {
-      this.detectSlowAttempt(attempt, now)
-    }
+    this.detectSlowAttempt(attempt, now)
   }
 
   private detectSlowAttempt(attempt: Attempt, now: number): void {
     if (
-      this.segment.usesStableRangeRequests() ||
       !this.rangeEnabled ||
       this.rescueAttempts >= this.segment.options.maxRescueAttempts ||
       attempt.bytes < 256 * 1024 ||
@@ -1189,11 +1175,7 @@ class ChunkLoadTask implements ScheduledRequest {
 
   private armAttemptTimeouts(attempt: Attempt): void {
     const { maxLoadTimeMs, maxTimeToFirstByteMs } = this.segment.loaderConfig.loadPolicy
-    if (
-      !this.segment.usesBufferedResponses() &&
-      Number.isFinite(maxTimeToFirstByteMs) &&
-      maxTimeToFirstByteMs > 0
-    ) {
+    if (Number.isFinite(maxTimeToFirstByteMs) && maxTimeToFirstByteMs > 0) {
       attempt.ttfbTimer = globalThis.setTimeout(() => {
         this.handleAttemptTimeout(attempt, `首字节等待超过 ${maxTimeToFirstByteMs}ms`)
       }, maxTimeToFirstByteMs)
@@ -1208,9 +1190,7 @@ class ChunkLoadTask implements ScheduledRequest {
   private markAttemptResponseStarted(attempt: Attempt, response: HttpTransportResponse): void {
     this.clearTimer(attempt.ttfbTimer)
     attempt.ttfbTimer = undefined
-    if (!this.segment.usesBufferedResponses()) {
-      this.resetTrafficTimer(attempt)
-    }
+    this.resetTrafficTimer(attempt)
     this.segment.markResponseStarted(response)
   }
 

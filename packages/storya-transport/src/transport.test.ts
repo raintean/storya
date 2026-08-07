@@ -1,13 +1,13 @@
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
 import {
-  createHttpRelayResponseBuffer,
-  decodeHttpRelayRequest,
-  decodeHttpRelayResponse,
-  encodeHttpRelayError,
-  encodeHttpRelayResponse,
+  decodeTransportFrame,
+  encodeTransportFrame,
   HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
-  HTTP_RELAY_RESPONSE_HEADER_NAMES,
-  HttpRelayResponseOutcome,
+  HttpRequestHeadSchema,
+  HttpResponseHeadSchema,
+  TransportFrameKind,
 } from 'storya-protocol'
+import type { HttpRequestHead } from 'storya-protocol'
 import { FetchHttpTransport } from './fetch-http-transport'
 import {
   formatTransportStatistics,
@@ -23,13 +23,16 @@ import type {
 } from './websocket-http-transport'
 
 interface RelayRequest {
-  readonly request: ReturnType<typeof decodeHttpRelayRequest>
+  readonly request: HttpRequestHead
+  readonly sequence: number
   readonly socket: FakeWebSocket
 }
 
 class FakeRelay {
+  readonly canceledSequences: number[] = []
   readonly clients: FakeWebSocket[] = []
   readonly requests: RelayRequest[] = []
+  ignoreCancel = false
 
   readonly factory: WebSocketFactory = () => {
     const socket = new FakeWebSocket(this)
@@ -38,35 +41,90 @@ class FakeRelay {
   }
 
   accept(socket: FakeWebSocket, data: ArrayBuffer | ArrayBufferView): void {
-    const request = decodeHttpRelayRequest(data)
-    this.requests.push({ request, socket })
+    const frame = decodeTransportFrame(data)
+    if (frame.kind === TransportFrameKind.CANCEL) {
+      this.canceledSequences.push(frame.sequence)
+      if (!this.ignoreCancel) {
+        const index = this.requests.findIndex(
+          entry => entry.socket === socket && entry.sequence === frame.sequence,
+        )
+        if (index >= 0) {
+          this.requests.splice(index, 1)
+        }
+        socket.receive(encodeTransportFrame(TransportFrameKind.CANCELED, frame.sequence))
+      }
+      return
+    }
+    if (frame.kind !== TransportFrameKind.REQUEST_HEAD) {
+      throw new Error(`测试 Relay 不接受 frame ${frame.kind}`)
+    }
+
+    const request = fromBinary(HttpRequestHeadSchema, frame.payload)
+    this.requests.push({ request, sequence: frame.sequence, socket })
     if (!new URL(request.url).pathname.startsWith('/hold')) {
       this.respond(request.url)
     }
   }
 
   respond(url: string): void {
+    this.respondHead(url)
+    const entry = this.findRequest(url)
+    const path = new URL(entry.request.url).pathname
+    if (entry.request.method !== 'HEAD') {
+      const body = new TextEncoder().encode(path)
+      const middle = Math.floor(body.byteLength / 2)
+      if (middle > 0) {
+        this.respondBody(url, body.subarray(0, middle))
+      }
+      this.respondBody(url, body.subarray(middle))
+    }
+    this.respondEnd(url)
+  }
+
+  respondBody(url: string, body: Uint8Array): void {
+    const entry = this.findRequest(url)
+    entry.socket.receive(
+      encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, entry.sequence, body),
+    )
+  }
+
+  respondEnd(url: string): void {
     const index = this.requests.findIndex(entry => entry.request.url === url)
     const entry = index < 0 ? undefined : this.requests.splice(index, 1)[0]
     if (entry === undefined) {
       throw new Error(`测试 Relay 没有等待中的请求: ${url}`)
     }
+    entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_END, entry.sequence))
+  }
+
+  respondHead(url: string, contentLength?: number): void {
+    const entry = this.findRequest(url)
     const path = new URL(entry.request.url).pathname
-    const body = entry.request.method === 'HEAD' ? new Uint8Array() : new TextEncoder().encode(path)
+    const head = create(HttpResponseHeadSchema, {
+      headers: [{ name: 'content-length', value: String(contentLength ?? path.length) }],
+      status: 200,
+      statusText: 'OK',
+      url: entry.request.url,
+    })
     entry.socket.receive(
-      encodeHttpRelayResponse({
-        body,
-        headers: [{ name: 'content-length', value: String(path.length) }],
-        message: '',
-        outcome: HttpRelayResponseOutcome.HTTP,
-        status: 200,
-        url: entry.request.url,
-      }),
+      encodeTransportFrame(
+        TransportFrameKind.RESPONSE_HEAD,
+        entry.sequence,
+        toBinary(HttpResponseHeadSchema, head),
+      ),
     )
   }
 
   requestedUrls(socket: FakeWebSocket): string[] {
     return this.requests.filter(entry => entry.socket === socket).map(entry => entry.request.url)
+  }
+
+  private findRequest(url: string): RelayRequest {
+    const entry = this.requests.find(candidate => candidate.request.url === url)
+    if (entry === undefined) {
+      throw new Error(`测试 Relay 没有等待中的请求: ${url}`)
+    }
+    return entry
   }
 }
 
@@ -128,31 +186,14 @@ class FakeWebSocket implements WebSocketLike {
   }
 }
 
-function testRelayCodecBodyView(): void {
-  const output = createHttpRelayResponseBuffer(
-    {
-      headerValues: HTTP_RELAY_RESPONSE_HEADER_NAMES.map(name =>
-        name === 'content-type' ? 'video/mp4' : null,
-      ),
-      status: 206,
-      url: 'https://example.com/video',
-    },
-    4,
-  )
-  output.body.set([1, 2, 3])
-  const message = output.finish(output.body.subarray(0, 3))
-  const response = decodeHttpRelayResponse(message)
-  assert(response.body.buffer === message.buffer, 'Response codec 不应复制 body')
-  assert(response.body.byteLength === 3, 'Response codec body 长度错误')
-  assert(response.body[2] === 3, 'Response codec body 内容错误')
-  assert(response.headers[0]?.name === 'content-type', 'Response codec header ID 解码错误')
-  assert(response.headers[0]?.value === 'video/mp4', 'Response codec header value 解码错误')
-
-  const error = decodeHttpRelayResponse(
-    encodeHttpRelayError(HttpRelayResponseOutcome.RESPONSE_TOO_LARGE, 'response too large'),
-  )
-  assert(error.body.byteLength === 0, '错误 Response 不应暴露 body')
-  assert(error.message === 'response too large', '错误 Response message 解码错误')
+function testTransportFrameBodyView(): void {
+  const payload = new Uint8Array([1, 2, 3])
+  const message = encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, 7, payload)
+  const frame = decodeTransportFrame(message)
+  assert(frame.payload.buffer === message.buffer, 'Transport frame 解码不应复制 body')
+  assert(frame.payload.byteLength === 3, 'Transport frame body 长度错误')
+  assert(frame.payload[2] === 3, 'Transport frame body 内容错误')
+  assert(frame.sequence === 7, 'Transport frame sequence 错误')
 }
 
 async function testTransportStatistics(): Promise<void> {
@@ -226,6 +267,28 @@ async function testFetchTransport(): Promise<void> {
   transport.destroy()
 }
 
+async function testStreamingResponse(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay)
+  const responsePromise = transport.request(new Request('https://example.com/hold/stream'))
+  await waitFor(() => relay.requests.length === 1)
+  relay.respondHead('https://example.com/hold/stream', 4)
+  const response = await responsePromise
+  const reader = response.body?.getReader()
+  assert(reader !== undefined, 'GET response 没有流式 body')
+
+  relay.respondBody('https://example.com/hold/stream', new Uint8Array([1, 2]))
+  const first = await reader.read()
+  assert(!first.done && first.value.byteLength === 2, '首个流式 body frame 没有立即到达')
+  relay.respondBody('https://example.com/hold/stream', new Uint8Array([3, 4]))
+  relay.respondEnd('https://example.com/hold/stream')
+  const second = await reader.read()
+  const end = await reader.read()
+  assert(!second.done && second.value[1] === 4, '第二个流式 body frame 错误')
+  assert(end.done, 'RESPONSE_END 没有关闭 response body')
+  transport.destroy()
+}
+
 async function testSequentialReuse(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
@@ -263,21 +326,68 @@ async function testHeadContentLength(): Promise<void> {
   transport.destroy()
 }
 
-async function testAbortIsIgnored(): Promise<void> {
+async function testAbortSendsCancelAndReusesConnection(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
   const controller = new AbortController()
   const response = transport.request(
-    new Request('https://example.com/hold/ignored-abort', { signal: controller.signal }),
+    new Request('https://example.com/hold/cancel', { signal: controller.signal }),
   )
   await waitFor(() => relay.requests.length === 1)
   controller.abort()
+  await assertRejectsAbort(response, '请求 Abort 没有结束 WebSocket 事务')
+  assert(relay.canceledSequences.length === 1, '请求 Abort 没有发送 CANCEL')
 
-  const next = transport.request(new Request('https://example.com/next'))
-  await waitFor(() => relay.clients.length === 2)
-  relay.respond('https://example.com/hold/ignored-abort')
-  assert(decode(await (await response).arrayBuffer()) === '/hold/ignored-abort', 'Abort 被错误转发')
-  assert(decode(await (await next).arrayBuffer()) === '/next', '补充连接请求失败')
+  const next = await transport.request(new Request('https://example.com/next'))
+  assert(decode(await next.arrayBuffer()) === '/next', 'CANCELED 后连接没有恢复复用')
+  assert(relay.clients.length === 1, 'CANCELED 后不应创建新连接')
+  transport.destroy()
+}
+
+async function testBodyCancelSendsCancel(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay)
+  const responsePromise = transport.request(new Request('https://example.com/hold/body-cancel'))
+  await waitFor(() => relay.requests.length === 1)
+  relay.respondHead('https://example.com/hold/body-cancel', 10)
+  const response = await responsePromise
+  await response.body?.cancel()
+  assert(relay.canceledSequences.length === 1, 'response body cancel 没有发送 CANCEL')
+
+  await (await transport.request(new Request('https://example.com/reused'))).arrayBuffer()
+  assert(relay.clients.length === 1, 'body cancel 确认后连接没有恢复复用')
+  transport.destroy()
+}
+
+async function testStreamingResponseLimit(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay)
+  const responsePromise = transport.request(new Request('https://example.com/hold/too-large'), {
+    maxResponseBytes: 4,
+  })
+  await waitFor(() => relay.requests.length === 1)
+  relay.respondHead('https://example.com/hold/too-large', 4)
+  const response = await responsePromise
+  const reader = response.body?.getReader()
+  assert(reader !== undefined, '超限测试没有 response body')
+  relay.respondBody('https://example.com/hold/too-large', new Uint8Array([1, 2, 3, 4, 5]))
+  await assertRejectsCode(reader.read(), 'response-too-large', '流式累计上限没有生效')
+  assert(relay.canceledSequences.length === 1, '流式响应超限没有发送 CANCEL')
+  transport.destroy()
+}
+
+async function testCancelTimeoutClosesConnection(): Promise<void> {
+  const relay = new FakeRelay()
+  relay.ignoreCancel = true
+  const transport = createTransport(relay, { cancelTimeoutMs: 5 })
+  const controller = new AbortController()
+  const response = transport.request(
+    new Request('https://example.com/hold/cancel-timeout', { signal: controller.signal }),
+  )
+  await waitFor(() => relay.requests.length === 1)
+  controller.abort()
+  await assertRejectsAbort(response, 'CANCEL 超时测试没有先取消请求')
+  await waitForWithin(() => relay.clients[0]?.readyState === 3, 100)
   transport.destroy()
 }
 
@@ -335,23 +445,9 @@ async function testMinimumIdleDoesNotPreconnect(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay, { minIdleConnections: 6 })
   await delay(5)
-  assert(relay.clients.length === 0, 'minIdleConnections 不应主动创建连接')
+  assert(countClients(relay) === 0, 'minIdleConnections 不应主动创建连接')
   await (await transport.request(new Request('https://example.com/one'))).arrayBuffer()
   assert(countClients(relay) === 1, '单个请求不应创建最低空闲数量的连接')
-  transport.destroy()
-}
-
-async function testTransactionTimeout(): Promise<void> {
-  const relay = new FakeRelay()
-  const transport = createTransport(relay, { transactionTimeoutMs: 5 })
-  let failed = false
-  try {
-    await transport.request(new Request('https://example.com/hold/timeout'))
-  } catch (cause) {
-    failed = cause instanceof Error && cause.message === 'WebSocket 请求事务超时'
-  }
-  assert(failed, '事务超时没有结束请求')
-  assert(relay.clients[0]?.readyState === 3, '事务超时没有关闭连接')
   transport.destroy()
 }
 
@@ -447,13 +543,13 @@ function createOptions(
   overrides: Partial<WebSocketHttpTransportOptions> = {},
 ): WebSocketHttpTransportOptions {
   return {
+    cancelTimeoutMs: 1_000,
     connectTimeoutMs: 1_000,
     defaultMaxResponseBytes: HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
     idleConnectionTimeoutMs: 60_000,
     maxConnections: 12,
     maxRequestsPerConnection: 50,
     minIdleConnections: 0,
-    transactionTimeoutMs: 1_000,
     ...overrides,
   }
 }
@@ -466,6 +562,32 @@ function createTransport(
     ...createOptions(overrides),
     webSocketFactory: relay.factory,
   })
+}
+
+async function assertRejectsAbort(value: Promise<unknown>, message: string): Promise<void> {
+  try {
+    await value
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === 'AbortError') {
+      return
+    }
+  }
+  throw new Error(message)
+}
+
+async function assertRejectsCode(
+  value: Promise<unknown>,
+  code: string,
+  message: string,
+): Promise<void> {
+  try {
+    await value
+  } catch (cause) {
+    if (cause instanceof Error && 'code' in cause && cause.code === code) {
+      return
+    }
+  }
+  throw new Error(message)
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -507,18 +629,21 @@ function assert(condition: boolean, message: string): asserts condition {
   }
 }
 
-testRelayCodecBodyView()
+testTransportFrameBodyView()
 await testTransportStatistics()
 await testFetchTransport()
+await testStreamingResponse()
 await testSequentialReuse()
 await testConcurrentGrowth()
 await testHeadContentLength()
-await testAbortIsIgnored()
+await testAbortSendsCancelAndReusesConnection()
+await testBodyCancelSendsCancel()
+await testStreamingResponseLimit()
+await testCancelTimeoutClosesConnection()
 await testMaximumReuse()
 await testYoungestConnectionFirst()
 await testIdleRetentionFloor()
 await testMinimumIdleDoesNotPreconnect()
-await testTransactionTimeout()
 await testConnectionDiagnostics()
 await testDefaultConnectionLog()
 await testConnectionFactoryFailure()

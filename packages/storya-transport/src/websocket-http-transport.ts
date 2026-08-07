@@ -1,15 +1,20 @@
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
 import {
-  decodeHttpRelayResponse,
-  encodeHttpRelayRequest,
+  decodeTransportFrame,
+  encodeTransportFrame,
   HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
-  HttpRelayResponseOutcome,
+  HttpRequestHeadSchema,
+  HttpResponseHeadSchema,
+  TransportErrorCode,
+  TransportErrorSchema,
+  TransportFrameKind,
 } from 'storya-protocol'
 import type {
   HttpTransport,
   HttpTransportRequestOptions,
   HttpTransportResponse,
 } from './http-transport'
-import { HttpTransportFailure } from './http-transport'
+import { createAbortError, HttpTransportFailure } from './http-transport'
 import { WebSocketHttpResponse } from './websocket-http-response'
 
 interface WebSocketEventMapLike {
@@ -61,6 +66,7 @@ export interface WebSocketHttpTransportDebugEvent {
 export type WebSocketHttpTransportDebugLogger = (event: WebSocketHttpTransportDebugEvent) => void
 
 export interface WebSocketHttpTransportOptions {
+  cancelTimeoutMs: number
   connectTimeoutMs: number
   defaultMaxResponseBytes: number
   debug?: boolean | WebSocketHttpTransportDebugLogger
@@ -68,7 +74,6 @@ export interface WebSocketHttpTransportOptions {
   maxConnections: number
   maxRequestsPerConnection: number
   minIdleConnections: number
-  transactionTimeoutMs: number
   webSocketFactory?: WebSocketFactory
 }
 
@@ -81,14 +86,27 @@ interface ResolvedOptions extends Omit<
 }
 
 interface PendingRequest {
+  abortListener: () => void
   maxResponseBytes: number
   reject: (reason: unknown) => void
   request: Request
   resolve: (response: HttpTransportResponse) => void
 }
 
-interface ActiveTransaction extends PendingRequest {
-  timeout: number
+interface ActiveTransaction {
+  abortListener: () => void
+  bodyCanceled: boolean
+  bodyController: ReadableStreamDefaultController<Uint8Array> | undefined
+  bytesReceived: number
+  cancelRequested: boolean
+  cancelTimer: number | undefined
+  maxResponseBytes: number
+  reject: (reason: unknown) => void
+  request: Request
+  resolve: (response: HttpTransportResponse) => void
+  responseHeadReceived: boolean
+  responseSettled: boolean
+  sequence: number
 }
 
 interface ChannelCallbacks {
@@ -118,7 +136,6 @@ const webSocketOpen = 1
 
 export class WebSocketHttpTransport implements HttpTransport {
   readonly rangeRequestMode = 'stable' as const
-  readonly responseMode = 'buffered' as const
 
   private readonly channels = new Set<WebSocketChannel>()
   private destroyed = false
@@ -144,6 +161,9 @@ export class WebSocketHttpTransport implements HttpTransport {
         ),
       )
     }
+    if (request.signal.aborted) {
+      return Promise.reject(createAbortError())
+    }
 
     let maxResponseBytes: number
     try {
@@ -158,7 +178,21 @@ export class WebSocketHttpTransport implements HttpTransport {
     }
 
     return new Promise<HttpTransportResponse>((resolve, reject) => {
-      this.pending.push({ maxResponseBytes, reject, request, resolve })
+      const pending: PendingRequest = {
+        abortListener: () => {
+          const index = this.pending.indexOf(pending)
+          if (index >= 0) {
+            this.pending.splice(index, 1)
+            reject(createAbortError())
+          }
+        },
+        maxResponseBytes,
+        reject,
+        request,
+        resolve,
+      }
+      request.signal.addEventListener('abort', pending.abortListener, { once: true })
+      this.pending.push(pending)
       this.drain()
     })
   }
@@ -170,6 +204,7 @@ export class WebSocketHttpTransport implements HttpTransport {
     this.destroyed = true
     const error = new HttpTransportFailure('destroyed', 'WebSocket transport 已经销毁')
     for (const pending of this.pending.splice(0)) {
+      pending.request.signal.removeEventListener('abort', pending.abortListener)
       pending.reject(error)
     }
     for (const channel of [...this.channels]) {
@@ -190,7 +225,11 @@ export class WebSocketHttpTransport implements HttpTransport {
             ...(details.code === 1000 ? {} : { error: error.message }),
           })
           if (!opened) {
-            this.pending.shift()?.reject(error)
+            const pending = this.pending.shift()
+            if (pending !== undefined) {
+              pending.request.signal.removeEventListener('abort', pending.abortListener)
+              pending.reject(error)
+            }
           }
           this.drain()
         },
@@ -202,9 +241,13 @@ export class WebSocketHttpTransport implements HttpTransport {
         },
       })
     } catch (cause) {
-      this.pending
-        .shift()
-        ?.reject(new HttpTransportFailure('connection-failed', 'WebSocket 连接创建失败', { cause }))
+      const pending = this.pending.shift()
+      if (pending !== undefined) {
+        pending.request.signal.removeEventListener('abort', pending.abortListener)
+        pending.reject(
+          new HttpTransportFailure('connection-failed', 'WebSocket 连接创建失败', { cause }),
+        )
+      }
       return
     }
     this.channels.add(channel)
@@ -225,6 +268,7 @@ export class WebSocketHttpTransport implements HttpTransport {
       if (pending === undefined) {
         break
       }
+      pending.request.signal.removeEventListener('abort', pending.abortListener)
       channel.execute(pending)
     }
 
@@ -321,6 +365,7 @@ class WebSocketChannel {
   private requests = 0
   private retirementReason: ChannelRetirementReason | undefined
   private retiring = false
+  private sequence = 0
   private readonly socket: WebSocketLike
   private state: WebSocketChannelState = 'connecting'
 
@@ -353,6 +398,12 @@ class WebSocketChannel {
       pending.reject(new HttpTransportFailure('connection-failed', 'WebSocket 连接当前不可用'))
       return
     }
+    if (pending.request.signal.aborted) {
+      pending.reject(createAbortError())
+      this.callbacks.onIdle(this)
+      return
+    }
+
     this.clearIdleTimer()
     this.state = 'busy'
     this.requests += 1
@@ -360,26 +411,33 @@ class WebSocketChannel {
       this.retiring = true
       this.retirementReason = 'max-requests'
     }
-    const timeout = globalThis.setTimeout(() => {
-      if (this.active !== undefined) {
-        this.closeWithError(new HttpTransportFailure('connection-failed', 'WebSocket 请求事务超时'))
-      }
-    }, this.options.transactionTimeoutMs)
-    this.active = { ...pending, timeout }
+    const sequence = this.nextSequence()
+    const active: ActiveTransaction = {
+      abortListener: () => this.cancel(active, createAbortError()),
+      bodyCanceled: false,
+      bodyController: undefined,
+      bytesReceived: 0,
+      cancelRequested: false,
+      cancelTimer: undefined,
+      maxResponseBytes: pending.maxResponseBytes,
+      reject: pending.reject,
+      request: pending.request,
+      resolve: pending.resolve,
+      responseHeadReceived: false,
+      responseSettled: false,
+      sequence,
+    }
+    this.active = active
+    pending.request.signal.addEventListener('abort', active.abortListener, { once: true })
 
+    const head = create(HttpRequestHeadSchema, {
+      headers: [...pending.request.headers].map(([name, value]) => ({ name, value })),
+      maxResponseBytes: BigInt(pending.maxResponseBytes),
+      method: pending.request.method,
+      url: pending.request.url,
+    })
     try {
-      const headers = []
-      for (const [name, value] of pending.request.headers) {
-        headers.push({ name, value })
-      }
-      this.socket.send(
-        encodeHttpRelayRequest({
-          headers,
-          maxResponseBytes: pending.maxResponseBytes,
-          method: pending.request.method as 'GET' | 'HEAD',
-          url: pending.request.url,
-        }),
-      )
+      this.send(TransportFrameKind.REQUEST_HEAD, sequence, toBinary(HttpRequestHeadSchema, head))
     } catch (cause) {
       this.closeWithError(
         new HttpTransportFailure('connection-failed', 'WebSocket 请求发送失败', { cause }),
@@ -448,18 +506,16 @@ class WebSocketChannel {
 
   private readonly handleMessage = (event: MessageEvent<unknown>): void => {
     if (this.readingMessage) {
-      this.closeWithError(
-        new HttpTransportFailure('protocol-error', '收到重叠的 WebSocket response'),
-      )
+      this.closeWithError(new HttpTransportFailure('protocol-error', '收到重叠的 WebSocket 消息'))
       return
     }
     if (event.data instanceof ArrayBuffer || ArrayBuffer.isView(event.data)) {
-      this.acceptResponse(event.data)
+      this.acceptFrame(event.data)
       return
     }
     if (!(event.data instanceof Blob)) {
       this.closeWithError(
-        new HttpTransportFailure('protocol-error', 'Transport 只接受二进制 WebSocket message'),
+        new HttpTransportFailure('protocol-error', 'Transport 只接受二进制 WebSocket 消息'),
       )
       return
     }
@@ -469,13 +525,13 @@ class WebSocketChannel {
       data => {
         this.readingMessage = false
         if (this.state !== 'closed') {
-          this.acceptResponse(data)
+          this.acceptFrame(data)
         }
       },
       cause => {
         this.readingMessage = false
         this.closeWithError(
-          new HttpTransportFailure('protocol-error', '无法读取 WebSocket response', { cause }),
+          new HttpTransportFailure('protocol-error', '无法读取 WebSocket 消息', { cause }),
         )
       },
     )
@@ -491,26 +547,82 @@ class WebSocketChannel {
     this.callbacks.onOpen(this)
   }
 
-  private acceptResponse(data: ArrayBuffer | ArrayBufferView): void {
-    const active = this.active
-    if (this.state !== 'busy' || active === undefined) {
+  private acceptFrame(data: ArrayBuffer | ArrayBufferView): void {
+    let frame
+    try {
+      frame = decodeTransportFrame(data)
+    } catch (cause) {
       this.closeWithError(
-        new HttpTransportFailure('protocol-error', '空闲 WebSocket 收到意外 response'),
+        new HttpTransportFailure('protocol-error', '收到无效的 Transport frame', { cause }),
       )
       return
     }
 
-    let response
-    try {
-      response = decodeHttpRelayResponse(data)
-    } catch (cause) {
-      this.closeWithError(
-        new HttpTransportFailure('protocol-error', 'HTTP relay response 解码失败', { cause }),
-      )
+    const active = this.active
+    if (active === undefined || frame.sequence !== active.sequence) {
       return
     }
-    if (response.body.byteLength > active.maxResponseBytes) {
-      this.closeWithError(
+    if (
+      active.cancelRequested &&
+      (frame.kind === TransportFrameKind.RESPONSE_HEAD ||
+        frame.kind === TransportFrameKind.RESPONSE_BODY)
+    ) {
+      return
+    }
+
+    try {
+      switch (frame.kind) {
+        case TransportFrameKind.RESPONSE_HEAD:
+          this.acceptResponseHead(active, frame.payload)
+          break
+        case TransportFrameKind.RESPONSE_BODY:
+          this.acceptResponseBody(active, frame.payload)
+          break
+        case TransportFrameKind.RESPONSE_END:
+          this.acceptResponseEnd(active)
+          break
+        case TransportFrameKind.CANCELED:
+          this.acceptCanceled(active)
+          break
+        case TransportFrameKind.ERROR:
+          this.acceptError(active, frame.payload)
+          break
+        default:
+          throw new HttpTransportFailure(
+            'protocol-error',
+            `当前连接不接受 Transport frame ${frame.kind}`,
+          )
+      }
+    } catch (cause) {
+      const error =
+        cause instanceof HttpTransportFailure
+          ? cause
+          : new HttpTransportFailure('protocol-error', 'Transport frame 处理失败', { cause })
+      this.closeWithError(error)
+    }
+  }
+
+  private acceptResponseHead(active: ActiveTransaction, payload: Uint8Array): void {
+    if (active.responseHeadReceived) {
+      throw new HttpTransportFailure('protocol-error', '重复收到 HTTP response head')
+    }
+    const head = fromBinary(HttpResponseHeadSchema, payload)
+    if (head.status < 100 || head.status > 599) {
+      throw new HttpTransportFailure('invalid-response', `无效的 HTTP status: ${head.status}`)
+    }
+    active.responseHeadReceived = true
+    const headers = new Headers()
+    for (const header of head.headers) {
+      headers.append(header.name, header.value)
+    }
+    const declaredLength = parseContentLength(headers)
+    if (
+      active.request.method !== 'HEAD' &&
+      declaredLength !== undefined &&
+      declaredLength > active.maxResponseBytes
+    ) {
+      this.cancel(
+        active,
         new HttpTransportFailure(
           'response-too-large',
           `HTTP 响应超过 ${active.maxResponseBytes} 字节限制`,
@@ -519,28 +631,112 @@ class WebSocketChannel {
       return
     }
 
-    if (response.outcome === HttpRelayResponseOutcome.HTTP) {
-      if (active.request.method === 'HEAD' && response.body.byteLength !== 0) {
-        this.closeWithError(
-          new HttpTransportFailure('invalid-response', 'HEAD response 不允许包含 body'),
-        )
-        return
-      }
-      const headers = new Headers()
-      for (const header of response.headers) {
-        headers.append(header.name, header.value)
-      }
-      active.resolve(
-        new WebSocketHttpResponse(active.request.method === 'HEAD' ? null : response.body, {
-          headers,
-          status: response.status,
-          url: response.url || active.request.url,
-        }),
+    let body: ReadableStream<Uint8Array> | null = null
+    if (active.request.method !== 'HEAD') {
+      body = new ReadableStream<Uint8Array>({
+        cancel: () => {
+          active.bodyCanceled = true
+          this.cancel(active, createAbortError('HTTP response body 已取消'))
+        },
+        start: controller => {
+          active.bodyController = controller
+        },
+      })
+    }
+    active.responseSettled = true
+    active.resolve(
+      new WebSocketHttpResponse(body, {
+        headers,
+        status: head.status,
+        statusText: head.statusText,
+        url: head.url || active.request.url,
+      }),
+    )
+  }
+
+  private acceptResponseBody(active: ActiveTransaction, payload: Uint8Array): void {
+    if (!active.responseHeadReceived || active.request.method === 'HEAD') {
+      throw new HttpTransportFailure('protocol-error', 'HTTP response body 早于 response head')
+    }
+    active.bytesReceived += payload.byteLength
+    if (active.bytesReceived > active.maxResponseBytes) {
+      this.cancel(
+        active,
+        new HttpTransportFailure(
+          'response-too-large',
+          `HTTP 响应超过 ${active.maxResponseBytes} 字节限制`,
+        ),
       )
-    } else {
-      active.reject(createRelayFailure(response.outcome, response.message))
+      return
+    }
+    active.bodyController?.enqueue(payload)
+  }
+
+  private acceptResponseEnd(active: ActiveTransaction): void {
+    if (!active.responseHeadReceived && !active.cancelRequested) {
+      throw new HttpTransportFailure('protocol-error', 'HTTP response 在 response head 前结束')
+    }
+    if (!active.cancelRequested && !active.bodyCanceled) {
+      active.bodyController?.close()
     }
     this.finish(active)
+  }
+
+  private acceptCanceled(active: ActiveTransaction): void {
+    if (!active.cancelRequested) {
+      this.rejectActive(active, createAbortError('Relay 取消了 HTTP 请求'))
+    }
+    this.finish(active)
+  }
+
+  private acceptError(active: ActiveTransaction, payload: Uint8Array): void {
+    const message = fromBinary(TransportErrorSchema, payload)
+    const code =
+      message.code === TransportErrorCode.RESPONSE_TOO_LARGE
+        ? 'response-too-large'
+        : message.code === TransportErrorCode.UPSTREAM_FAILURE
+          ? 'upstream-failure'
+          : 'invalid-response'
+    this.rejectActive(active, new HttpTransportFailure(code, message.message || 'Relay 请求失败'))
+    this.finish(active)
+  }
+
+  private cancel(active: ActiveTransaction, reason: Error): void {
+    if (this.active !== active || active.cancelRequested) {
+      return
+    }
+    active.cancelRequested = true
+    this.rejectActive(active, reason)
+    try {
+      this.send(TransportFrameKind.CANCEL, active.sequence)
+    } catch (cause) {
+      this.closeWithError(
+        new HttpTransportFailure('connection-failed', 'WebSocket CANCEL 发送失败', { cause }),
+      )
+      return
+    }
+    active.cancelTimer = globalThis.setTimeout(() => {
+      if (this.active === active) {
+        this.closeWithError(
+          new HttpTransportFailure('connection-failed', 'WebSocket CANCEL 确认超时'),
+        )
+      }
+    }, this.options.cancelTimeoutMs)
+  }
+
+  private rejectActive(active: ActiveTransaction, reason: unknown): void {
+    if (!active.responseSettled) {
+      active.responseSettled = true
+      active.reject(reason)
+    }
+    if (!active.bodyCanceled) {
+      try {
+        active.bodyController?.error(reason)
+      } catch {
+        // 已经终止的 ReadableStream 不需要再次处理
+      }
+      active.bodyCanceled = true
+    }
   }
 
   private armIdleTimer(): void {
@@ -595,9 +791,12 @@ class WebSocketChannel {
     if (active === undefined) {
       return
     }
-    globalThis.clearTimeout(active.timeout)
+    this.rejectActive(active, error)
+    active.request.signal.removeEventListener('abort', active.abortListener)
+    if (active.cancelTimer !== undefined) {
+      globalThis.clearTimeout(active.cancelTimer)
+    }
     this.active = undefined
-    active.reject(error)
   }
 
   private finalizeClose(error: HttpTransportFailure, details: ChannelCloseDetails): void {
@@ -620,7 +819,10 @@ class WebSocketChannel {
     if (this.active !== active) {
       return
     }
-    globalThis.clearTimeout(active.timeout)
+    active.request.signal.removeEventListener('abort', active.abortListener)
+    if (active.cancelTimer !== undefined) {
+      globalThis.clearTimeout(active.cancelTimer)
+    }
     if (this.retiring) {
       this.active = undefined
       this.close(1000, this.retirementReason ?? 'max-requests')
@@ -629,19 +831,18 @@ class WebSocketChannel {
     this.becomeIdle()
     this.callbacks.onIdle(this)
   }
-}
 
-function createRelayFailure(
-  outcome: HttpRelayResponseOutcome,
-  message: string,
-): HttpTransportFailure {
-  const code =
-    outcome === HttpRelayResponseOutcome.RESPONSE_TOO_LARGE
-      ? 'response-too-large'
-      : outcome === HttpRelayResponseOutcome.UPSTREAM_FAILURE
-        ? 'upstream-failure'
-        : 'invalid-response'
-  return new HttpTransportFailure(code, message || 'HTTP relay 请求失败')
+  private send(kind: TransportFrameKind, sequence: number, payload?: Uint8Array): void {
+    if (this.socket.readyState !== webSocketOpen) {
+      throw new Error('WebSocket 尚未打开')
+    }
+    this.socket.send(encodeTransportFrame(kind, sequence, payload))
+  }
+
+  private nextSequence(): number {
+    this.sequence = this.sequence >= 0xffff_ffff ? 1 : this.sequence + 1
+    return this.sequence
+  }
 }
 
 function normalizeMaxResponseBytes(value: number, method: string): number {
@@ -654,6 +855,15 @@ function normalizeMaxResponseBytes(value: number, method: string): number {
     throw new Error(`无效的 maxResponseBytes: ${value}`)
   }
   return value
+}
+
+function parseContentLength(headers: Headers): number | undefined {
+  const value = headers.get('content-length')
+  if (value === null || !/^\d+$/u.test(value)) {
+    return undefined
+  }
+  const length = Number(value)
+  return Number.isSafeInteger(length) ? length : undefined
 }
 
 function normalizeWebSocketUrl(value: string): string {
@@ -699,13 +909,13 @@ function formatConnectionClosed(event: WebSocketHttpTransportDebugEvent): string
 }
 
 function resolveOptions(options: WebSocketHttpTransportOptions): ResolvedOptions {
+  positiveNumber(options.cancelTimeoutMs, 'cancelTimeoutMs')
   positiveNumber(options.connectTimeoutMs, 'connectTimeoutMs')
   positiveInteger(options.defaultMaxResponseBytes, 'defaultMaxResponseBytes')
   positiveNumber(options.idleConnectionTimeoutMs, 'idleConnectionTimeoutMs')
   positiveInteger(options.maxConnections, 'maxConnections')
   positiveInteger(options.maxRequestsPerConnection, 'maxRequestsPerConnection')
   nonNegativeInteger(options.minIdleConnections, 'minIdleConnections')
-  positiveNumber(options.transactionTimeoutMs, 'transactionTimeoutMs')
   if (options.defaultMaxResponseBytes > HTTP_RELAY_MAX_RESPONSE_BODY_BYTES) {
     throw new Error(`defaultMaxResponseBytes 不能超过 ${HTTP_RELAY_MAX_RESPONSE_BODY_BYTES}`)
   }
@@ -713,6 +923,7 @@ function resolveOptions(options: WebSocketHttpTransportOptions): ResolvedOptions
     throw new Error('minIdleConnections 不能超过 maxConnections')
   }
   return {
+    cancelTimeoutMs: options.cancelTimeoutMs,
     connectTimeoutMs: options.connectTimeoutMs,
     defaultMaxResponseBytes: options.defaultMaxResponseBytes,
     debugLogger: resolveDebugLogger(options.debug),
@@ -720,7 +931,6 @@ function resolveOptions(options: WebSocketHttpTransportOptions): ResolvedOptions
     maxConnections: options.maxConnections,
     maxRequestsPerConnection: options.maxRequestsPerConnection,
     minIdleConnections: options.minIdleConnections,
-    transactionTimeoutMs: options.transactionTimeoutMs,
     webSocketFactory: options.webSocketFactory ?? (url => new WebSocket(url)),
   }
 }
