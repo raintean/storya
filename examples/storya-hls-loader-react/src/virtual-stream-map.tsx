@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import type {
   HlsLoaderDiagnosticChunk,
+  HlsLoaderDiagnosticFrontier,
   HlsLoaderDiagnosticSegment,
   HlsLoaderDiagnosticsSnapshot,
   HlsLoaderDiagnosticStream,
@@ -13,53 +14,19 @@ interface VirtualStreamMapProps {
 }
 
 const minimumTimelineSpan = 12
-const inactiveStreamRetentionMs = 10_000
 const playbackInitialPosition = 0.15
 const playbackPanThreshold = 0.35
 const timelinePanStep = 0.2
 
-interface StreamVisibility {
-  active: boolean
-  inactiveAt: number
-}
-
 interface TimelineViewport {
   bounds: TimelineBounds
+  segmentBounds: TimelineBounds
   streamKey: string
 }
 
 export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: VirtualStreamMapProps) {
-  const visibilityRef = useRef(new Map<string, StreamVisibility>())
   const timelineViewportRef = useRef<TimelineViewport | null>(null)
-  const now = snapshot.timestamp || Date.now()
-  const streamIds = new Set(snapshot.streams.map(stream => stream.id))
-
-  for (const stream of snapshot.streams) {
-    const visibility = visibilityRef.current.get(stream.id)
-    if (stream.active) {
-      visibilityRef.current.set(stream.id, { active: true, inactiveAt: 0 })
-    } else if (visibility === undefined || visibility.active) {
-      visibilityRef.current.set(stream.id, { active: false, inactiveAt: now })
-    }
-  }
-  for (const streamId of visibilityRef.current.keys()) {
-    if (!streamIds.has(streamId)) {
-      visibilityRef.current.delete(streamId)
-    }
-  }
-
-  const streams = snapshot.streams
-    .filter(stream => {
-      if (stream.segments.length === 0) {
-        return false
-      }
-      if (stream.active) {
-        return true
-      }
-      const visibility = visibilityRef.current.get(stream.id)
-      return visibility !== undefined && now - visibility.inactiveAt < inactiveStreamRetentionMs
-    })
-    .sort(compareStreams)
+  const streams = snapshot.streams.filter(stream => stream.segments.length > 0).sort(compareStreams)
   if (streams.length === 0) {
     timelineViewportRef.current = null
     return (
@@ -70,19 +37,18 @@ export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: Virtua
     )
   }
 
-  const activeStreams = streams.filter(stream => stream.active)
-  const timelineStreams = activeStreams.length > 0 ? activeStreams : streams
-  const streamKey = timelineStreams
+  const streamKey = streams
     .map(stream => stream.id)
     .sort()
     .join('\0')
-  const bounds = updateTimelineViewport(
+  const viewport = updateTimelineViewport(
     timelineViewportRef.current,
-    timelineStreams,
+    streams,
     streamKey,
     playbackTime,
   )
-  timelineViewportRef.current = { bounds, streamKey }
+  timelineViewportRef.current = viewport
+  const bounds = viewport.bounds
   const markers = [{ className: 'playback', label: '播放', value: playbackTime }]
 
   return (
@@ -134,16 +100,7 @@ export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: Virtua
 }
 
 function compareStreams(left: HlsLoaderDiagnosticStream, right: HlsLoaderDiagnosticStream): number {
-  if (left.active !== right.active) {
-    return left.active ? -1 : 1
-  }
-
-  const kindOrder = { audio: 1, main: 0, subtitle: 2 }
-  return (
-    kindOrder[left.kind] - kindOrder[right.kind] ||
-    left.level - right.level ||
-    left.id.localeCompare(right.id)
-  )
+  return left.id.localeCompare(right.id)
 }
 
 function StreamRow({
@@ -159,20 +116,30 @@ function StreamRow({
   const pending = stream.segments.filter(
     segment => segment.prefetch && segment.state !== 'ready',
   ).length
+  const readerCount = stream.segments.reduce((total, segment) => total + segment.readerCount, 0)
+  const frontier = stream.frontier
   return (
-    <div className={`stream-row ${stream.active ? 'is-active' : ''}`}>
+    <div className={`stream-row ${readerCount > 0 ? 'has-readers' : ''}`}>
       <div className="stream-label">
         <strong>{label}</strong>
-        <small>
-          {stream.kind.toUpperCase()} · {stream.active ? 'ACTIVE' : 'IDLE'}
-        </small>
+        <small>{getStreamTypeLabel(stream.id)}</small>
         <span>
-          cache {cached} · need {pending}
+          reader {readerCount} · cache {cached} · need {pending}
         </span>
+        {frontier === undefined ? null : (
+          <span>
+            frontier g{frontier.generation} · {getFrontierLabel(frontier)}
+          </span>
+        )}
       </div>
       <div className="segment-track">
         {stream.segments.map(segment => (
-          <SegmentCell bounds={bounds} key={segment.key} segment={segment} />
+          <SegmentCell
+            bounds={bounds}
+            frontier={stream.frontier?.segmentKey === segment.key}
+            key={segment.key}
+            segment={segment}
+          />
         ))}
       </div>
     </div>
@@ -181,9 +148,11 @@ function StreamRow({
 
 function SegmentCell({
   bounds,
+  frontier,
   segment,
 }: {
   bounds: TimelineBounds
+  frontier: boolean
   segment: HlsLoaderDiagnosticSegment
 }) {
   const end = segment.start + Math.max(segment.duration, 0.01)
@@ -193,8 +162,8 @@ function SegmentCell({
     'segment-cell',
     `is-${segment.state}`,
     segment.prefetch ? 'is-prefetch' : '',
-    segment.hardDemands > 0 || segment.playbackDemand ? 'is-demanded' : '',
-    segment.anchor ? 'is-anchor' : '',
+    segment.readerCount > 0 ? 'has-readers' : '',
+    frontier ? 'is-frontier' : '',
   ]
     .filter(Boolean)
     .join(' ')
@@ -205,10 +174,10 @@ function SegmentCell({
       style={{ left: `${left}%`, width: `${width}%` }}
       title={createSegmentTitle(segment)}
     >
-      <span className="segment-name">S{String(segment.segmentSn)}</span>
+      <span className="segment-name">{formatSegmentKey(segment.key)}</span>
       <div className="chunk-track">
         {segment.chunks.length > 0 ? (
-          segment.chunks.map(chunk => <ChunkCell chunk={chunk} key={chunk.id} segment={segment} />)
+          segment.chunks.map(chunk => <ChunkCell chunk={chunk} key={chunk.key} segment={segment} />)
         ) : (
           <i className="chunk-placeholder" />
         )}
@@ -259,26 +228,41 @@ function updateTimelineViewport(
   streams: HlsLoaderDiagnosticStream[],
   streamKey: string,
   playbackTime: number,
-): TimelineBounds {
+): TimelineViewport {
   const segmentBounds = findSegmentBounds(streams)
-  if (current === null || current.streamKey !== streamKey) {
-    return createTimelineViewport(segmentBounds, playbackTime)
+  if (
+    current === null ||
+    current.streamKey !== streamKey ||
+    current.segmentBounds.start !== segmentBounds.start ||
+    current.segmentBounds.end !== segmentBounds.end
+  ) {
+    return {
+      bounds: createTimelineViewport(segmentBounds, playbackTime),
+      segmentBounds,
+      streamKey,
+    }
   }
 
   const span = current.bounds.end - current.bounds.start
   if (playbackTime < current.bounds.start || playbackTime > current.bounds.end) {
-    return positionTimelineAtPlayback(span, playbackTime)
+    return {
+      ...current,
+      bounds: positionTimelineAtPlayback(span, playbackTime),
+    }
   }
 
   const playbackPosition = toPercent(playbackTime, current.bounds) / 100
   if (playbackPosition < playbackPanThreshold) {
-    return current.bounds
+    return current
   }
 
   const shift = span * timelinePanStep
   return {
-    end: current.bounds.end + shift,
-    start: current.bounds.start + shift,
+    ...current,
+    bounds: {
+      end: current.bounds.end + shift,
+      start: current.bounds.start + shift,
+    },
   }
 }
 
@@ -328,24 +312,44 @@ function getStreamLabel(
   stream: HlsLoaderDiagnosticStream,
   levelLabels: Map<number, string>,
 ): string {
-  if (stream.kind === 'audio') {
+  const [kind, identity] = stream.id.split(':')
+  if (kind === 'audio') {
     return `Audio · ${stream.id.split(':').slice(1, 3).join('/')}`
   }
-  if (stream.kind === 'subtitle') {
-    return 'Subtitle'
+  if (kind === 'subtitle') {
+    return `Subtitle · ${stream.id.split(':').slice(1, 3).join('/')}`
   }
-  return levelLabels.get(stream.level) ?? `Level ${stream.level}`
+  if (kind === 'main') {
+    const level = Number(identity)
+    return levelLabels.get(level) ?? `Level ${identity ?? '?'}`
+  }
+  return stream.id
+}
+
+function getStreamTypeLabel(streamId: string): string {
+  const kind = streamId.split(':', 1)[0]
+  if (kind === 'main') {
+    return 'MAIN TRACK'
+  }
+  if (kind === 'audio') {
+    return 'AUDIO TRACK'
+  }
+  if (kind === 'subtitle') {
+    return 'SUBTITLE TRACK'
+  }
+  return 'VIRTUAL STREAM'
+}
+
+function getFrontierLabel(frontier: HlsLoaderDiagnosticFrontier): string {
+  if (frontier.barrier) {
+    return 'BARRIER'
+  }
+  return frontier.confirmed ? 'CONFIRMED' : 'PROVISIONAL'
 }
 
 function getSegmentStateLabel(segment: HlsLoaderDiagnosticSegment): string {
-  if (segment.playbackDemand && segment.state === 'failed') {
-    return 'NEED · FAILED'
-  }
-  if (segment.hardDemands > 0) {
-    return 'HLS READER'
-  }
-  if (segment.playbackDemand) {
-    return 'PLAYBACK NEED'
+  if (segment.readerCount > 0) {
+    return segment.state === 'failed' ? 'READER · FAILED' : 'HLS READER'
   }
   if (segment.state === 'ready') {
     return 'CACHED'
@@ -361,20 +365,27 @@ function getSegmentStateLabel(segment: HlsLoaderDiagnosticSegment): string {
 
 function createSegmentTitle(segment: HlsLoaderDiagnosticSegment): string {
   return [
-    `Segment ${String(segment.segmentSn)}`,
+    `Segment ${segment.key}`,
     `${segment.start.toFixed(2)}s – ${(segment.start + segment.duration).toFixed(2)}s`,
     getSegmentStateLabel(segment),
+    `readers ${segment.readerCount} · prefetch ${segment.prefetch ? 'yes' : 'no'}`,
     `${formatBytes(segment.loadedBytes)} / ${formatBytes(segment.totalBytes)}`,
   ].join('\n')
 }
 
 function createChunkTitle(chunk: HlsLoaderDiagnosticChunk): string {
   return [
-    `Chunk ${chunk.id} · ${chunk.state}`,
+    `Chunk ${chunk.key} · ${chunk.state}`,
     `${formatBytes(chunk.startOffset)} – ${formatBytes(chunk.endOffset)}`,
     `received ${formatBytes(chunk.receivedBytes)}`,
+    `filler ${chunk.fillerId ?? '—'} · writer ${chunk.writerId ?? '—'}`,
     `slow ${chunk.slowRetries} · preempted ${chunk.preemptions} · retry ${chunk.networkRetries}`,
   ].join('\n')
+}
+
+function formatSegmentKey(key: string): string {
+  const sequence = /(?:^|\|)sn:([^|]+)/u.exec(key)?.[1]
+  return sequence === undefined ? key : `S${sequence}`
 }
 
 function formatTime(value: number): string {

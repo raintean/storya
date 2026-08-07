@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsx src/byte-ranges.test.ts && tsx src/scheduler.test.ts && tsx src/virtual-stream.test.ts && tsx src/fragment-loader.test.ts && tsx src/hls-parallel-loader.test.ts",
+    "test": "tsx src/byte-ranges.test.ts && tsx src/virtual-stream.test.ts && tsx src/fragment-loader.test.ts && tsx src/hls-parallel-loader.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

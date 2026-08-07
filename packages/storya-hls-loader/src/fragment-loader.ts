@@ -8,16 +8,9 @@ import type {
   LoaderStats,
 } from 'hls.js'
 import type { HttpTransportResponse } from 'storya-transport'
-import { SegmentFillFailure } from './stream-filler'
-import type { VirtualSegmentResult } from './virtual-stream'
-import { copyLoaderStats, createLoaderStats } from './stats'
-
-export type SegmentReaderReleaseReason = 'aborted' | 'failed' | 'succeeded'
-
-export interface SegmentReader {
-  promise: Promise<VirtualSegmentResult>
-  release(reason: SegmentReaderReleaseReason): void
-}
+import { VirtualStreamReadFailure, VirtualStreamSegmentReader } from './virtual-stream'
+import type { VirtualStreamSegmentResult } from './virtual-stream'
+import { copyVirtualStreamStatistics, createLoaderStats } from './stats'
 
 export interface FragmentLoaderSession {
   configure(config: HlsConfig): void
@@ -25,7 +18,7 @@ export interface FragmentLoaderSession {
     context: FragmentLoaderContext,
     config: LoaderConfiguration,
     stats: LoaderStats,
-  ): SegmentReader
+  ): VirtualStreamSegmentReader
 }
 
 export function createVirtualFragmentLoader(
@@ -36,9 +29,10 @@ export function createVirtualFragmentLoader(
     stats: LoaderStats = createLoaderStats()
 
     private callbacks: LoaderCallbacks<FragmentLoaderContext> | undefined
+    private loadTimer: number | undefined
     private networkDetails: HttpTransportResponse | null = null
     private progressive = false
-    private reader: SegmentReader | undefined
+    private reader: VirtualStreamSegmentReader | undefined
     private settled = false
 
     constructor(config: HlsConfig) {
@@ -58,7 +52,11 @@ export function createVirtualFragmentLoader(
       this.progressive = callbacks.onProgress !== undefined && Number.isFinite(config.highWaterMark)
       const reader = session.read(context, config, this.stats)
       this.reader = reader
-      void reader.promise.then(
+      const maxLoadTimeMs = config.loadPolicy.maxLoadTimeMs
+      if (Number.isFinite(maxLoadTimeMs) && maxLoadTimeMs > 0) {
+        this.loadTimer = globalThis.setTimeout(() => this.timeout(), maxLoadTimeMs)
+      }
+      void reader.result.then(
         result => this.succeed(result),
         cause => this.fail(cause),
       )
@@ -69,16 +67,18 @@ export function createVirtualFragmentLoader(
         return
       }
       this.settled = true
+      this.clearLoadTimer()
       this.stats.aborted = true
       this.stats.loading.end = performance.now()
-      this.reader.release('aborted')
+      this.reader.cancel()
       this.callbacks?.onAbort?.(this.stats, this.context, this.networkDetails)
     }
 
     destroy(): void {
       if (!this.settled) {
-        this.reader?.release('aborted')
+        this.reader?.cancel()
       }
+      this.clearLoadTimer()
       this.settled = true
       this.callbacks = undefined
       this.reader = undefined
@@ -94,23 +94,23 @@ export function createVirtualFragmentLoader(
       return this.networkDetails?.headers.get(name) ?? null
     }
 
-    private succeed(result: VirtualSegmentResult): void {
-      if (this.settled || this.context === null || this.reader === undefined) {
+    private succeed(result: VirtualStreamSegmentResult): void {
+      if (this.settled || this.context === null) {
         return
       }
       this.settled = true
+      this.clearLoadTimer()
       this.networkDetails = result.networkDetails
-      copyLoaderStats(this.stats, result.stats)
-      this.reader.release('succeeded')
+      copyVirtualStreamStatistics(this.stats, result.statistics)
       const callbacks = this.callbacks
-      const data = cloneResponseData(result.response.data)
-      if (callbacks?.onProgress !== undefined && data instanceof ArrayBuffer) {
+      const data = result.data.slice(0)
+      if (callbacks?.onProgress !== undefined) {
         callbacks.onProgress(this.stats, this.context, data, result.networkDetails)
       }
       callbacks?.onSuccess(
         this.progressive
-          ? { ...result.response, data: new ArrayBuffer(0) }
-          : { ...result.response, data },
+          ? { code: result.code, data: new ArrayBuffer(0), url: result.url }
+          : { code: result.code, data, url: result.url },
         this.stats,
         this.context,
         result.networkDetails,
@@ -118,15 +118,14 @@ export function createVirtualFragmentLoader(
     }
 
     private fail(cause: unknown): void {
-      if (this.settled || this.context === null || this.reader === undefined) {
+      if (this.settled || this.context === null) {
         return
       }
       this.settled = true
-      this.reader.release('failed')
+      this.clearLoadTimer()
 
-      if (cause instanceof SegmentFillFailure) {
+      if (cause instanceof VirtualStreamReadFailure) {
         this.networkDetails = cause.networkDetails
-        copyLoaderStats(this.stats, cause.stats)
         if (cause.kind === 'timeout') {
           this.callbacks?.onTimeout(this.stats, this.context, cause.networkDetails)
           return
@@ -153,12 +152,23 @@ export function createVirtualFragmentLoader(
         this.stats,
       )
     }
-  }
-}
 
-function cloneResponseData(data: VirtualSegmentResult['response']['data']): ArrayBuffer {
-  if (!(data instanceof ArrayBuffer)) {
-    throw new Error('虚拟 Segment 中不存在可交付的 ArrayBuffer')
+    private timeout(): void {
+      if (this.settled || this.context === null) {
+        return
+      }
+      this.settled = true
+      this.loadTimer = undefined
+      this.stats.loading.end = performance.now()
+      this.reader?.cancel()
+      this.callbacks?.onTimeout(this.stats, this.context, this.networkDetails)
+    }
+
+    private clearLoadTimer(): void {
+      if (this.loadTimer !== undefined) {
+        globalThis.clearTimeout(this.loadTimer)
+        this.loadTimer = undefined
+      }
+    }
   }
-  return data.slice(0)
 }

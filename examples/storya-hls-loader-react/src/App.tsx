@@ -5,7 +5,7 @@ import {
   createHlsParallelLoader,
   DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CONCURRENCY,
-  DEFAULT_PREFETCH_DEPTH,
+  DEFAULT_PREFETCH_AHEAD_SEGMENTS,
 } from 'storya-hls-loader'
 import type { HlsLoaderDiagnosticsSnapshot, HlsLoaderSegmentEvent } from 'storya-hls-loader'
 import { ProxyHttpTransport, WebSocketHttpTransport } from 'storya-transport'
@@ -48,9 +48,10 @@ interface LogEntryOptions {
 }
 
 interface LoaderEventCounts {
-  cacheHits: number
+  cancelled: number
+  failed: number
   preempted: number
-  prefetched: number
+  ready: number
   rescued: number
 }
 
@@ -94,17 +95,19 @@ const initialFrontier: HlsFrontier = {
 }
 
 const initialLoaderEventCounts: LoaderEventCounts = {
-  cacheHits: 0,
+  cancelled: 0,
+  failed: 0,
   preempted: 0,
-  prefetched: 0,
+  ready: 0,
   rescued: 0,
 }
 
 const emptyDiagnostics: HlsLoaderDiagnosticsSnapshot = {
   activeRequests: 0,
-  enabled: true,
   estimatedThroughputBytesPerSecond: 0,
+  fillers: [],
   maxConcurrency: DEFAULT_MAX_CONCURRENCY,
+  registryRevision: 0,
   streams: [],
   timestamp: 0,
 }
@@ -119,6 +122,7 @@ export function App() {
   const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
   const [workerUrl, setWorkerUrl] = useState('')
   const [proxyOriginsText, setProxyOriginsText] = useState('')
+  const [activeLoaderMode, setActiveLoaderMode] = useState<LoaderMode | null>(null)
   const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
   const [source, setSource] = useState(defaultSource)
   const [qualityLevels, setQualityLevels] = useState<QualityLevel[]>([])
@@ -171,9 +175,16 @@ export function App() {
     return () => window.clearInterval(timer)
   }, [])
 
-  useEffect(() => {
-    return () => hlsRef.current?.destroy()
+  const destroyPlaybackSession = useCallback(() => {
+    const hls = hlsRef.current
+    const parallelLoader = parallelLoaderRef.current
+    hlsRef.current = null
+    parallelLoaderRef.current = null
+    hls?.destroy()
+    parallelLoader?.destroy()
   }, [])
+
+  useEffect(() => destroyPlaybackSession, [destroyPlaybackSession])
 
   const startPlayback = useCallback(
     (initialLevel?: number) => {
@@ -183,9 +194,7 @@ export function App() {
         return
       }
 
-      hlsRef.current?.destroy()
-      hlsRef.current = null
-      parallelLoaderRef.current = null
+      destroyPlaybackSession()
       video.pause()
       video.removeAttribute('src')
       video.load()
@@ -197,6 +206,8 @@ export function App() {
       setMetrics(initialMetrics)
       setFrontier(initialFrontier)
       setDiagnostics(emptyDiagnostics)
+      setActiveLoaderMode(null)
+      setActiveTransportMode(null)
       setError(null)
       playbackLevelIndexRef.current = -1
       setStatus('正在加载播放列表')
@@ -204,7 +215,7 @@ export function App() {
       if (Hls.isSupported()) {
         let relayEndpoint: string | undefined
         let proxyOrigins: string[] | undefined
-        if (transportMode === 'websocket') {
+        if (loaderMode === 'parallel' && transportMode === 'websocket') {
           try {
             relayEndpoint = resolveRelayEndpoint(workerUrl)
           } catch (cause) {
@@ -214,7 +225,7 @@ export function App() {
             appendLog(message, 'error', { tag: 'Transport' })
             return
           }
-        } else if (transportMode === 'proxy') {
+        } else if (loaderMode === 'parallel' && transportMode === 'proxy') {
           try {
             proxyOrigins = parseProxyOrigins(proxyOriginsText)
           } catch (cause) {
@@ -227,79 +238,84 @@ export function App() {
         }
 
         const transport =
-          relayEndpoint === undefined
-            ? proxyOrigins === undefined
-              ? undefined
-              : new ProxyHttpTransport(proxyOrigins)
-            : new WebSocketHttpTransport(relayEndpoint, {
-                cancelTimeoutMs: websocketCancelTimeoutMs,
-                connectTimeoutMs: websocketConnectTimeoutMs,
-                defaultMaxResponseBytes: websocketDefaultMaxResponseBytes,
-                debug: true,
-                idleConnectionTimeoutMs: websocketIdleConnectionTimeoutMs,
-                maxConnections: websocketMaxConnections,
-                maxRequestsPerConnection: websocketMaxRequestsPerConnection,
-                minIdleConnections: websocketMinIdleConnections,
-              })
+          loaderMode !== 'parallel'
+            ? undefined
+            : relayEndpoint === undefined
+              ? proxyOrigins === undefined
+                ? undefined
+                : new ProxyHttpTransport(proxyOrigins)
+              : new WebSocketHttpTransport(relayEndpoint, {
+                  cancelTimeoutMs: websocketCancelTimeoutMs,
+                  connectTimeoutMs: websocketConnectTimeoutMs,
+                  defaultMaxResponseBytes: websocketDefaultMaxResponseBytes,
+                  debug: true,
+                  idleConnectionTimeoutMs: websocketIdleConnectionTimeoutMs,
+                  maxConnections: websocketMaxConnections,
+                  maxRequestsPerConnection: websocketMaxRequestsPerConnection,
+                  minIdleConnections: websocketMinIdleConnections,
+                })
 
-        const parallelLoader = createHlsParallelLoader({
-          getPlaybackRate: () => video.playbackRate,
-          getPlaybackTime: () => video.currentTime,
-          onEvent: event => {
-            if (event.type === 'segment-state') {
-              countSegmentEvent(event, setLoaderEventCounts)
-              appendSegmentStateLog(event, appendLog)
-              return
-            }
+        const parallelLoader =
+          loaderMode === 'parallel'
+            ? createHlsParallelLoader({
+                getPlaybackRate: () => video.playbackRate,
+                getPlaybackTime: () => video.currentTime,
+                onEvent: event => {
+                  if (event.type === 'segment-state') {
+                    countSegmentEvent(event, setLoaderEventCounts)
+                    appendSegmentStateLog(event, appendLog)
+                    return
+                  }
 
-            const rescued = event.reason === 'slow-connection'
-            setLoaderEventCounts(current => ({
-              ...current,
-              preempted: current.preempted + (rescued ? 0 : 1),
-              rescued: current.rescued + (rescued ? 1 : 0),
-            }))
-            appendLog(
-              rescued ? '慢速请求已中止并重新调度' : '低优先级请求已暂停并让出通道',
-              rescued ? 'rescued' : 'preempted',
-              {
-                details: [
-                  {
-                    label: 'Segment',
-                    value: `${String(event.segmentSn)} · ${event.segmentStart.toFixed(2)}s`,
-                  },
-                  {
-                    label: '请求范围',
-                    value: formatRange(event.requestStart, event.requestEnd),
-                  },
-                  {
-                    label: '本次加载',
-                    value: `${formatBytes(event.loadedBytes)} · Chunk ${formatBytes(event.chunkLoadedBytes)}`,
-                  },
-                  { label: '剩余数据', value: formatBytes(event.remainingBytes) },
-                  {
-                    label: '当前速率',
-                    value: formatThroughput(event.throughputBytesPerSecond),
-                  },
-                  ...(event.baselineThroughputBytesPerSecond === undefined
-                    ? []
-                    : [
+                  const rescued = event.reason === 'slow-connection'
+                  setLoaderEventCounts(current => ({
+                    ...current,
+                    preempted: current.preempted + (rescued ? 0 : 1),
+                    rescued: current.rescued + (rescued ? 1 : 0),
+                  }))
+                  appendLog(
+                    rescued ? '慢速请求已中止并重新调度' : '低优先级请求已暂停并让出通道',
+                    rescued ? 'rescued' : 'preempted',
+                    {
+                      details: [
                         {
-                          label: '参考速率',
-                          value: formatThroughput(event.baselineThroughputBytesPerSecond),
+                          label: 'Segment',
+                          value: `${formatSegmentKey(event.segmentKey)} · ${event.segmentStart.toFixed(2)}s`,
                         },
-                      ]),
-                  {
-                    label: '请求状态',
-                    value: `${event.elapsedMs.toFixed(0)} ms · Attempt ${event.attempt}`,
-                  },
-                ],
-                tag: rescued ? '慢速补救' : '请求抢占',
-              },
-            )
-          },
-          ...(transport === undefined ? {} : { transport }),
-        })
-        parallelLoader.setEnabled(loaderMode === 'parallel')
+                        {
+                          label: '请求范围',
+                          value: formatRange(event.requestStart, event.requestEnd),
+                        },
+                        {
+                          label: '本次加载',
+                          value: `${formatBytes(event.loadedBytes)} · Chunk ${formatBytes(event.chunkLoadedBytes)}`,
+                        },
+                        { label: '剩余数据', value: formatBytes(event.remainingBytes) },
+                        {
+                          label: '当前速率',
+                          value: formatThroughput(event.throughputBytesPerSecond),
+                        },
+                        ...(event.baselineThroughputBytesPerSecond === undefined
+                          ? []
+                          : [
+                              {
+                                label: '参考速率',
+                                value: formatThroughput(event.baselineThroughputBytesPerSecond),
+                              },
+                            ]),
+                        {
+                          label: '请求状态',
+                          value: `${event.elapsedMs.toFixed(0)} ms · Attempt ${event.attempt}`,
+                        },
+                      ],
+                      tag: rescued ? '慢速补救' : '请求抢占',
+                    },
+                  )
+                },
+                prefetchAheadSegments: DEFAULT_PREFETCH_AHEAD_SEGMENTS,
+                ...(transport === undefined ? {} : { transport }),
+              })
+            : null
         parallelLoaderRef.current = parallelLoader
 
         const hls = new Hls({
@@ -307,9 +323,9 @@ export function App() {
           preferManagedMediaSource: true,
           preserveManualLevelOnError: true,
           progressive: false,
-          ...(loaderMode === 'parallel' ? { fLoader: parallelLoader.fragmentLoader } : {}),
+          ...(parallelLoader === null ? {} : { fLoader: parallelLoader.fragmentLoader }),
         })
-        parallelLoader.attach(hls)
+        parallelLoader?.attach(hls)
         hlsRef.current = hls
 
         hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
@@ -412,7 +428,8 @@ export function App() {
 
         hls.attachMedia(video)
         hls.loadSource(normalizedSource)
-        setActiveTransportMode(transportMode)
+        setActiveLoaderMode(loaderMode)
+        setActiveTransportMode(loaderMode === 'parallel' ? transportMode : null)
         appendLog(
           loaderMode === 'parallel'
             ? `启用 ${DEFAULT_MAX_CONCURRENCY} 路并行 Range Loader`
@@ -420,15 +437,17 @@ export function App() {
           'default',
           { tag: '加载器' },
         )
-        appendLog(
-          relayEndpoint !== undefined
-            ? `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`
-            : proxyOrigins !== undefined
-              ? `并行加载器配置为 HTTP Proxy Transport: ${proxyOrigins.length} 个 Origin`
-              : '并行加载器配置为 Browser Fetch Transport',
-          'default',
-          { tag: 'Transport' },
-        )
+        if (loaderMode === 'parallel') {
+          appendLog(
+            relayEndpoint !== undefined
+              ? `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`
+              : proxyOrigins !== undefined
+                ? `并行加载器配置为 HTTP Proxy Transport: ${proxyOrigins.length} 个 Origin`
+                : '并行加载器配置为 Browser Fetch Transport',
+            'default',
+            { tag: 'Transport' },
+          )
+        }
         return
       }
 
@@ -444,37 +463,37 @@ export function App() {
       setError('没有可用的 HLS 播放路径')
       appendLog('没有可用的 HLS 播放路径', 'error', { tag: '错误' })
     },
-    [appendLog, loaderMode, proxyOriginsText, source, transportMode, workerUrl],
+    [
+      appendLog,
+      destroyPlaybackSession,
+      loaderMode,
+      proxyOriginsText,
+      source,
+      transportMode,
+      workerUrl,
+    ],
   )
 
   const handleLoaderModeChange = (value: string) => {
     const mode: LoaderMode = value === 'native' ? 'native' : 'parallel'
     setLoaderMode(mode)
 
-    const hls = hlsRef.current
-    const parallelLoader = parallelLoaderRef.current
-    if (hls === null || parallelLoader === null) {
-      return
+    if (hlsRef.current !== null && mode !== activeLoaderMode) {
+      appendLog('加载器设置已改变, 点击 LOAD STREAM 重建加载会话', 'default', {
+        tag: '加载器',
+      })
     }
-
-    parallelLoader.setEnabled(mode === 'parallel')
-    if (mode === 'parallel') {
-      hls.config.fLoader = parallelLoader.fragmentLoader
-      appendLog('切换到并行 Range, 从后续新 Fragment 生效', 'default', { tag: '加载器' })
-      return
-    }
-
-    delete hls.config.fLoader
-    appendLog('切换到 hls.js 原生加载, 从后续新 Fragment 生效', 'default', {
-      tag: '加载器',
-    })
   }
 
   const handleTransportModeChange = (value: string) => {
     const mode: TransportMode =
       value === 'websocket' ? 'websocket' : value === 'proxy' ? 'proxy' : 'fetch'
     setTransportMode(mode)
-    if (hlsRef.current !== null && mode !== activeTransportMode) {
+    if (
+      hlsRef.current !== null &&
+      activeLoaderMode === 'parallel' &&
+      mode !== activeTransportMode
+    ) {
       appendLog('Transport 设置已改变, 点击 LOAD STREAM 重建加载会话', 'default', {
         tag: 'Transport',
       })
@@ -601,7 +620,7 @@ export function App() {
           accent="green"
           label="CONCURRENCY"
           value={`${diagnostics.activeRequests} / ${diagnostics.maxConcurrency}`}
-          note={`${diagnostics.streams.filter(stream => stream.active).length} active streams`}
+          note={`${diagnostics.streams.filter(hasActiveReader).length} reader streams`}
         />
         <MetricCard
           accent="blue"
@@ -614,13 +633,13 @@ export function App() {
       <section className="workspace-grid">
         <div className="main-column">
           <section className="panel stream-panel">
-            <PanelHeading index="01" eyebrow="SCHEDULER" title="虚拟流状态">
+            <PanelHeading index="01" eyebrow="REGISTRY" title="虚拟流状态">
               <div className="stream-legend">
                 <span data-state="cached">缓存</span>
-                <span data-state="loading">加载</span>
-                <span data-state="needed">待加载</span>
-                <span data-state="slow">慢速补救</span>
-                <span data-state="preempted">被抢占</span>
+                <span data-state="loading">填充</span>
+                <span data-state="needed">待领取</span>
+                <span data-state="retrying">重试</span>
+                <span data-state="failed">失败</span>
               </div>
             </PanelHeading>
             <VirtualStreamMap
@@ -688,13 +707,14 @@ export function App() {
               <select
                 id="transport-mode"
                 value={transportMode}
+                disabled={loaderMode !== 'parallel'}
                 onChange={event => handleTransportModeChange(event.target.value)}
               >
                 <option value="fetch">Browser Fetch</option>
                 <option value="proxy">HTTP Proxy</option>
                 <option value="websocket">WebSocket Relay</option>
               </select>
-              {transportMode === 'websocket' ? (
+              {loaderMode === 'parallel' && transportMode === 'websocket' ? (
                 <div className="transport-endpoint">
                   <label htmlFor="worker-url">WORKER URL</label>
                   <input
@@ -708,7 +728,7 @@ export function App() {
                   <small>可填写 Worker 根 URL 或完整的 wss://.../transport 地址</small>
                 </div>
               ) : null}
-              {transportMode === 'proxy' ? (
+              {loaderMode === 'parallel' && transportMode === 'proxy' ? (
                 <div className="transport-endpoint">
                   <label htmlFor="proxy-origins">PROXY ORIGINS</label>
                   <textarea
@@ -728,6 +748,10 @@ export function App() {
                   <dd>{DEFAULT_MAX_CONCURRENCY}</dd>
                 </div>
                 <div>
+                  <dt>SESSION LOADER</dt>
+                  <dd>{formatLoaderMode(activeLoaderMode)}</dd>
+                </div>
+                <div>
                   <dt>SESSION TRANSPORT</dt>
                   <dd>{formatTransportMode(activeTransportMode)}</dd>
                 </div>
@@ -740,8 +764,12 @@ export function App() {
                   <dd>{formatBytes(DEFAULT_CHUNK_SIZE)}</dd>
                 </div>
                 <div>
-                  <dt>PREFETCH DEPTH</dt>
-                  <dd>{DEFAULT_PREFETCH_DEPTH} segments</dd>
+                  <dt>PREFETCH AHEAD</dt>
+                  <dd>{DEFAULT_PREFETCH_AHEAD_SEGMENTS} segments</dd>
+                </div>
+                <div>
+                  <dt>REGISTRY REVISION</dt>
+                  <dd>{diagnostics.registryRevision}</dd>
                 </div>
                 <div>
                   <dt>PLAYBACK LEVEL</dt>
@@ -755,8 +783,9 @@ export function App() {
             <div className="event-heading">
               <PanelHeading index="LOG" eyebrow="TELEMETRY" title="加载事件" />
               <div className="event-summary">
-                <span data-tone="success">命中 {loaderEventCounts.cacheHits}</span>
-                <span data-tone="success">预取 {loaderEventCounts.prefetched}</span>
+                <span data-tone="success">完成 {loaderEventCounts.ready}</span>
+                <span data-tone="preempted">取消 {loaderEventCounts.cancelled}</span>
+                <span data-tone="error">失败 {loaderEventCounts.failed}</span>
                 <span data-tone="preempted">抢占 {loaderEventCounts.preempted}</span>
                 <span data-tone="rescued">补救 {loaderEventCounts.rescued}</span>
                 <button
@@ -886,13 +915,14 @@ function countSegmentEvent(
   event: HlsLoaderSegmentEvent,
   setCounts: React.Dispatch<React.SetStateAction<LoaderEventCounts>>,
 ) {
-  if (event.action !== 'demand-ready' && event.action !== 'prefetch-ready') {
+  if (event.action === 'reader-created') {
     return
   }
   setCounts(current => ({
     ...current,
-    cacheHits: current.cacheHits + (event.action === 'demand-ready' ? 1 : 0),
-    prefetched: current.prefetched + (event.action === 'prefetch-ready' ? 1 : 0),
+    cancelled: current.cancelled + (event.action === 'reader-cancelled' ? 1 : 0),
+    failed: current.failed + (event.action === 'reader-failed' ? 1 : 0),
+    ready: current.ready + (event.action === 'reader-ready' ? 1 : 0),
   }))
 }
 
@@ -903,11 +933,10 @@ function appendSegmentStateLog(
   const definitions: Partial<
     Record<HlsLoaderSegmentEvent['action'], [message: string, tag: string, tone: LogTone]>
   > = {
-    'demand-miss': ['hls.js 请求尚未填充的 Segment', '即时需求', 'default'],
-    'demand-ready': ['hls.js 命中虚拟流缓存', '缓存命中', 'success'],
-    'prefetch-cancelled': ['预填充 Segment 已退出窗口', '预取取消', 'preempted'],
-    'prefetch-ready': ['预填充 Segment 已就绪', '预取完成', 'success'],
-    'prefetch-started': ['开始填充后续 Segment', '预填充', 'default'],
+    'reader-cancelled': ['hls.js 已取消 Segment Reader', '读取取消', 'preempted'],
+    'reader-created': ['hls.js 已提交 Segment Reader', '读取需求', 'default'],
+    'reader-failed': ['Segment Reader 读取失败', '读取失败', 'error'],
+    'reader-ready': ['Segment Reader 已取得完整数据', '读取完成', 'success'],
   }
   const definition = definitions[event.action]
   if (definition === undefined) {
@@ -983,6 +1012,22 @@ function formatTransportMode(mode: TransportMode | null): string {
     return 'WebSocket Relay'
   }
   return mode === 'proxy' ? 'HTTP Proxy' : 'Browser Fetch'
+}
+
+function formatLoaderMode(mode: LoaderMode | null): string {
+  if (mode === null) {
+    return '—'
+  }
+  return mode === 'parallel' ? 'Parallel Range' : 'hls.js Native'
+}
+
+function hasActiveReader(stream: HlsLoaderDiagnosticsSnapshot['streams'][number]): boolean {
+  return stream.segments.some(segment => segment.readerCount > 0)
+}
+
+function formatSegmentKey(key: string): string {
+  const sequence = /(?:^|\|)sn:([^|]+)/u.exec(key)?.[1]
+  return sequence === undefined ? key : `S${sequence}`
 }
 
 function parseProxyOrigins(value: string): string[] {

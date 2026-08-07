@@ -551,12 +551,12 @@ select:disabled {
   --legend-color: var(--amber);
 }
 
-.stream-legend [data-state='slow'] {
-  --legend-color: var(--red);
+.stream-legend [data-state='retrying'] {
+  --legend-color: #ff8d65;
 }
 
-.stream-legend [data-state='preempted'] {
-  --legend-color: var(--violet);
+.stream-legend [data-state='failed'] {
+  --legend-color: var(--red);
 }
 
 .stream-map {
@@ -681,11 +681,11 @@ select:disabled {
   border-bottom: 1px solid #131d21;
 }
 
-.stream-row.is-active .stream-label strong {
+.stream-row.has-readers .stream-label strong {
   color: var(--green);
 }
 
-.stream-row.is-active .stream-label::before {
+.stream-row.has-readers .stream-label::before {
   position: absolute;
   top: 8px;
   bottom: 8px;
@@ -777,11 +777,11 @@ select:disabled {
   border-color: rgb(255 107 115 / 46%);
 }
 
-.segment-cell.is-demanded {
+.segment-cell.has-readers {
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 35%);
 }
 
-.segment-cell.is-anchor::before {
+.segment-cell.is-frontier::before {
   position: absolute;
   top: 0;
   right: 0;
@@ -839,22 +839,17 @@ select:disabled {
   opacity: 0.58;
 }
 
-.chunk.is-slow-retrying {
-  background: var(--red);
+.chunk.is-retrying {
+  background: #ff8d65;
   animation: retry-flash 0.75s steps(2) infinite;
 }
 
-.chunk.is-preempted {
+.chunk.is-failed {
+  background: var(--red);
+}
+
+.chunk.is-partial {
   background: var(--violet);
-}
-
-.chunk.is-network-retrying {
-  background: #ff8d65;
-}
-
-.chunk.is-cancelled {
-  background: #3d4649;
-  opacity: 0.4;
 }
 
 .chunk.was-preempted {
@@ -1025,6 +1020,11 @@ select:disabled {
 .event-summary [data-tone='rescued'] {
   color: var(--amber);
   border-color: rgb(244 189 98 / 23%);
+}
+
+.event-summary [data-tone='error'] {
+  color: var(--red);
+  border-color: rgb(255 107 115 / 23%);
 }
 
 .event-summary button {

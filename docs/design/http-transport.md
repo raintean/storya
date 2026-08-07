@@ -18,7 +18,7 @@ storya-transport
 ```
 
 - `storya-transport` 提供统一的 `HttpTransport` 接口和三种网络实现。
-- `storya-hls-loader` 负责 Range 规划、并发调度、抢占、重试和流式 Transport 的慢速补救。
+- `storya-hls-loader` 的独立 StreamFiller 负责 Range 规划、Chunk 领取、抢占、重试和流式 Transport 的慢速补救。
 - `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。
 - `storya-edge-worker` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
 - WebSocket relay 的控制消息由 `storya-protocol` 中的 Protobuf schema 描述，媒体 body 使用原始二进制 frame。

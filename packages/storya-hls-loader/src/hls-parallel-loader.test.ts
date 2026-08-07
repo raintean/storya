@@ -49,7 +49,7 @@ globalThis.fetch = async input => {
     })
   }
   if (request.headers.get('range') === null) {
-    throw new Error('非原子 Segment 的首个请求必须携带 Range')
+    throw new Error('未知长度 Segment 的首个请求必须携带 Range')
   }
 
   fetchCounts.set(request.url, (fetchCounts.get(request.url) ?? 0) + 1)
@@ -96,9 +96,9 @@ try {
   const firstPromise = load(parallel.fragmentLoader, fragments[0] as Fragment)
   await delay(5)
   const loadingSnapshot = parallel.getDiagnostics()
-  const loadingStream = loadingSnapshot.streams[0]
-  if (loadingStream === undefined || !loadingStream.active || loadingStream.level !== 0) {
-    throw new Error('诊断快照应包含当前活跃的 main 虚拟流')
+  const loadingStream = loadingSnapshot.streams.find(stream => stream.id === 'main:0')
+  if (loadingStream?.frontier === undefined || loadingStream.frontier.confirmed) {
+    throw new Error('诊断快照应包含尚未确认的读取 frontier')
   }
   if (
     loadingSnapshot.activeRequests === 0 ||
@@ -106,8 +106,8 @@ try {
   ) {
     throw new Error('诊断快照中的活动请求数应处于全局并发范围内')
   }
-  if (!loadingStream.segments.some(segment => segment.chunks.some(chunk => chunk.running))) {
-    throw new Error('诊断快照应暴露正在运行的 Chunk')
+  if (!loadingStream.segments.some(segment => segment.chunks.some(chunk => chunk.fillerId))) {
+    throw new Error('诊断快照应暴露正在持有 Writer 的 Filler')
   }
 
   const first = await firstPromise
@@ -115,34 +115,19 @@ try {
   await delay(80)
 
   const readySnapshot = parallel.getDiagnostics()
-  const readyStream = readySnapshot.streams[0]
+  const readyStream = readySnapshot.streams.find(stream => stream.id === 'main:0')
   if (
     readyStream === undefined ||
     !readyStream.segments.some(segment => segment.prefetch && segment.state === 'ready')
   ) {
     throw new Error('诊断快照应暴露已经完成的预填充 Segment')
   }
-  const deliveredSegment = readyStream.segments.find(segment => segment.segmentSn === 0)
-  if (
-    deliveredSegment === undefined ||
-    deliveredSegment.state !== 'ready' ||
-    !deliveredSegment.playbackDemand
-  ) {
-    throw new Error('Segment 交付后应保留播放需求, 直到 hls.js 确认已经缓冲')
+  const deliveredSegment = readyStream.segments.find(segment => segment.start === 0)
+  if (deliveredSegment?.state !== 'ready' || deliveredSegment.readerCount !== 0) {
+    throw new Error('Segment 交付后 Reader 应自然结束, 数据继续由 Chunk 持有')
   }
-
-  hls.emit(Hls.Events.FRAG_BUFFERED, {
-    frag: fragments[0],
-    id: 'main',
-    part: null,
-    stats: {},
-  })
-  await delay(5)
-  const bufferedSegment = parallel
-    .getDiagnostics()
-    .streams[0]?.segments.find(segment => segment.segmentSn === 0)
-  if (bufferedSegment === undefined || bufferedSegment.playbackDemand) {
-    throw new Error('FRAG_BUFFERED 后应释放 Segment 的播放需求')
+  if (readyStream.frontier?.confirmed !== true || readyStream.frontier.barrier) {
+    throw new Error('成功交付后 frontier 应被确认且不能是失败屏障')
   }
 
   for (let sn = 0; sn <= 6; sn += 1) {
@@ -160,29 +145,23 @@ try {
   await delay(50)
   assertFetchCount(1, 1, 'ready Segment 应复用预填充数据')
   assertFetchCount(7, 1, '窗口推进后应填充新的 Segment')
-  if (getHeadRequestCount() !== 0) {
-    throw new Error('Content-Range 可读时不应发送 HEAD')
-  }
 
   const [sharedLeft, sharedRight] = await Promise.all([
     load(parallel.fragmentLoader, fragments[8] as Fragment),
     load(parallel.fragmentLoader, fragments[8] as Fragment),
   ])
-  assertFetchCount(8, 1, '多个 reader 应共享同一 Segment 填充任务')
+  assertFetchCount(8, 1, '多个 Reader 应共享同一 Segment 的 Chunk')
   if (getHeadRequestCount() !== 1) {
     throw new Error(`Content-Range 缺失时应补发一次 HEAD, 实际 ${headRequests}`)
   }
   assertPayload(sharedLeft, 8)
   assertPayload(sharedRight, 8)
   if (sharedLeft.data === sharedRight.data) {
-    throw new Error('不同 reader 不应共享可能被 hls.js 转移或分离的 ArrayBuffer 实例')
+    throw new Error('不同 Reader 不应共享可能被 hls.js 转移或分离的 ArrayBuffer 实例')
   }
 
-  if (!events.includes('demand-miss:0')) {
-    throw new Error('首个 Segment 应记录 demand-miss')
-  }
-  if (!events.includes('demand-ready:1')) {
-    throw new Error('预填充 Segment 应记录 demand-ready')
+  if (!events.includes('reader-created:0') || !events.includes('reader-ready:1')) {
+    throw new Error('Reader 生命周期事件没有正确发出')
   }
 
   const failingFragment = createFragment(100)
@@ -200,20 +179,42 @@ try {
     () => undefined,
   )
   await delay(5)
-  const failedSegment = parallel
-    .getDiagnostics()
-    .streams.flatMap(stream => stream.segments)
-    .find(segment => segment.segmentSn === 100)
+  const failedStream = parallel.getDiagnostics().streams.find(stream => stream.id === 'main:1')
+  const failedSegment = failedStream?.segments.find(segment => segment.start === 200)
   if (
-    failedSegment === undefined ||
-    failedSegment.state !== 'failed' ||
-    !failedSegment.playbackDemand
+    failedSegment?.state !== 'failed' ||
+    failedStream?.frontier?.barrier !== true ||
+    failedSegment.readerCount !== 0
   ) {
-    throw new Error('Segment 失败后应保留播放需求并等待 hls.js 重试')
+    throw new Error('Segment 最终失败后应形成 frontier 屏障并结束 Reader')
+  }
+
+  const lateFragment = createFragment(50)
+  lateFragment.level = 2
+  const lateRead = load(parallel.fragmentLoader, lateFragment)
+  await delay(1)
+  hls.emit(Hls.Events.LEVEL_LOADED, {
+    details: {
+      fragments: [lateFragment],
+      url: 'https://example.com/late/index.m3u8',
+    },
+    level: 2,
+  } as LevelLoadedData)
+  assertPayload(await lateRead, 50)
+  const lateSnapshot = parallel.getDiagnostics()
+  if (
+    !lateSnapshot.streams.some(stream => stream.id === 'main:2') ||
+    lateSnapshot.streams.some(stream => stream.id.startsWith('provisional:'))
+  ) {
+    throw new Error('迟到的 topology 应把 provisional VirtualStream 归并到 canonical Stream')
   }
 } finally {
   parallel.destroy()
   globalThis.fetch = originalFetch
+}
+
+function getHeadRequestCount(): number {
+  return headRequests
 }
 
 await testStableRangeRetry()
@@ -278,10 +279,6 @@ async function testStableRangeRetry(): Promise<void> {
   }
 }
 
-function getHeadRequestCount(): number {
-  return headRequests
-}
-
 async function load(
   LoaderConstructor: ReturnType<typeof createHlsParallelLoader>['fragmentLoader'],
   fragment: Fragment,
@@ -305,6 +302,7 @@ function createFragment(sn: number): Fragment {
     baseurl: 'https://example.com/main/index.m3u8',
     byteRangeEndOffset: undefined,
     byteRangeStartOffset: undefined,
+    cc: 0,
     duration: 2,
     gap: false,
     initSegment: null,

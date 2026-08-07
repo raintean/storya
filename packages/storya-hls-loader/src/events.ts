@@ -13,8 +13,9 @@ export interface HlsLoaderAbortEvent {
   requestEnd: number | undefined
   requestStart: number
   segmentDuration: number
-  segmentSn: number | string
+  segmentKey: string
   segmentStart: number
+  streamId: string
   throughputBytesPerSecond: number
   timestamp: number
   type: 'request-aborted'
@@ -22,12 +23,10 @@ export interface HlsLoaderAbortEvent {
 }
 
 export type HlsLoaderSegmentAction =
-  | 'demand-loading'
-  | 'demand-miss'
-  | 'demand-ready'
-  | 'prefetch-cancelled'
-  | 'prefetch-ready'
-  | 'prefetch-started'
+  | 'reader-cancelled'
+  | 'reader-created'
+  | 'reader-failed'
+  | 'reader-ready'
 
 export interface HlsLoaderSegmentEvent {
   action: HlsLoaderSegmentAction

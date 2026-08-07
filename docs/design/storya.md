@@ -26,7 +26,7 @@ Storya 当前包含三类运行端:
 - `storya-edge-worker` 是部署在 Cloudflare Workers 的边缘能力单元。当前实现 `/health` 和 `/transport`，通过流式 HTTP-over-WebSocket 协议透明转发 GET/HEAD；未来媒体能力可以作为独立模块加入。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
 - `storya-protocol` 是 Rust 和 TypeScript 共用的协议包。当前包含健康检查和 HTTP relay 控制消息的 Protobuf，以及 relay frame header codec；健康检查类型尚未接入 `storya-api` 的 HTTP 路由。
-- `storya-hls-loader` 是基于 hls.js fLoader 的并行加载包。它通过独立虚拟流维护主画面和音轨的 Segment 需求，以每流 6 Segment 预填充窗口和全局 6 路 GET/Range 并发执行跨 Segment、Segment 内并行加载，不负责媒体解码、解密或 transmux。
+- `storya-hls-loader` 是基于 hls.js fLoader 的并行加载包。它采用媒体类型无关的 VirtualStream、VirtualStreamSegment 和 VirtualStreamChunk 表达轨道、读取与缓存, 由多个独立 StreamFiller 在可配置的前向预填充窗口中自主领取和抢占 Chunk, 不负责媒体解码、解密或 transmux。
 - `storya-transport` 提供通用 HTTP Transport 接口、原生 Fetch、多 Origin HTTP Proxy 和基于连接池的串行复用 WebSocket 实现。
 
 目标业务关系是:
@@ -167,7 +167,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 - Rust 和 pnpm workspace 骨架。
 - Web、Admin、中心 API 和 Edge Worker 的最小可运行项目。
 - 框架无关播放器 Web Component。
-- HLS 虚拟流、跨 Segment 预填充、Segment 内 Range 并行、请求抢占和慢速补救。
+- HLS VirtualStreamRegistry 状态中心、Segment Reader、Chunk Writer、独立 StreamFiller、跨 Segment 预填充、Segment 内 Range 并行、请求抢占和慢速补救。
 - 通用 Fetch/WebSocket HTTP Transport、串行复用连接池和流式 Edge Worker relay。
 - 多 Origin HTTP Proxy Transport 和无状态 Rust HTTP proxy。
 - Protobuf/Buf 跨语言生成链路。
@@ -183,6 +183,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 ## 修改历史
 
+- 2026-08-07: 完成 HLS 并行加载器架构重构, 采用媒体类型无关的 VirtualStream 层级和多个独立 StreamFiller, 删除中心 Scheduler 和 Session 需求协调。
 - 2026-08-07: WebSocket relay 恢复 Protobuf 控制帧、128 KiB 流式 body 和 CANCEL，同时保留单连接串行 Keep-Alive 及现有连接池策略。
 - 2026-08-07: WebSocket relay 改为单 Request/Response 整包协议，删除流式分帧、取消、心跳和最大连接寿命；增加 TypeScript 手写二进制 codec 的 Protocol 例外。
 - 2026-08-06: 增加基于 cross 的 `x86_64-unknown-linux-musl` Rust workspace release 构建入口。

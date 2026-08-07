@@ -1,37 +1,39 @@
 import Hls from 'hls.js'
-import { FetchHttpTransport } from 'storya-transport'
-import type { HttpTransport } from 'storya-transport'
 import type {
   AudioTrackLoadedData,
-  FragBufferedData,
+  Fragment,
   FragmentLoaderConstructor,
   FragmentLoaderContext,
   HlsConfig,
+  LevelDetails,
   LevelLoadedData,
   LoaderConfiguration,
   LoaderStats,
+  SubtitleTrackLoadedData,
 } from 'hls.js'
+import { FetchHttpTransport } from 'storya-transport'
+import type { HttpTransport } from 'storya-transport'
+import { createDiagnosticsSnapshot } from './diagnostics'
+import type { HlsLoaderDiagnosticsSnapshot } from './diagnostics'
 import type { HlsLoaderEventHandler, HlsLoaderSegmentAction } from './events'
-import type {
-  HlsLoaderDiagnosticSegment,
-  HlsLoaderDiagnosticsSnapshot,
-  HlsLoaderDiagnosticStream,
-} from './diagnostics'
 import { createVirtualFragmentLoader } from './fragment-loader'
-import type {
-  FragmentLoaderSession,
-  SegmentReader,
-  SegmentReaderReleaseReason,
-} from './fragment-loader'
-import type { SegmentLoaderOptions } from './segment-loader'
-import { RequestScheduler } from './scheduler'
+import type { FragmentLoaderSession } from './fragment-loader'
 import { StreamFiller } from './stream-filler'
-import { VirtualSegment, VirtualStream, VirtualStreamRegistry } from './virtual-stream'
+import type { StreamFillerOptions } from './stream-filler'
+import { VirtualStreamReadFailure, VirtualStreamRegistry } from './virtual-stream'
+import type {
+  VirtualStreamFillPolicy,
+  VirtualStreamRetryPolicy,
+  VirtualStreamSegmentDescriptor,
+  VirtualStreamSegmentReader,
+} from './virtual-stream'
+import { copyVirtualStreamStatistics } from './stats'
 
 export interface HlsParallelLoaderOptions {
   getPlaybackRate?: () => number
   getPlaybackTime?: () => number
   onEvent?: HlsLoaderEventHandler
+  prefetchAheadSegments?: number
   transport?: HttpTransport
 }
 
@@ -41,53 +43,59 @@ export interface HlsParallelLoader {
   attach(hls: Hls): void
   destroy(): void
   getDiagnostics(): HlsLoaderDiagnosticsSnapshot
-  setEnabled(enabled: boolean): void
 }
 
 const chunkSize = 2 * 1024 * 1024
 const maxConcurrency = 6
-const prefetchDepth = 6
+const prefetchAheadSegments = 6
 
 class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSession {
   readonly fragmentLoader: FragmentLoaderConstructor
 
-  private readonly activeStreams = new Map<string, VirtualStream>()
   private destroyed = false
-  private enabled = true
-  private readonly filler: StreamFiller
+  private readonly fillers: StreamFiller[]
+  private readonly fragmentStreams = new WeakMap<Fragment, string>()
   private hls: Hls | undefined
+  private hlsConfig: HlsConfig | undefined
   private readonly onEvent: HlsLoaderEventHandler
-  private reconcilePending = false
-  private readonly registry = new VirtualStreamRegistry()
-  private readonly scheduler: RequestScheduler
+  private readonly registry: VirtualStreamRegistry
   private readonly transport: HttpTransport
 
   constructor(options: HlsParallelLoaderOptions) {
+    const configuredPrefetch = options.prefetchAheadSegments ?? prefetchAheadSegments
+    if (!Number.isSafeInteger(configuredPrefetch) || configuredPrefetch < 0) {
+      throw new Error('prefetchAheadSegments 必须是非负整数')
+    }
+
     const getPlaybackRate = options.getPlaybackRate ?? (() => 1)
     const getPlaybackTime = options.getPlaybackTime ?? (() => 0)
     this.onEvent = options.onEvent ?? (() => undefined)
     this.transport = options.transport ?? new FetchHttpTransport()
-    this.scheduler = new RequestScheduler({
-      getPlaybackRate,
-      getPlaybackTime,
-      maxConcurrency,
-      scheduleIntervalMs: 200,
-    })
-    const loaderOptions: SegmentLoaderOptions = {
+    this.registry = new VirtualStreamRegistry({
       chunkSize,
+      prefetchAheadSegments: configuredPrefetch,
+    })
+    const fillerOptions: StreamFillerOptions = {
       finishingRatio: 0.8,
       finishingRemainingMs: 300,
+      getPlaybackRate,
+      getPlaybackTime,
       idleTimeoutMs: 5_000,
-      maxLookAheadBytes: chunkSize * maxConcurrency,
       maxRescueAttempts: 2,
-      minSlowThroughputSamples: 3,
       minRequestLifetimeMs: 300,
+      minSlowThroughputSamples: 3,
       onEvent: this.onEvent,
       slowThroughputRatio: 0.35,
       slowThroughputWindowMs: 1_000,
     }
-    this.filler = new StreamFiller(this.scheduler, loaderOptions, this.onEvent, this.transport)
+    this.fillers = Array.from(
+      { length: maxConcurrency },
+      (_, index) => new StreamFiller(index + 1, this.registry, this.transport, fillerOptions),
+    )
     this.fragmentLoader = createVirtualFragmentLoader(this)
+    for (const filler of this.fillers) {
+      filler.start()
+    }
   }
 
   attach(hls: Hls): void {
@@ -102,91 +110,56 @@ class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSessi
     this.configure(hls.config)
     hls.on(Hls.Events.LEVEL_LOADED, this.handleLevelLoaded)
     hls.on(Hls.Events.AUDIO_TRACK_LOADED, this.handleAudioTrackLoaded)
-    hls.on(Hls.Events.FRAG_BUFFERED, this.handleFragBuffered)
+    hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, this.handleSubtitleTrackLoaded)
     hls.on(Hls.Events.DESTROYING, this.handleHlsDestroying)
   }
 
   configure(config: HlsConfig): void {
-    this.filler.configure(config)
+    this.hlsConfig ??= config
   }
 
   read(
     context: FragmentLoaderContext,
     config: LoaderConfiguration,
     stats: LoaderStats,
-  ): SegmentReader {
+  ): VirtualStreamSegmentReader {
     if (this.destroyed) {
-      return {
-        promise: Promise.reject(new Error('HLS 并行加载会话已经销毁')),
-        release: () => undefined,
-      }
+      throw new Error('HLS 并行加载会话已经销毁')
+    }
+    const hlsConfig = this.hlsConfig
+    if (hlsConfig === undefined) {
+      throw new Error('HLS 并行加载器尚未取得 hls.js 配置')
     }
 
-    const segment = this.registry.resolve(context)
-    const stream = segment.stream
-    const previousState = segment.state
-    segment.hardDemands += 1
-    if (segment.isMediaSegment) {
-      segment.playbackDemand = true
-    }
-    segment.addReaderStats(stats)
-    stream.loaderConfig = config
-    if (this.enabled && stream.kind !== 'subtitle' && segment.isMediaSegment) {
-      this.activate(stream, segment)
-    }
-
-    this.emitDemandEvent(
-      segment,
-      previousState === 'ready'
-        ? 'demand-ready'
-        : previousState === 'filling'
-          ? 'demand-loading'
-          : 'demand-miss',
+    const streamId = this.fragmentStreams.get(context.frag) ?? createProvisionalStreamId(context)
+    this.fragmentStreams.set(context.frag, streamId)
+    const reader = this.registry.createSegmentReader({
+      fillPolicy: createFillPolicy(config),
+      onStatistics: statistics => copyVirtualStreamStatistics(stats, statistics),
+      segment: createSegmentDescriptor(context, hlsConfig),
+      streamId,
+    })
+    this.emitReaderEvent(reader, context, 'reader-created')
+    void reader.result.then(
+      () => this.emitReaderEvent(reader, context, 'reader-ready'),
+      failure =>
+        this.emitReaderEvent(
+          reader,
+          context,
+          failure instanceof VirtualStreamReadFailure && failure.kind === 'aborted'
+            ? 'reader-cancelled'
+            : 'reader-failed',
+        ),
     )
-    const promise = this.filler.ensure(segment, config, false)
-    this.requestReconcile()
-
-    let released = false
-    return {
-      promise,
-      release: reason => {
-        if (released) {
-          return
-        }
-        released = true
-        segment.removeReaderStats(stats)
-        segment.hardDemands = Math.max(0, segment.hardDemands - 1)
-        this.releaseDemand(stream, segment, reason)
-        this.requestReconcile()
-      },
-    }
-  }
-
-  setEnabled(enabled: boolean): void {
-    if (this.enabled === enabled) {
-      return
-    }
-    this.enabled = enabled
-    if (!enabled) {
-      for (const stream of this.registry.values()) {
-        stream.active = false
-        stream.clearPlaybackDemands()
-      }
-      this.activeStreams.clear()
-    }
-    this.requestReconcile()
+    return reader
   }
 
   getDiagnostics(): HlsLoaderDiagnosticsSnapshot {
-    const streams = [...this.registry.values()].map(stream => this.getStreamDiagnostics(stream))
-    return {
-      activeRequests: this.scheduler.getActiveRequestCount(),
-      enabled: this.enabled,
-      estimatedThroughputBytesPerSecond: this.scheduler.getEstimatedThroughput(),
+    return createDiagnosticsSnapshot(
+      this.registry.snapshot(),
+      this.fillers.map(filler => filler.getState()),
       maxConcurrency,
-      streams,
-      timestamp: Date.now(),
-    }
+    )
   }
 
   destroy(): void {
@@ -195,178 +168,75 @@ class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSessi
     }
     this.destroyed = true
     this.detach()
-    this.filler.destroy()
+    for (const filler of this.fillers) {
+      filler.destroy()
+    }
+    this.registry.destroy()
     this.transport.destroy()
-    this.activeStreams.clear()
-    this.registry.clear()
   }
 
   private readonly handleLevelLoaded = (_event: string, data: LevelLoadedData) => {
-    this.registry.updateMain(data.level, data.details)
-    this.requestReconcile()
+    this.updateTopology(`main:${data.level}`, data.details)
   }
 
   private readonly handleAudioTrackLoaded = (_event: string, data: AudioTrackLoadedData) => {
-    this.registry.updateAudio(data.groupId, data.id, data.details)
-    this.requestReconcile()
+    this.updateTopology(`audio:${data.groupId}:${data.id}`, data.details)
   }
 
-  private readonly handleFragBuffered = (_event: string, data: FragBufferedData) => {
-    if (data.part !== null) {
-      return
-    }
-    const segment = this.registry.find(data.frag)
-    if (segment === undefined) {
-      return
-    }
-    segment.playbackDemand = false
-    this.requestReconcile()
+  private readonly handleSubtitleTrackLoaded = (_event: string, data: SubtitleTrackLoadedData) => {
+    this.updateTopology(`subtitle:${data.groupId}:${data.id}`, data.details)
   }
 
   private readonly handleHlsDestroying = () => {
     this.destroy()
   }
 
-  private activate(stream: VirtualStream, segment: VirtualSegment): void {
-    const previous = this.activeStreams.get(stream.kind)
-    if (previous !== undefined && previous !== stream) {
-      previous.active = false
-      previous.clearPlaybackDemands()
-    }
-    this.activeStreams.set(stream.kind, stream)
-    stream.active = true
-    if (segment.isMediaSegment) {
-      stream.anchor = segment
-    }
-  }
-
-  private releaseDemand(
-    stream: VirtualStream,
-    segment: VirtualSegment,
-    reason: SegmentReaderReleaseReason,
+  private emitReaderEvent(
+    reader: VirtualStreamSegmentReader,
+    context: FragmentLoaderContext,
+    action: HlsLoaderSegmentAction,
   ): void {
-    if (reason === 'aborted') {
-      segment.playbackDemand = false
-    }
-    if (reason === 'aborted' && stream.anchor === segment && segment.hardDemands === 0) {
-      stream.active = false
-      if (this.activeStreams.get(stream.kind) === stream) {
-        this.activeStreams.delete(stream.kind)
-      }
-    }
-  }
-
-  private requestReconcile(): void {
-    if (this.reconcilePending || this.destroyed) {
-      return
-    }
-    this.reconcilePending = true
-    queueMicrotask(() => {
-      this.reconcilePending = false
-      this.reconcile()
-    })
-  }
-
-  private reconcile(): void {
-    if (this.destroyed) {
-      return
-    }
-
-    const wanted = new Map<VirtualSegment, { config: LoaderConfiguration; prefetch: boolean }>()
-    for (const stream of this.registry.values()) {
-      const config = stream.loaderConfig
-      for (const segment of stream.allSegments()) {
-        const waitingForHlsRetry = segment.playbackDemand && segment.state === 'failed'
-        if (
-          (segment.hardDemands > 0 || (segment.playbackDemand && !waitingForHlsRetry)) &&
-          config !== undefined
-        ) {
-          wanted.set(segment, { config, prefetch: false })
-        }
-      }
-      if (!this.enabled || !stream.active || config === undefined) {
-        continue
-      }
-      if (stream.anchor?.playbackDemand && stream.anchor.state === 'failed') {
-        continue
-      }
-      for (const segment of stream.getPrefetchSegments(prefetchDepth)) {
-        if (!wanted.has(segment)) {
-          wanted.set(segment, { config, prefetch: true })
-        }
-      }
-    }
-
-    for (const stream of this.registry.values()) {
-      for (const segment of stream.allSegments()) {
-        const plan = wanted.get(segment)
-        if (plan !== undefined) {
-          void this.filler.ensure(segment, plan.config, plan.prefetch).catch(() => undefined)
-          continue
-        }
-        if (segment.hardDemands === 0 && !segment.playbackDemand) {
-          this.filler.cancel(segment)
-          stream.releaseRetired(segment)
-        }
-      }
-    }
-  }
-
-  private emitDemandEvent(segment: VirtualSegment, action: HlsLoaderSegmentAction): void {
+    const segment = reader.segment
     try {
       this.onEvent({
         action,
-        segmentSn: segment.fragment.sn,
+        segmentSn: context.frag.sn,
         segmentStart: segment.start,
         streamId: segment.stream.id,
         timestamp: Date.now(),
         type: 'segment-state',
-        url: segment.context.url,
+        url: context.url,
       })
     } catch {
       // 观测回调不能影响加载流程
     }
   }
 
-  private getStreamDiagnostics(stream: VirtualStream): HlsLoaderDiagnosticStream {
-    const prefetchSegments = new Set(stream.getPrefetchSegments(prefetchDepth))
-    const segments: HlsLoaderDiagnosticSegment[] = stream
-      .getDiagnosticSegments(3, prefetchDepth + 3)
-      .map(segment => {
-        const chunks = this.filler.getSegmentDiagnostics(segment)
-        const loadedBytes =
-          segment.result?.stats.loaded ??
-          chunks.reduce((total, chunk) => total + chunk.receivedBytes, 0)
-        const totalBytes =
-          segment.result?.stats.total ??
-          chunks.reduce(
-            (maximum, chunk) =>
-              Math.max(maximum, chunk.endOffset ?? chunk.startOffset + chunk.receivedBytes),
-            0,
-          )
-        return {
-          anchor: stream.anchor === segment,
-          chunks,
-          duration: segment.duration,
-          hardDemands: segment.hardDemands,
-          key: segment.key,
-          loadedBytes,
-          playbackDemand: segment.playbackDemand,
-          prefetch: prefetchSegments.has(segment),
-          segmentSn: segment.fragment.sn,
-          start: segment.start,
-          state: segment.state,
-          totalBytes,
-          url: segment.context.url,
-        }
-      })
-    return {
-      active: stream.active,
-      id: stream.id,
-      kind: stream.kind,
-      level: stream.level,
-      segments,
+  private updateTopology(streamId: string, details: LevelDetails): void {
+    const hlsConfig = this.hlsConfig
+    if (hlsConfig === undefined) {
+      return
     }
+    const descriptors: VirtualStreamSegmentDescriptor[] = []
+    for (const fragment of details.fragments) {
+      const previousStreamId = this.fragmentStreams.get(fragment)
+      if (previousStreamId !== undefined && previousStreamId !== streamId) {
+        this.registry.mergeStream(previousStreamId, streamId)
+      }
+      this.fragmentStreams.set(fragment, streamId)
+      descriptors.push(createSegmentDescriptor(createFragmentContext(fragment), hlsConfig))
+
+      const initSegment = fragment.initSegment
+      if (initSegment !== null) {
+        const previousInitStreamId = this.fragmentStreams.get(initSegment)
+        if (previousInitStreamId !== undefined && previousInitStreamId !== streamId) {
+          this.registry.mergeStream(previousInitStreamId, streamId)
+        }
+        this.fragmentStreams.set(initSegment, streamId)
+        descriptors.push(createSegmentDescriptor(createFragmentContext(initSegment), hlsConfig))
+      }
+    }
+    this.registry.updateStream(streamId, descriptors)
   }
 
   private detach(): void {
@@ -376,7 +246,7 @@ class HlsParallelLoaderSession implements HlsParallelLoader, FragmentLoaderSessi
     }
     hls.off(Hls.Events.LEVEL_LOADED, this.handleLevelLoaded)
     hls.off(Hls.Events.AUDIO_TRACK_LOADED, this.handleAudioTrackLoaded)
-    hls.off(Hls.Events.FRAG_BUFFERED, this.handleFragBuffered)
+    hls.off(Hls.Events.SUBTITLE_TRACK_LOADED, this.handleSubtitleTrackLoaded)
     hls.off(Hls.Events.DESTROYING, this.handleHlsDestroying)
     this.hls = undefined
   }
@@ -388,4 +258,113 @@ export function createHlsParallelLoader(options: HlsParallelLoaderOptions = {}):
 
 export const DEFAULT_CHUNK_SIZE = chunkSize
 export const DEFAULT_MAX_CONCURRENCY = maxConcurrency
-export const DEFAULT_PREFETCH_DEPTH = prefetchDepth
+export const DEFAULT_PREFETCH_AHEAD_SEGMENTS = prefetchAheadSegments
+
+function createProvisionalStreamId(context: FragmentLoaderContext): string {
+  const fragment = context.frag
+  return `provisional:${fragment.type}:${fragment.level}:${fragment.baseurl}`
+}
+
+function createSegmentDescriptor(
+  context: FragmentLoaderContext,
+  hlsConfig: HlsConfig,
+): VirtualStreamSegmentDescriptor {
+  const rangeStart = context.rangeStart ?? 0
+  const configuredRangeEnd = context.rangeEnd ?? 0
+  const rangeEnd = configuredRangeEnd > rangeStart ? configuredRangeEnd : undefined
+  return {
+    key: createSegmentKey(context),
+    position: {
+      duration: context.part?.duration ?? context.frag.duration,
+      start: context.part?.start ?? context.frag.start,
+    },
+    prefetch: context.part === null && context.frag.sn !== 'initSegment' && !context.frag.gap,
+    resource: {
+      createRequest: async parameters => {
+        const requestContext: FragmentLoaderContext = {
+          ...context,
+          headers: Object.fromEntries(parameters.headers.entries()),
+          rangeEnd: parameters.rangeEnd ?? 0,
+          rangeStart: parameters.rangeStart,
+        }
+        const init: RequestInit = {
+          credentials: 'same-origin',
+          headers: parameters.headers,
+          method: parameters.method,
+          mode: 'cors',
+          signal: parameters.signal,
+        }
+        return (
+          (await hlsConfig.fetchSetup?.(requestContext, init)) ?? new Request(context.url, init)
+        )
+      },
+      headers: context.headers ?? {},
+      rangeEnd,
+      rangeStart,
+      url: context.url,
+    },
+  }
+}
+
+function createFillPolicy(config: LoaderConfiguration): VirtualStreamFillPolicy {
+  return {
+    errorRetry: createRetryPolicy(config.loadPolicy.errorRetry),
+    maxTimeToFirstByteMs: config.loadPolicy.maxTimeToFirstByteMs,
+    timeoutRetry: createRetryPolicy(config.loadPolicy.timeoutRetry),
+  }
+}
+
+function createRetryPolicy(
+  policy: LoaderConfiguration['loadPolicy']['errorRetry'],
+): VirtualStreamRetryPolicy | undefined {
+  if (policy === null || policy === undefined) {
+    return undefined
+  }
+  const normalized: VirtualStreamRetryPolicy = {
+    backoff: policy.backoff ?? 'exponential',
+    maxNumRetry: policy.maxNumRetry,
+    maxRetryDelayMs: policy.maxRetryDelayMs,
+    retryDelayMs: policy.retryDelayMs,
+  }
+  if (policy.shouldRetry === undefined) {
+    return normalized
+  }
+  return {
+    ...normalized,
+    shouldRetry: (retryCount, timeout, error) =>
+      policy.shouldRetry?.(
+        policy,
+        retryCount,
+        timeout,
+        { code: error.code, text: error.message, url: error.url },
+        true,
+      ) ?? true,
+  }
+}
+
+function createFragmentContext(fragment: Fragment): FragmentLoaderContext {
+  return {
+    frag: fragment,
+    headers: {},
+    part: null,
+    rangeEnd: fragment.byteRangeEndOffset ?? 0,
+    rangeStart: fragment.byteRangeStartOffset ?? 0,
+    responseType: 'arraybuffer',
+    url: fragment.url,
+  }
+}
+
+function createSegmentKey(context: FragmentLoaderContext): string {
+  const part = context.part
+  const fragment = context.frag
+  if (fragment.sn === 'initSegment') {
+    return ['init', fragment.url, context.rangeStart ?? 0, context.rangeEnd ?? 0].join('|')
+  }
+  return [
+    `sn:${fragment.sn}`,
+    `cc:${fragment.cc ?? 0}`,
+    `part:${part?.index ?? ''}`,
+    `start:${part?.start ?? fragment.start}`,
+    `range:${context.rangeStart ?? 0}-${context.rangeEnd ?? 0}`,
+  ].join('|')
+}

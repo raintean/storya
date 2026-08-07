@@ -123,7 +123,7 @@ Memory 记录特定场景下需要长期保留的经验。遇到描述匹配的�
 设计文档描述当前采用的结构、职责、接口和关键取舍。修改对应范围前先阅读相关设计。
 
 - **Storya 总体设计** (`docs/design/storya.md`) - 仓库结构、组件边界、协议机制、依赖方向和当前实现范围。
-- **HLS 并行加载器设计** (`docs/design/hls-parallel-loader.md`) - 虚拟流、跨 Segment 预填充、全局请求调度和 fLoader 边界。
+- **HLS 并行加载器设计** (`docs/design/hls-parallel-loader.md`) - VirtualStream 状态模型、Segment Reader、Chunk Writer、独立 Filler 和 fLoader 边界。
 - **HTTP Transport 设计** (`docs/design/http-transport.md`) - 通用 HTTP Transport、WebSocket 连接池、线协议和 Edge Worker relay。
 
 ## 文档维护
