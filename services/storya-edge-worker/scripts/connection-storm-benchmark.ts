@@ -1,4 +1,4 @@
-import { DEFAULT_WEBSOCKET_MAX_CONNECTIONS, WebSocketHttpTransport } from 'storya-transport'
+import { WebSocketHttpTransport } from 'storya-transport'
 import type { WebSocketHttpTransportDebugEvent } from 'storya-transport'
 
 declare const process: {
@@ -37,6 +37,13 @@ const DEFAULT_ENDPOINT = 'ws://127.0.0.1:8787/transport'
 const DEFAULT_RANGE_BYTES = 1024 * 1024
 const DEFAULT_REPORT_INTERVAL_MS = 5_000
 const DEFAULT_RETRY_DELAY_MS = 250
+const DEFAULT_MAX_CONNECTIONS = 12
+const CONNECT_TIMEOUT_MS = 10_000
+const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+const IDLE_CONNECTION_TIMEOUT_MS = 30_000
+const MAX_REQUESTS_PER_CONNECTION = 50
+const MIN_IDLE_CONNECTIONS = 6
+const TRANSACTION_TIMEOUT_MS = 60_000
 const DEFAULT_URL =
   'https://cdn.radiantmediatechs.com/rmp/media/samples-for-rmp-site/04052024-lac-de-bimont/hls/avc_2160p/1.m4s'
 
@@ -57,13 +64,19 @@ async function main(): Promise<void> {
   }
   let measuring = true
   const transport = new WebSocketHttpTransport(options.endpoint, {
+    connectTimeoutMs: CONNECT_TIMEOUT_MS,
+    defaultMaxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
     debug: event => {
       if (!measuring) {
         return
       }
       observeConnection(event, connections)
     },
+    idleConnectionTimeoutMs: IDLE_CONNECTION_TIMEOUT_MS,
     maxConnections: options.maxConnections,
+    maxRequestsPerConnection: MAX_REQUESTS_PER_CONNECTION,
+    minIdleConnections: Math.min(MIN_IDLE_CONNECTIONS, options.maxConnections),
+    transactionTimeoutMs: TRANSACTION_TIMEOUT_MS,
   })
 
   console.info('开始 WebSocket 连接风暴 benchmark', options)
@@ -214,7 +227,7 @@ function isExpectedRotation(event: WebSocketHttpTransportDebugEvent): boolean {
   return (
     event.code === 1000 &&
     event.initiator === 'local' &&
-    (event.reason === 'idle' || event.reason === 'max-lifetime' || event.reason === 'max-requests')
+    (event.reason === 'idle' || event.reason === 'max-requests')
   )
 }
 
@@ -260,7 +273,7 @@ function parseOptions(args: string[]): BenchmarkOptions {
   assertWebSocketUrl(endpoint)
   const maxConnections = parsePositiveInteger(
     values.get('--max-connections'),
-    DEFAULT_WEBSOCKET_MAX_CONNECTIONS,
+    DEFAULT_MAX_CONNECTIONS,
     '--max-connections',
   )
   return {
@@ -342,7 +355,7 @@ function printHelp(): void {
   --url <url>                  Range 请求地址, 默认使用测试 HLS Segment
   --endpoint <url>             Worker WebSocket 地址, 默认 ${DEFAULT_ENDPOINT}
   --concurrency <count>        持续请求并发数, 默认等于 max-connections
-  --max-connections <count>    连接池上限, 默认 ${DEFAULT_WEBSOCKET_MAX_CONNECTIONS}
+  --max-connections <count>    连接池上限, 默认 ${DEFAULT_MAX_CONNECTIONS}
   --range-bytes <bytes>        每个请求的字节数, 默认 ${DEFAULT_RANGE_BYTES}
   --duration-ms <ms>           发起请求的持续时间, 默认 ${DEFAULT_DURATION_MS}
   --report-interval-ms <ms>    周期统计间隔, 默认 ${DEFAULT_REPORT_INTERVAL_MS}

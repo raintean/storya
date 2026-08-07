@@ -14,9 +14,11 @@ export interface HttpTransportResponse {
 }
 
 export type HttpTransportRangeRequestMode = 'resumable' | 'stable'
+export type HttpTransportResponseMode = 'buffered' | 'streaming'
 
 export interface HttpTransport {
   readonly rangeRequestMode?: HttpTransportRangeRequestMode
+  readonly responseMode: HttpTransportResponseMode
 
   request(request: Request, options?: HttpTransportRequestOptions): Promise<HttpTransportResponse>
   destroy(): void

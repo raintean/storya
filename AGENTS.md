@@ -83,7 +83,7 @@ make clean
 ### Protocol
 
 - 跨 Rust/TypeScript 或跨 TypeScript 项目的传输协议统一放在 `packages/storya-protocol`。
-- Schema 使用 Protobuf，格式化、lint、breaking check 和生成由 Buf 管理。
+- 跨 Rust/TypeScript 的 Schema 使用 Protobuf，格式化、lint、breaking check 和生成由 Buf 管理。仅 TypeScript 消费且性能敏感的协议可以使用经过设计文档确认的手写二进制 codec；当前只有 HTTP-over-WebSocket relay 使用该例外。
 - Proto 文件按领域直接放在 `proto/<domain>/`，不增加重复的 `storya/` 目录层。
 - Protobuf package 使用 `storya.<domain>`；不建立没有实际兼容需求的 `v1`、`v2` 目录或命名空间。
 - Rust 生成代码位于 `generated/rust`，TypeScript 生成代码位于 `typescript/generated`，不得手工修改或纳入版本管理。

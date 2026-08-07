@@ -4,6 +4,12 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-05",
   "compatibility_flags": ["no_web_socket_compression"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "limits": {
+    "cpu_ms": 300000,
+    "subrequests": 10000,
+  },
   "observability": {
     "enabled": true,
     "logs": {

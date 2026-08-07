@@ -1,6 +1,6 @@
 # HTTP Transport 设计
 
-本文描述 Storya 当前采用的通用 HTTP Transport、基于普通 Fetch 的多域名 HTTP Proxy、HTTP-over-WebSocket 线协议、客户端连接池和 Edge Worker relay。Transport 只表达 HTTP 请求与响应，不理解 HLS、Segment、Range 调度或其他媒体业务。
+本文描述 Storya 当前采用的通用 HTTP Transport、普通 Fetch、基于 HTTP 的多域名 Proxy，以及基于连接池的 HTTP-over-WebSocket relay。Transport 只表达 HTTP 请求与响应，不理解 HLS、Segment、Range 调度或媒体业务。
 
 ## 组件边界
 
@@ -17,141 +17,196 @@ storya-transport
   +---- WebSocketHttpTransport ---------------------> storya-edge-worker ----> HTTP 源站
 ```
 
-- `storya-transport` 提供统一的 `HttpTransport` 接口，以及 Browser Fetch、HTTP Proxy 和 WebSocket 三种实现。
-- `storya-hls-loader` 继续负责 Range 规划、并发调度、抢占、慢速补救和重试，只把构造完成的 HTTP Request 交给 Transport。
-- `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。第一版只接受 GET/HEAD，直接流式转发上游响应，不理解媒体语义，也不建立本地缓存。
-- `storya-edge-worker` 是边缘能力的单一 Cloudflare Worker 部署单元。当前只有 `/transport` HTTP relay 和 `/health`；未来媒体能力必须使用独立模块和接口，不得进入 Transport 协议。
-- Transport 控制消息 Schema 位于 `storya-protocol/proto/transport`。
+- `storya-transport` 提供统一的 `HttpTransport` 接口和三种网络实现。
+- `storya-hls-loader` 负责 Range 规划、并发调度、抢占、重试和流式 Transport 的慢速补救。
+- `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。
+- `storya-edge-worker` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
+- WebSocket relay 的手写二进制 codec 位于 `storya-protocol/typescript/http-relay.ts`，不使用 Protobuf。
 
 ## HTTP 接口
 
-`HttpTransport` 接受 Web 标准 `Request`，返回只包含加载器所需 HTTP 语义的响应:
+`HttpTransport` 接受 Web 标准 `Request`，返回加载器所需的 HTTP 响应：
 
 ```ts
 interface HttpTransport {
+  readonly rangeRequestMode?: 'resumable' | 'stable'
+  readonly responseMode: 'streaming' | 'buffered'
+
   request(request: Request, options?: HttpTransportRequestOptions): Promise<HttpTransportResponse>
   destroy(): void
 }
 ```
 
-响应包含 status、status text、最终 URL、headers、body 和 `arrayBuffer()`。调用方交给 HLS 会话的 Transport 所有权随会话转移；会话销毁时同时销毁 Transport。
-
-当前 Proxy 和 WebSocket 实现只接受 GET 和 HEAD，不支持请求体。`Range`、`Content-Range`、缓存控制和条件请求都按普通 HTTP header 传输，proxy 和 relay 不解析媒体含义。Fetch 实现保持浏览器原生请求行为。
+Fetch 和 Proxy Transport 使用 `streaming` response。WebSocket Transport 使用 `buffered` response，只有完整 WebSocket response message 到达后才返回 `HttpTransportResponse`。
 
 ## HTTP Proxy Transport
 
-`ProxyHttpTransport` 接受一个或多个 HTTP(S) Proxy Origin。每次请求按轮询顺序选择一个 Origin；HLS 调度器的重试、抢占和慢速补救会自然形成新的请求，从而继续轮换 Origin。Transport 不按目标 URL 建立固定映射，也不在 Origin 之间同步缓存状态。
+`ProxyHttpTransport` 接受一个或多个 HTTP(S) Proxy Origin。每个 Range 使用目标 URL 和分片位置稳定选择 Origin，域名更换时重建 Transport 即可。
 
-目标 URL 使用 UTF-8 和无 padding 的 Base64URL 编码为以下地址：
+目标 URL、逻辑 method 和可选 Range 使用 UTF-8 与无 padding Base64URL 编码为：
 
 ```text
-/proxy/<base64url(target-url)>.jpg
+/proxy/<descriptor>.jpg
 ```
 
-`.jpg` 后缀让 Cloudflare 把该路径当作可缓存静态图片资源，配合 `Content-Type: image/jpeg` 获得更长的边缘缓存有效期。第一版不加密，也没有签名；该编码只用于把完整目标 URL 安全放入 path，不是访问控制。公开生产部署前需要增加服务端签发或等价的授权机制。
+`.jpg` 后缀和 `image/jpeg` Content-Type 用于获得 Cloudflare 静态资源缓存语义。Rust proxy 将上游 206 包装为可缓存的 200，把原始 status、Content-Range、Content-Length 和 Content-Type 放入 `x-storya-proxy-*` header，由客户端恢复。
 
-Transport 通过标准 Fetch 发送原请求的 method 和 headers，不发送浏览器 cookie。Rust proxy 解码目标 URL、限制 scheme 为 HTTP/HTTPS、过滤逐跳和代理基础设施 header，并流式返回上游 status、headers 和 body。上游重定向的 `Location` 会被解析并重新编码为同一 Proxy Origin 下的 `/proxy/...jpg`，因此浏览器仍按标准 Fetch 重定向流程执行，最终响应 URL 也能由 Transport 还原为真实上游 URL。
-
-Rust proxy 为成功和错误响应统一增加 CORS header，并暴露全部响应 header，使浏览器可以读取 `Content-Range`、`Content-Length`、ETag 和缓存诊断信息。任意目标 URL、无签名和未拦截内网地址的组合只适合当前开发验证，不是公开代理的安全终态。
-
-`storya-http-proxy` 默认监听 `0.0.0.0:80`，部署环境可以通过 `STORYA_HTTP_PROXY_ADDRESS` 覆盖完整监听地址。
-
-多个 Cloudflare for SaaS custom hostname 可以指向同一个 `storya-http-proxy` fallback origin。客户端只需要拿到可用 Origin 列表；域名更换时重建 Transport 即可，不要求 target 到域名的稳定映射。
+Rust proxy 不建立本地缓存。HEAD、Range 未命中和错误响应不进入 CDN 缓存。当前 descriptor 没有签名，公开部署前仍需增加授权、Origin allowlist 和内网地址防护。
 
 ## WebSocket 事务
 
-每条 WebSocket 同时只承载一个 HTTP 事务。事务完整结束后连接才能复用，不在单条 WebSocket 内进行请求多路复用；HTTP 并发来自多条 WebSocket 连接。
+每条 WebSocket 同时只处理一个 HTTP 事务。事务收到完整 response 后连接回到 idle，可以继续处理下一个 request，语义类似没有 pipelining 的 HTTP/1.1 Keep-Alive。
 
 ```text
-idle -> requesting -> streaming -> idle
-             |            |
-             +-> canceling+-> idle
+connecting -> idle -> busy -> idle
+                    |
+                    +-> closed
 ```
 
-客户端为每条连接维护递增 sequence。sequence 只隔离取消竞态和迟到帧，不允许并发事务。
+加载器并发和单连接并发彼此独立。HTTP 并发由连接池中的多条 WebSocket 提供，不在单条连接上进行 multiplexing。
 
-控制帧包括:
+每个事务只有两条应用消息：
 
-- `REQUEST_HEAD`
-- `RESPONSE_HEAD`
-- `RESPONSE_END`
-- `CANCEL` / `CANCELED`
-- `PING` / `PONG`
-- `ERROR`
+```text
+client ---- one Request message ----> Worker
+client <--- one Response message ---- Worker
+```
 
-Frame 使用 1 字节 kind、4 字节大端 sequence 和 payload。控制 payload 使用 Protobuf，`RESPONSE_BODY` payload 是原始响应字节。relay 使用 BYOB reader 将上游响应聚合成不超过 256 KiB 的 Frame；流结束时发送不足 256 KiB 的尾帧。聚合不对首帧做特殊处理，也不保留上游流原始分块边界。
+方向和连接状态已经确定消息含义，因此协议没有 message kind、request ID 或 sequence。Worker 在 busy 状态收到第二条 request，或者客户端在 idle 状态收到 response，都视为协议错误并关闭连接。
 
-HTTP 4xx、5xx 仍然是正常 `RESPONSE_HEAD`，只有协议错误、上游 Fetch 失败或资源限制才发送 `ERROR`。每个事务只能以 `RESPONSE_END`、`CANCELED` 或 `ERROR` 中的一种状态结束。
+## 二进制编码
 
-## 取消
+Request 和 Response 使用固定宽度大端整数、长度前缀 UTF-8 字符串和原始 payload。每条消息携带一字节协议版本，不依赖 Protobuf runtime。
 
-Request 的 AbortSignal 或 response body cancel 会立即使本地消费者结束，并发送 `CANCEL`。连接进入 canceling，在 relay 确认上游 Fetch 和 body reader 已经停止后返回 `CANCELED`；收到确认前该连接不能承载新请求。
+Request 包含 method、`maxResponseBytes`、URL 和原始 request headers。Response 包含 outcome、HTTP status、可选最终 URL、固定集合内的 response headers 和 payload。HTTP outcome 的 payload 是完整 body；错误 outcome 的 payload 是 UTF-8 error message。协议不传输 `statusText`。Response outcome 区分正常 HTTP、无效请求、响应过大、上游失败和内部失败；HTTP 4xx、5xx 仍然是正常 HTTP outcome。
 
-取消确认超过 10 秒时直接关闭连接。连接关闭或协议错误会使当前事务产生 Transport failure，HLS 加载器继续按原有策略决定是否重试。
+当前 wire version 为 2。Request 固定头为 11 字节：
 
-relay 使用 Cloudflare runtime 的标准 WebSocket 自动关闭握手。客户端关闭 WebSocket 时，runtime 自动回送 Close，relay 的关闭回调只终止并等待仍在进行的上游事务收敛，不重复调用 `close()`。消息处理、上游代理和取消属于同一条被 ExecutionContext 跟踪的异步任务链；关闭和错误事件会输出结构化 Worker 日志。连接池因请求次数、寿命或空闲回收而发起的 `1000` 关闭属于正常生命周期，客户端诊断事件不记录为 error。
+| Offset | 类型 | 字段                    |
+| -----: | ---- | ----------------------- |
+|      0 | u8   | protocol version        |
+|      1 | u8   | method，GET=0、HEAD=1   |
+|      2 | u8   | header count            |
+|      3 | u32  | max response body bytes |
+|      7 | u32  | URL UTF-8 bytes         |
 
-## 响应界限与流控
+固定头之后依次写入 URL 和 request headers。每条 request header 由 u8 name length、u16 value length、name UTF-8 bytes 和 value UTF-8 bytes 组成。
 
-WebSocket Transport 不实现应用层 flow control。加载器的 Range 请求本身有明确字节边界，未知长度请求使用 Transport 的响应上限；客户端请求头声明 `max_response_bytes`，relay 还施加 64 MiB 全局硬上限。
+Response 固定头为 13 字节：
 
-relay 使用 BYOB `readAtLeast()` 读取 Cloudflare Fetch body，读满 256 KiB 或遇到流结束后发送一个 Frame，不等待客户端 ACK。小于 256 KiB 的响应上限会直接作为聚合大小，避免为小请求分配过大的缓冲区。客户端和 relay 都统计实际响应字节，源站忽略 Range 或返回超限响应时取消上游请求并返回错误。
+| Offset | 类型 | 字段                                    |
+| -----: | ---- | --------------------------------------- |
+|      0 | u8   | protocol version                        |
+|      1 | u8   | outcome                                 |
+|      2 | u16  | HTTP status，错误 outcome 时为 0        |
+|      4 | u8   | response header count                   |
+|      5 | u32  | redirected final URL UTF-8 bytes        |
+|      9 | u32  | body bytes 或 error message UTF-8 bytes |
 
-Worker 在 WebSocket upgrade response 中使用空的 `Sec-WebSocket-Extensions`，明确拒绝浏览器自动提供的 `permessage-deflate`。Transport 主要承载已经压缩的媒体字节，重复压缩通常不能减少流量，却会持续消耗 Worker CPU。正常的 `1000` 空闲连接关闭不写结构化日志，异常关闭和仍有活动事务的关闭继续保留诊断信息。
+固定头之后依次写入可选 final URL、response headers 和 payload。没有重定向时 final URL 为空，由客户端复用 request URL。每条 response header 由 u8 header ID、u16 value length 和 value UTF-8 bytes 组成，不重复传输 header name。所有整数使用大端编码，不插入 padding。
+
+Response 只承载 Loader 和 Transport 当前消费的 headers：
+
+|  ID | Header            |
+| --: | ----------------- |
+|   0 | `accept-ranges`   |
+|   1 | `age`             |
+|   2 | `cache-control`   |
+|   3 | `cf-cache-status` |
+|   4 | `content-length`  |
+|   5 | `content-range`   |
+|   6 | `content-type`    |
+|   7 | `etag`            |
+|   8 | `expires`         |
+|   9 | `last-modified`   |
+
+其他上游 response header 不进入 WebSocket message。新增 header 必须先确认真实消费者，再追加稳定 ID；不能改变已有 ID 含义。
+
+codec 解码 body 时返回原消息的 `Uint8Array.subarray()`，WebSocket Response 和 Loader buffered 路径继续传递同一视图，不复制媒体数据。Worker 根据已知 Content-Length 或请求上限一次性分配最终 response buffer，并使用 BYOB reader 直接把上游 body 读入 metadata 后方。应用代码不执行 body 拼接；Cloudflare runtime 和浏览器内部是否复制不属于协议保证。
+
+## Buffered Response 与上层调度
+
+WebSocket Transport 不提供流式 body。Worker 完整读取上游响应后发送一条 Response message，客户端收到整条消息后才解析 status、headers 和 body。
+
+因此 HLS Loader 在 buffered 模式下：
+
+- 不启用首字节超时。
+- 不启用响应流量空闲超时。
+- 不执行请求进行中的吞吐判断和慢速救援。
+- 继续使用完整请求加载超时。
+- 请求完成后用完整字节数和总耗时更新历史吞吐。
+- Range 重试始终从稳定 Chunk 起点重新开始。
+
+这项取舍减少 Worker 和浏览器的消息事件、流控制与内存复制，但无法在一个 Response 下载过程中观察进度。
+
+## 响应上限
+
+协议允许的 Response body 上限为 32 MiB。客户端为每个请求声明更小的 `maxResponseBytes` 时，Worker 使用更小值。
+
+Worker 在以下位置验证上限：
+
+- 上游 Content-Length 已知时，在读取 body 前拒绝超限响应。
+- Content-Length 未知时，最多读取 `maxResponseBytes + 1`，多出的一个字节用于检测越界。
+- 客户端解码后再次验证实际 body 不超过本次请求上限。
+
+HEAD 的 body 必须为空。当前生产 Chunk 默认为 2 MiB，因此正常媒体 Range 远低于协议硬上限。
+
+## 取消与超时
+
+协议不提供 CANCEL。上层 Abort 只使旧加载 attempt 失效，WebSocket Transport 不发送消息、不停止 Worker Fetch，也不提前复用 busy 连接。Response 最终到达后，旧 attempt 丢弃结果，连接重新回到 idle。
+
+Transport 保留不依赖协议消息的生命周期超时：
+
+- connect timeout：连接建立超时后关闭连接。
+- transaction timeout：完整 Response 长时间未到达时关闭连接，避免连接永久占用池容量。
+- idle timeout：回收超过空闲保留下限的连接。
+
+WebSocket 关闭时 Worker 同步清空活动事务，立即触发 BYOB reader cancel 以结束 pending read，再通过 AbortController 终止上游 Fetch，但不等待 cancel Promise；随后立即完成服务端关闭握手。这属于连接资源清理，不是独立的取消协议。
 
 ## 连接池
 
-HLS 当前最多同时执行 6 个 GET/Range 请求，WebSocket Transport 默认最多保留 12 条连接，为正在取消、建立或退休的连接提供替换空间。12 是连接上限，不改变加载器的请求并发上限。
+连接池完全按需创建连接，不主动预热，也不主动补足最低空闲数。所有池化数值由调用方显式配置，Transport 不提供业务默认值。
 
-连接池按以下规则运行:
+Example 当前配置：
 
-- 初始不建立连接，有请求且无空闲连接时立即扩容。
-- HTTP 请求完成后连接回到空闲池并按串行方式复用。
-- 多余空闲连接持续 30 秒后缩容，至少暂时保留一条已经建立的空闲连接。
-- 每条连接发送 40 个请求或存活约 90 秒后退休；寿命带有正负 10% 抖动。
-- 退休只阻止分配新请求，活动事务可以正常结束；事务结束后关闭连接。
-- 请求次数在 `REQUEST_HEAD` 发出时增加，失败和取消请求也计数，PING/PONG 不计数。
+- 最多 12 条连接。
+- 空闲回收下限为 6 条。
+- 每条连接最多处理 50 个请求。
+- 空闲 30 秒后可以回收。
+- connect timeout 为 10 秒。
+- transaction timeout 为 60 秒。
+- 默认 Response 上限为 32 MiB。
 
-连接池不做慢连接判断。当前请求是否过慢、是否需要补救继续由 HLS 调度器决定。
+分配 request 时优先选择创建时间最晚、年龄最小的 idle 连接。老连接因为较少获得新请求，会自然积累空闲时间并进入普通 idle 回收流程。
 
-## 心跳与死链接
+idle timeout 只关闭超出 `minIdleConnections` 的空闲连接。如果池从未扩展到该数量，不会主动创建连接；故障或最大复用次数使连接数降低时也不补建。
 
-连接连续 30 秒没有任何收发数据时，客户端发送应用层 `PING`；10 秒内没有收到对应 `PONG` 就关闭连接。业务数据同样更新连接活动时间，正在持续传输时不会额外发送心跳。
+连接发送第 50 个 request 时标记 retiring。该 response 完成后关闭连接，不再接受新 request。连接池不再按绝对寿命回收连接，也不发送应用层心跳。
 
-心跳只判断连接是否存活，不使用 RTT 估算吞吐量。连接的 wire activity 与 HTTP business activity 独立记录，PING/PONG 不阻止空闲连接缩容。
+## Relay 行为
 
-## Relay 与缓存
+Worker 只接受 GET 和 HEAD。它过滤 Host、Connection、Transfer-Encoding 等 hop-by-hop 或运行时管理的 header，从 WebSocket 握手继承浏览器 User-Agent，并根据握手 Origin 生成只包含 origin 的 Referer。
 
-`storya-edge-worker` 将 HTTP request head 还原为 Cloudflare `Request`，通过普通 `fetch()` 回源，并原样传输 status、最终 URL、headers 和 body。relay 过滤 Host、Connection、Transfer-Encoding 等 hop-by-hop 或运行时管理的 request header。
+Worker 使用普通 `fetch()` 回源，跟随重定向，返回 status、最终 URL、headers 和完整 body。当前只限制 URL scheme 为 HTTP/HTTPS，尚未实现鉴权、请求额度、内网地址拦截或逐跳重定向校验。
 
-浏览器不会把自动生成的 `Referer` 和 `User-Agent` 暴露在 JavaScript `Request.headers` 中。relay 因此从 WebSocket 握手继承浏览器 `User-Agent`，并根据握手 `Origin` 生成只包含 origin 的 `Referer`；Transport 请求显式提供同名 header 时优先使用显式值。该行为用于保持普通浏览器 HTTP 请求语义，不包含站点或媒体特例。
+Worker 禁用 `permessage-deflate`。媒体通常已经压缩，重复压缩会增加 CPU，且整包 Response 会进一步放大压缩成本。
 
-Fetch 子请求继续使用 Cloudflare 标准 HTTP 缓存语义。relay 当前不强制 `cacheEverything` 或自定义 TTL，也不手工缓存 206；`Cache-Control`、ETag、Last-Modified、Age 和 CF-Cache-Status 等信息按响应头传给客户端。
-
-当前 relay 只限制 URL 必须使用 HTTP 或 HTTPS，尚未实现鉴权、请求额度、内网地址拦截或重定向逐跳检查。这些属于公开部署前的安全工作，不改变 Transport 协议。
-
-## HTTP Proxy 与缓存
-
-`storya-http-proxy` 是无状态直通服务，不使用本地缓存。Cloudflare 位于 Proxy Origin 和 Rust service 之间，按 `cloudflare-cdn-cache-control` 缓存 `/proxy/...jpg` 响应。对于 Range chunk（上游返回 206），Rust proxy 把响应包装为 200 可缓存对象：原始 206 状态码移入 `x-storya-proxy-status`、`Content-Range` 移入 `x-storya-proxy-content-range`，浏览器侧输出 `Cache-Control: no-store`，CF 边缘强制 `cloudflare-cdn-cache-control: public, max-age=31536000`（一年），并把 `Content-Type` 改写为 `image/jpeg`、真实类型存入 `x-storya-proxy-content-type` 供客户端还原。HEAD、Range 未命中（非 206）和错误响应统一 `no-store`，不进入边缘缓存；完整 GET（init segment 等）保持上游响应透传。
-
-对于可缓存的 `.jpg` URL，Cloudflare 在 HEAD MISS 时可能向 Rust origin 发送 GET 并缓存完整响应。当前明确接受该行为，将其视为缓存预热；服务和客户端都不增加 HEAD 绕过参数或独立路径。
+Worker 使用 Paid 计划运行，CPU time 上限为 300 秒，单次调用 subrequest 上限为 10,000。生产入口只使用 Dashboard 管理的 Custom Domain，关闭 `workers.dev` 和 Preview URL；Wrangler 配置不声明 routes，避免覆盖 Dashboard 已有的 Custom Domain。
 
 ## 可观测性
 
-Edge Worker 开启持久化 Workers Logs 和 invocation logs，head sampling rate 为 1。Cloudflare Dashboard 会保留全部采样到的 Fetch 和 WebSocket invocation、运行时异常及代码产生的结构化日志；当前不启用 traces。
+连接池自定义 debug 回调记录连接创建、建立和关闭，包含连接年龄、请求次数、池大小和关闭原因。正常回收原因只有 `idle` 与 `max-requests`。调用方使用内置 `debug: true` 时，控制台只输出连接关闭事件，并采用与 Proxy Transport 一致的单行可读格式，不输出连接创建、建立或逐请求日志。
 
-Rust proxy 在收到上游响应头后输出一条结构化 INFO 日志，包含 method、目标 host、status、Range、Content-Range、Content-Length 和响应头耗时。日志不记录完整目标 URL、query 或 body chunk；上游请求和响应异常继续使用 WARN。
+Edge Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/response 热路径不输出逐请求或逐消息日志，异常异步任务才写结构化错误。
 
 ## 实现状态
 
-通用接口、Fetch Transport、Proxy Transport、WebSocket Transport、Rust HTTP proxy、动态连接池、取消、心跳、连接老化、响应上限、Transport Schema 和 Edge Worker relay 均已实现。HLS 加载器默认使用 Fetch；调用方显式提供 Proxy 或 WebSocket Transport 后切换网络执行路径，其他加载与调度逻辑不变。
+Fetch、Proxy、WebSocket Transport、Rust HTTP proxy、极简二进制 codec、buffered Worker relay、串行复用连接池和 Loader buffered 模式均已实现。
 
 ## 修改历史
 
-- 2026-08-06: Proxy URL 改用 `.jpg` 后缀以延长 Cloudflare 边缘默认缓存；Range chunk 把 `cloudflare-cdn-cache-control` 强制设为一年，并通过 `x-storya-proxy-content-type` 把 `Content-Type` 改写为 `image/jpeg`、真实类型由客户端还原。
-- 2026-08-06: 增加多 Origin `ProxyHttpTransport` 和无状态 `storya-http-proxy`，采用 `/proxy/<base64url>.bin` 执行标准 GET/HEAD 直通。
-- 2026-08-06: 禁用 WebSocket 压缩，将响应聚合提高到 256 KiB，并减少正常连接关闭日志以降低 relay CPU 消耗。
-- 2026-08-05: relay 恢复 runtime 标准 WebSocket 自动关闭握手，并将消息处理、上游代理和取消纳入 ExecutionContext 跟踪。
-- 2026-08-05: Edge Worker 开启持久化 Workers Logs 和完整 invocation logs。
-- 2026-08-05: relay 改用 BYOB 聚合读取，将上游小块合并成 128 KiB 响应帧，减少 WebSocket 发送和读取唤醒次数。
-- 2026-08-05: 建立通用 HTTP Transport、HTTP-over-WebSocket 串行连接协议、动态连接池和 `storya-edge-worker` relay。
+- 2026-08-07: Edge Worker 切换为 Paid 运行限制，CPU time 上限设为 300 秒、subrequest 上限设为 10,000，并关闭 `workers.dev` 与 Preview URL，仅保留 Dashboard 管理的 Custom Domain。
+- 2026-08-07: wire protocol 升级为 version 2；Response 删除 status text、正常响应的空 error message 和未重定向 URL，response header 改为固定 ID 白名单，Request header 长度字段同步收紧。
+- 2026-08-07: 从零重写 WebSocket relay。每个事务改为一条 Request 和一条完整 Response，删除 Protobuf、多帧 body、取消协议、心跳和最大连接寿命；连接池改为优先复用年轻连接、空闲下限回收和每连接 50 次复用，Loader 增加 buffered response 模式。
+- 2026-08-06: 增加多 Origin `ProxyHttpTransport` 和无状态 `storya-http-proxy`，采用稳定 Range descriptor 缓存媒体 Chunk。
+- 2026-08-05: 建立通用 HTTP Transport 和 Edge Worker relay。

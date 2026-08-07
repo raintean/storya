@@ -30,6 +30,7 @@ interface ProxyTargetDescriptor {
 
 export class ProxyHttpTransport implements HttpTransport {
   readonly rangeRequestMode = 'stable' as const
+  readonly responseMode = 'streaming' as const
 
   private destroyed = false
   private readonly fetcher: FetchFunction

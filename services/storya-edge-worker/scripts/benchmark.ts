@@ -36,14 +36,20 @@ const DEFAULT_URL =
   'https://cdn.radiantmediatechs.com/rmp/media/samples-for-rmp-site/04052024-lac-de-bimont/hls/avc_2160p/1.m4s'
 const LONG_CONNECTION_TIMEOUT_MS = 30 * 60 * 1000
 const MAX_REQUESTS_PER_CONNECTION = 1_000_000
+const CONNECT_TIMEOUT_MS = 10_000
+const MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 async function main(): Promise<void> {
   const options = parseOptions(process.argv.slice(2))
   const transport = new WebSocketHttpTransport(options.endpoint, {
+    connectTimeoutMs: CONNECT_TIMEOUT_MS,
+    defaultMaxResponseBytes: MAX_RESPONSE_BYTES,
     idleConnectionTimeoutMs: LONG_CONNECTION_TIMEOUT_MS,
-    maxConnectionLifetimeMs: LONG_CONNECTION_TIMEOUT_MS,
     maxConnections: options.concurrency,
     maxRequestsPerConnection: MAX_REQUESTS_PER_CONNECTION,
+    minIdleConnections: options.concurrency,
+    transactionTimeoutMs:
+      options.requestTimeoutMs === 0 ? LONG_CONNECTION_TIMEOUT_MS : options.requestTimeoutMs,
   })
 
   console.info('准备 WebSocket Worker CPU benchmark', {
@@ -104,24 +110,26 @@ async function runRound(
   return Promise.all(
     Array.from({ length: options.concurrency }, async (_, lane) => {
       const startedAt = performance.now()
-      const controller = new AbortController()
-      const timeout =
-        options.requestTimeoutMs === 0
-          ? undefined
-          : globalThis.setTimeout(() => controller.abort(), options.requestTimeoutMs)
       try {
         const response = await transport.request(
           new Request(options.url, {
             headers: {
               range: `bytes=0-${rangeBytes - 1}`,
             },
-            signal: controller.signal,
           }),
           { maxResponseBytes: rangeBytes },
         )
         if (response.status !== 206) {
           await response.body?.cancel()
           throw new Error(`目标没有返回 Range 响应: HTTP ${response.status}`)
+        }
+        if (response.headers.get('content-length') !== String(rangeBytes)) {
+          await response.body?.cancel()
+          throw new Error('Range 响应没有通过 relay 保留正确的 Content-Length')
+        }
+        if (!response.headers.get('content-range')?.startsWith(`bytes 0-${rangeBytes - 1}/`)) {
+          await response.body?.cancel()
+          throw new Error('Range 响应没有通过 relay 保留正确的 Content-Range')
         }
         const data = await response.arrayBuffer()
         if (data.byteLength !== rangeBytes) {
@@ -132,14 +140,14 @@ async function runRound(
           elapsedMs: performance.now() - startedAt,
         }
       } catch (cause) {
-        if (controller.signal.aborted && options.requestTimeoutMs !== 0) {
+        if (
+          cause instanceof Error &&
+          cause.message === 'WebSocket 请求事务超时' &&
+          options.requestTimeoutMs !== 0
+        ) {
           throw new Error(`Lane ${lane + 1} 请求超过 ${options.requestTimeoutMs}ms`, { cause })
         }
         throw cause
-      } finally {
-        if (timeout !== undefined) {
-          globalThis.clearTimeout(timeout)
-        }
       }
     }),
   )

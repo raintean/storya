@@ -1,27 +1,18 @@
-import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
 import {
-  decodeTransportFrame,
-  encodeTransportFrame,
-  HttpResponseHeadSchema,
-  HttpRequestHeadSchema,
-  TRANSPORT_FRAME_HEADER_SIZE,
-  TransportErrorCode,
-  TransportErrorSchema,
-  TransportFrameKind,
+  createHttpRelayResponseBuffer,
+  decodeHttpRelayRequest,
+  encodeHttpRelayError,
+  HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
+  HTTP_RELAY_RESPONSE_HEADER_NAMES,
+  HttpRelayResponseOutcome,
 } from 'storya-protocol'
-import type { HttpRequestHead } from 'storya-protocol'
+import type { HttpRelayHeader, HttpRelayRequest } from 'storya-protocol'
 
 interface RelayTransaction {
   readonly controller: AbortController
   reader: ReadableStreamBYOBReader | undefined
-  readonly sequence: number
-  readonly startedAt: number
-  terminal: boolean
-  transferredBytes: number
 }
 
-const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-const RESPONSE_FRAME_SIZE = 256 * 1024
 const blockedRequestHeaders = new Set([
   'connection',
   'content-length',
@@ -46,320 +37,202 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
   const client = pair[0]
   const server = pair[1]
   const clientHeaders = createClientHeaders(request)
+  let active: RelayTransaction | undefined
+
   server.binaryType = 'arraybuffer'
   server.accept()
 
-  let active: RelayTransaction | undefined
-
-  const send = (kind: TransportFrameKind, sequence: number, payload?: Uint8Array): void => {
-    server.send(encodeTransportFrame(kind, sequence, payload))
+  const closeServer = (code?: number, reason?: string): void => {
+    try {
+      if (code === undefined) {
+        server.close()
+      } else {
+        server.close(code, reason)
+      }
+    } catch {
+      // 连接丢失或已经关闭时只需收敛本地事务
+    }
   }
 
-  const sendResponseBody = (sequence: number, payload: Uint8Array<ArrayBuffer>): void => {
-    const frame = new Uint8Array(
-      payload.buffer,
-      payload.byteOffset - TRANSPORT_FRAME_HEADER_SIZE,
-      payload.byteLength + TRANSPORT_FRAME_HEADER_SIZE,
-    )
-    frame[0] = TransportFrameKind.RESPONSE_BODY
-    new DataView(frame.buffer, frame.byteOffset, TRANSPORT_FRAME_HEADER_SIZE).setUint32(1, sequence)
-    server.send(frame)
+  const sendError = (outcome: HttpRelayResponseOutcome, message: string): void => {
+    server.send(encodeHttpRelayError(outcome, message))
   }
 
-  const sendError = (sequence: number, code: TransportErrorCode, message: string): void => {
-    const error = create(TransportErrorSchema, { code, message })
-    send(TransportFrameKind.ERROR, sequence, toBinary(TransportErrorSchema, error))
-  }
-
-  const stopActive = async (): Promise<void> => {
+  const stop = (): void => {
     const transaction = active
     active = undefined
     if (transaction === undefined) {
       return
     }
-    transaction.terminal = true
+    const reader = transaction.reader
+    transaction.reader = undefined
+    if (reader !== undefined) {
+      void reader.cancel().catch(() => {
+        // AbortController 会继续终止上游请求
+      })
+    }
     transaction.controller.abort()
-    try {
-      await transaction.reader?.cancel()
-    } catch {
-      // 上游流可能已经因 WebSocket 关闭而终止
+  }
+
+  const sendUpstreamResponse = async (
+    relayRequest: HttpRelayRequest,
+    transaction: RelayTransaction,
+    response: Response,
+  ): Promise<void> => {
+    const responseHead = {
+      headerValues: collectResponseHeaderValues(response.headers),
+      status: response.status,
+      url: response.url === '' || response.url === relayRequest.url ? '' : response.url,
     }
-  }
-
-  const trackTask = (name: string, task: Promise<void>): void => {
-    ctx.waitUntil(
-      task.catch(async cause => {
-        console.error({
-          activeSequence: active?.sequence,
-          message: cause instanceof Error ? cause.message : String(cause),
-          name,
-          type: 'transport-async-task-error',
-        })
-        await stopActive()
-        if (server.readyState === WebSocket.OPEN) {
-          try {
-            server.close(1011, 'transport task failed')
-          } catch (closeCause) {
-            console.error({
-              message: closeCause instanceof Error ? closeCause.message : String(closeCause),
-              name,
-              type: 'transport-websocket-close-error',
-            })
-          }
-        }
-      }),
-    )
-  }
-
-  const finish = (transaction: RelayTransaction, kind: TransportFrameKind): void => {
-    if (active !== transaction || transaction.terminal) {
+    if (relayRequest.method === 'HEAD' || response.body === null) {
+      server.send(createHttpRelayResponseBuffer(responseHead, 0).finishEmpty())
       return
     }
-    send(kind, transaction.sequence)
-    transaction.terminal = true
-    active = undefined
-  }
 
-  const fail = (transaction: RelayTransaction, code: TransportErrorCode, message: string): void => {
-    if (active !== transaction || transaction.terminal) {
+    const declaredLength = parseContentLength(response.headers)
+    if (declaredLength !== undefined && declaredLength > relayRequest.maxResponseBytes) {
+      transaction.controller.abort()
+      sendError(
+        HttpRelayResponseOutcome.RESPONSE_TOO_LARGE,
+        `HTTP 响应超过 ${relayRequest.maxResponseBytes} 字节限制`,
+      )
       return
     }
-    sendError(transaction.sequence, code, message)
-    transaction.terminal = true
-    active = undefined
-  }
 
-  const cancel = async (sequence: number): Promise<void> => {
-    const transaction = active
-    if (transaction === undefined || transaction.sequence !== sequence || transaction.terminal) {
+    const capacity = declaredLength ?? relayRequest.maxResponseBytes + 1
+    const output = createHttpRelayResponseBuffer(responseHead, capacity)
+    if (capacity === 0) {
+      transaction.controller.abort()
+      server.send(output.finishEmpty())
       return
     }
-    transaction.terminal = true
-    transaction.controller.abort()
-    try {
-      await transaction.reader?.cancel()
-    } catch {
-      // 上游流已经结束时不需要再次处理取消错误
-    }
+
+    const reader = response.body.getReader({ mode: 'byob' })
+    transaction.reader = reader
+    const result = await reader.readAtLeast(capacity, output.body).finally(() => {
+      if (transaction.reader === reader) {
+        transaction.reader = undefined
+      }
+    })
+    const body = result.value
     if (active !== transaction) {
       return
     }
-    send(TransportFrameKind.CANCELED, sequence)
-    active = undefined
+    if (body === undefined) {
+      server.send(createHttpRelayResponseBuffer(responseHead, 0).finishEmpty())
+      return
+    }
+    if (body.byteLength === 0) {
+      server.send(output.finish(body))
+      return
+    }
+    if (body.byteLength > relayRequest.maxResponseBytes) {
+      transaction.controller.abort()
+      sendError(
+        HttpRelayResponseOutcome.RESPONSE_TOO_LARGE,
+        `HTTP 响应超过 ${relayRequest.maxResponseBytes} 字节限制`,
+      )
+      return
+    }
+    if (declaredLength !== undefined && body.byteLength !== declaredLength) {
+      transaction.controller.abort()
+      sendError(HttpRelayResponseOutcome.UPSTREAM_FAILURE, '上游响应长度与 Content-Length 不一致')
+      return
+    }
+    server.send(output.finish(body))
   }
 
-  const proxy = async (transaction: RelayTransaction, head: HttpRequestHead): Promise<void> => {
+  const proxy = async (
+    relayRequest: HttpRelayRequest,
+    transaction: RelayTransaction,
+  ): Promise<void> => {
     try {
-      const target = new URL(head.url)
-      if (target.protocol !== 'http:' && target.protocol !== 'https:') {
-        fail(
-          transaction,
-          TransportErrorCode.INVALID_REQUEST,
-          `不支持的 HTTP URL protocol: ${target.protocol}`,
-        )
-        return
-      }
-      if (head.method !== 'GET' && head.method !== 'HEAD') {
-        fail(transaction, TransportErrorCode.UNSUPPORTED_METHOD, `暂不支持 ${head.method} 请求`)
-        return
-      }
-
-      const requestedLimit = Number(head.maxResponseBytes)
-      if (
-        !Number.isSafeInteger(requestedLimit) ||
-        requestedLimit < 0 ||
-        (head.method !== 'HEAD' && requestedLimit === 0)
-      ) {
-        fail(transaction, TransportErrorCode.INVALID_REQUEST, 'max_response_bytes 无效')
-        return
-      }
-      const maxResponseBytes = Math.min(requestedLimit, MAX_RESPONSE_BYTES)
-      const headers = new Headers()
-      for (const header of head.headers) {
-        const name = header.name.toLowerCase()
-        if (!blockedRequestHeaders.has(name) && !name.startsWith('sec-websocket-')) {
-          headers.append(header.name, header.value)
-        }
-      }
-      for (const [name, value] of clientHeaders) {
-        if (!headers.has(name)) {
-          headers.set(name, value)
-        }
-      }
-
+      const target = validateRequest(relayRequest)
+      const headers = createUpstreamHeaders(relayRequest.headers, clientHeaders)
       const response = await fetch(
         new Request(target, {
           headers,
-          method: head.method,
+          method: relayRequest.method,
           redirect: 'follow',
           signal: transaction.controller.signal,
         }),
       )
-      if (active !== transaction || transaction.terminal) {
+      if (active !== transaction) {
         await response.body?.cancel()
         return
       }
-
-      const contentLength = parseContentLength(response.headers)
-      if (
-        head.method !== 'HEAD' &&
-        contentLength !== undefined &&
-        contentLength > maxResponseBytes
-      ) {
-        await response.body?.cancel()
-        fail(
-          transaction,
-          TransportErrorCode.RESPONSE_TOO_LARGE,
-          `HTTP 响应超过 ${maxResponseBytes} 字节限制`,
-        )
-        return
-      }
-
-      const responseHead = create(HttpResponseHeadSchema, {
-        headers: [...response.headers].map(([name, value]) => ({ name, value })),
-        status: response.status,
-        statusText: response.statusText,
-        url: response.url || target.toString(),
-      })
-      send(
-        TransportFrameKind.RESPONSE_HEAD,
-        transaction.sequence,
-        toBinary(HttpResponseHeadSchema, responseHead),
-      )
-
-      if (head.method === 'HEAD' || response.body === null) {
-        finish(transaction, TransportFrameKind.RESPONSE_END)
-        return
-      }
-
-      const reader = response.body.getReader({ mode: 'byob' })
-      transaction.reader = reader
-      const responseFrameSize = Math.min(RESPONSE_FRAME_SIZE, maxResponseBytes)
-      while (true) {
-        const readBuffer = new Uint8Array(
-          new ArrayBuffer(TRANSPORT_FRAME_HEADER_SIZE + responseFrameSize),
-          TRANSPORT_FRAME_HEADER_SIZE,
-        )
-        const result = await reader.readAtLeast(responseFrameSize, readBuffer)
-        if (active !== transaction || transaction.terminal) {
-          await reader.cancel()
-          return
-        }
-
-        const payload = result.value
-        transaction.transferredBytes += payload?.byteLength ?? 0
-        if (transaction.transferredBytes > maxResponseBytes) {
-          transaction.controller.abort()
-          await reader.cancel()
-          fail(
-            transaction,
-            TransportErrorCode.RESPONSE_TOO_LARGE,
-            `HTTP 响应超过 ${maxResponseBytes} 字节限制`,
-          )
-          return
-        }
-        if (payload !== undefined && payload.byteLength !== 0) {
-          sendResponseBody(transaction.sequence, payload)
-        }
-        if (result.done) {
-          finish(transaction, TransportFrameKind.RESPONSE_END)
-          return
-        }
-      }
+      await sendUpstreamResponse(relayRequest, transaction, response)
     } catch (cause) {
-      if (active !== transaction || transaction.terminal) {
+      if (active !== transaction) {
         return
       }
-      const message = cause instanceof Error ? cause.message : '未知上游请求错误'
-      fail(transaction, TransportErrorCode.UPSTREAM_FAILURE, message)
+      sendError(
+        cause instanceof InvalidRelayRequest
+          ? HttpRelayResponseOutcome.INVALID_REQUEST
+          : HttpRelayResponseOutcome.UPSTREAM_FAILURE,
+        cause instanceof Error ? cause.message : '未知上游请求错误',
+      )
+    } finally {
+      if (active === transaction) {
+        active = undefined
+      }
     }
   }
 
   const acceptMessage = async (data: string | ArrayBuffer): Promise<void> => {
     if (typeof data === 'string') {
-      server.close(1003, 'binary frames required')
-      return
-    }
-
-    let frame
-    try {
-      frame = decodeTransportFrame(data)
-    } catch {
-      server.close(1002, 'invalid transport frame')
-      return
-    }
-
-    if (frame.kind === TransportFrameKind.PING) {
-      send(TransportFrameKind.PONG, frame.sequence)
-      return
-    }
-    if (frame.kind === TransportFrameKind.CANCEL) {
-      await cancel(frame.sequence)
-      return
-    }
-    if (frame.kind !== TransportFrameKind.REQUEST_HEAD) {
-      sendError(frame.sequence, TransportErrorCode.INVALID_REQUEST, '当前连接不接受该消息')
+      closeServer(1003, 'binary message required')
       return
     }
     if (active !== undefined) {
-      sendError(frame.sequence, TransportErrorCode.INVALID_REQUEST, '当前连接已有活动请求')
+      closeServer(1008, 'request already active')
       return
     }
 
-    let head
+    let relayRequest: HttpRelayRequest
     try {
-      head = fromBinary(HttpRequestHeadSchema, frame.payload)
-    } catch {
-      sendError(frame.sequence, TransportErrorCode.INVALID_REQUEST, 'HTTP request head 无效')
+      relayRequest = decodeHttpRelayRequest(data)
+    } catch (cause) {
+      sendError(
+        HttpRelayResponseOutcome.INVALID_REQUEST,
+        cause instanceof Error ? cause.message : 'HTTP relay request 无效',
+      )
       return
     }
+
     const transaction: RelayTransaction = {
       controller: new AbortController(),
       reader: undefined,
-      sequence: frame.sequence,
-      startedAt: Date.now(),
-      terminal: false,
-      transferredBytes: 0,
     }
     active = transaction
-    await proxy(transaction, head)
+    await proxy(relayRequest, transaction)
+  }
+
+  const track = (task: Promise<void>): void => {
+    ctx.waitUntil(
+      task.catch(cause => {
+        console.error({
+          message: cause instanceof Error ? cause.message : String(cause),
+          type: 'http-relay-failure',
+        })
+        stop()
+        if (server.readyState === WebSocket.OPEN) {
+          closeServer(1011, 'relay failure')
+        }
+      }),
+    )
   }
 
   server.addEventListener('message', event => {
-    trackTask('message', acceptMessage(event.data))
+    track(acceptMessage(event.data))
   })
-  server.addEventListener('close', event => {
-    if (event.code !== 1000 || active !== undefined) {
-      console.info({
-        activeAgeMs: active === undefined ? undefined : Date.now() - active.startedAt,
-        activeSequence: active?.sequence,
-        activeTransferredBytes: active?.transferredBytes,
-        code: event.code,
-        readyState: server.readyState,
-        reason: event.reason,
-        type: 'transport-websocket-close',
-        wasClean: event.wasClean,
-      })
-    }
-    trackTask('close-cleanup', stopActive())
+  server.addEventListener('close', () => {
+    stop()
+    closeServer()
   })
-  server.addEventListener('error', event => {
-    console.error({
-      activeSequence: active?.sequence,
-      message: event.message,
-      type: 'transport-websocket-error',
-    })
-    trackTask('error-cleanup', stopActive())
-    if (server.readyState === WebSocket.OPEN) {
-      try {
-        server.close(1011, 'transport error')
-      } catch (cause) {
-        console.error({
-          message: cause instanceof Error ? cause.message : String(cause),
-          type: 'transport-websocket-close-error',
-        })
-      }
-    }
+  server.addEventListener('error', () => {
+    stop()
+    closeServer(1011, 'websocket error')
   })
 
   return new Response(null, {
@@ -367,6 +240,52 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
     status: 101,
     webSocket: client,
   })
+}
+
+function validateRequest(request: HttpRelayRequest): URL {
+  let target: URL
+  try {
+    target = new URL(request.url)
+  } catch {
+    throw new InvalidRelayRequest('HTTP relay URL 无效')
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    throw new InvalidRelayRequest(`不支持的 HTTP URL protocol: ${target.protocol}`)
+  }
+  if (
+    request.maxResponseBytes > HTTP_RELAY_MAX_RESPONSE_BODY_BYTES ||
+    (request.method === 'GET' && request.maxResponseBytes === 0)
+  ) {
+    throw new InvalidRelayRequest('maxResponseBytes 无效')
+  }
+  return target
+}
+
+function createUpstreamHeaders(
+  headers: readonly HttpRelayHeader[],
+  clientHeaders: Headers,
+): Headers {
+  const upstream = new Headers()
+  for (const header of headers) {
+    const name = header.name.toLowerCase()
+    if (!blockedRequestHeaders.has(name) && !name.startsWith('sec-websocket-')) {
+      upstream.append(name, header.value)
+    }
+  }
+  for (const [name, value] of clientHeaders) {
+    if (!upstream.has(name)) {
+      upstream.set(name, value)
+    }
+  }
+  return upstream
+}
+
+function collectResponseHeaderValues(headers: Headers): (string | null)[] {
+  const values: (string | null)[] = []
+  for (const name of HTTP_RELAY_RESPONSE_HEADER_NAMES) {
+    values.push(headers.get(name))
+  }
+  return values
 }
 
 function createClientHeaders(request: Request): Headers {
@@ -396,17 +315,18 @@ function parseHttpOrigin(value: string | null): string | undefined {
 
 function parseContentLength(headers: Headers): number | undefined {
   const value = headers.get('content-length')
-  if (value === null) {
+  if (value === null || !/^\d+$/u.test(value)) {
     return undefined
   }
-  const length = Number.parseInt(value, 10)
-  return Number.isSafeInteger(length) && length >= 0 ? length : undefined
+  const length = Number(value)
+  return Number.isSafeInteger(length) ? length : undefined
 }
+
+class InvalidRelayRequest extends Error {}
 
 export default {
   fetch(request, _env, ctx): Response {
     const url = new URL(request.url)
-
     if (url.pathname === '/health') {
       return json({ service: 'storya-edge-worker', status: 'ok' })
     }
@@ -419,7 +339,6 @@ export default {
       }
       return createTransportResponse(request, ctx)
     }
-
     return json({ error: 'not_found', message: 'Edge capability was not found.' }, { status: 404 })
   },
 } satisfies ExportedHandler<Env>

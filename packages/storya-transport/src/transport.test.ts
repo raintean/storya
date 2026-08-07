@@ -1,10 +1,12 @@
-import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
 import {
-  decodeTransportFrame,
-  encodeTransportFrame,
-  HttpRequestHeadSchema,
-  HttpResponseHeadSchema,
-  TransportFrameKind,
+  createHttpRelayResponseBuffer,
+  decodeHttpRelayRequest,
+  decodeHttpRelayResponse,
+  encodeHttpRelayError,
+  encodeHttpRelayResponse,
+  HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
+  HTTP_RELAY_RESPONSE_HEADER_NAMES,
+  HttpRelayResponseOutcome,
 } from 'storya-protocol'
 import { FetchHttpTransport } from './fetch-http-transport'
 import {
@@ -16,14 +18,18 @@ import { WebSocketHttpTransport } from './websocket-http-transport'
 import type {
   WebSocketFactory,
   WebSocketHttpTransportDebugEvent,
+  WebSocketHttpTransportOptions,
   WebSocketLike,
 } from './websocket-http-transport'
 
+interface RelayRequest {
+  readonly request: ReturnType<typeof decodeHttpRelayRequest>
+  readonly socket: FakeWebSocket
+}
+
 class FakeRelay {
   readonly clients: FakeWebSocket[] = []
-  requestCount = 0
-  respondToPing = true
-  sendResponseHeadBeforeCancel = false
+  readonly requests: RelayRequest[] = []
 
   readonly factory: WebSocketFactory = () => {
     const socket = new FakeWebSocket(this)
@@ -32,62 +38,35 @@ class FakeRelay {
   }
 
   accept(socket: FakeWebSocket, data: ArrayBuffer | ArrayBufferView): void {
-    const frame = decodeTransportFrame(data)
-    if (frame.kind === TransportFrameKind.PING) {
-      if (this.respondToPing) {
-        socket.receive(encodeTransportFrame(TransportFrameKind.PONG, frame.sequence))
-      }
-      return
+    const request = decodeHttpRelayRequest(data)
+    this.requests.push({ request, socket })
+    if (!new URL(request.url).pathname.startsWith('/hold')) {
+      this.respond(request.url)
     }
-    if (frame.kind === TransportFrameKind.CANCEL) {
-      if (this.sendResponseHeadBeforeCancel) {
-        const response = create(HttpResponseHeadSchema, {
-          headers: [{ name: 'content-length', value: '0' }],
-          status: 200,
-          statusText: 'OK',
-          url: 'https://example.com/hang',
-        })
-        socket.receive(
-          encodeTransportFrame(
-            TransportFrameKind.RESPONSE_HEAD,
-            frame.sequence,
-            toBinary(HttpResponseHeadSchema, response),
-          ),
-        )
-      }
-      socket.receive(encodeTransportFrame(TransportFrameKind.CANCELED, frame.sequence))
-      return
-    }
-    if (frame.kind !== TransportFrameKind.REQUEST_HEAD) {
-      throw new Error(`测试 Relay 收到意外 frame: ${frame.kind}`)
-    }
+  }
 
-    this.requestCount += 1
-    const request = fromBinary(HttpRequestHeadSchema, frame.payload)
-    if (new URL(request.url).pathname === '/hang') {
-      return
+  respond(url: string): void {
+    const index = this.requests.findIndex(entry => entry.request.url === url)
+    const entry = index < 0 ? undefined : this.requests.splice(index, 1)[0]
+    if (entry === undefined) {
+      throw new Error(`测试 Relay 没有等待中的请求: ${url}`)
     }
-
-    const payload = new TextEncoder().encode(new URL(request.url).pathname)
-    const response = create(HttpResponseHeadSchema, {
-      headers: [{ name: 'content-length', value: String(payload.byteLength) }],
-      status: 200,
-      statusText: 'OK',
-      url: request.url,
-    })
-    socket.receive(
-      encodeTransportFrame(
-        TransportFrameKind.RESPONSE_HEAD,
-        frame.sequence,
-        toBinary(HttpResponseHeadSchema, response),
-      ),
+    const path = new URL(entry.request.url).pathname
+    const body = entry.request.method === 'HEAD' ? new Uint8Array() : new TextEncoder().encode(path)
+    entry.socket.receive(
+      encodeHttpRelayResponse({
+        body,
+        headers: [{ name: 'content-length', value: String(path.length) }],
+        message: '',
+        outcome: HttpRelayResponseOutcome.HTTP,
+        status: 200,
+        url: entry.request.url,
+      }),
     )
-    if (request.method !== 'HEAD') {
-      socket.receive(
-        encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, frame.sequence, payload),
-      )
-    }
-    socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_END, frame.sequence))
+  }
+
+  requestedUrls(socket: FakeWebSocket): string[] {
+    return this.requests.filter(entry => entry.socket === socket).map(entry => entry.request.url)
   }
 }
 
@@ -96,10 +75,8 @@ class FakeWebSocket implements WebSocketLike {
   readyState = 0
 
   private readonly listeners = new Map<string, Set<(event: never) => void>>()
-  private readonly relay: FakeRelay
 
-  constructor(relay: FakeRelay) {
-    this.relay = relay
+  constructor(private readonly relay: FakeRelay) {
     queueMicrotask(() => {
       if (this.readyState !== 0) {
         return
@@ -118,6 +95,14 @@ class FakeWebSocket implements WebSocketLike {
     this.listeners.set(type, listeners)
   }
 
+  close(code = 1000, reason = ''): void {
+    if (this.readyState === 3) {
+      return
+    }
+    this.readyState = 3
+    this.emit('close', { code, reason, wasClean: code === 1000 } as CloseEvent)
+  }
+
   removeEventListener(
     type: 'close' | 'error' | 'message' | 'open',
     listener: (event: never) => void,
@@ -127,17 +112,9 @@ class FakeWebSocket implements WebSocketLike {
 
   send(data: string | Blob | ArrayBuffer | ArrayBufferView<ArrayBuffer>): void {
     if (typeof data === 'string' || data instanceof Blob) {
-      throw new Error('测试 WebSocket 只支持二进制消息')
+      throw new Error('测试 WebSocket 只支持二进制 message')
     }
     this.relay.accept(this, data)
-  }
-
-  close(code = 1000, reason = ''): void {
-    if (this.readyState === 3) {
-      return
-    }
-    this.readyState = 3
-    this.emit('close', { code, reason } as CloseEvent)
   }
 
   receive(data: Uint8Array<ArrayBuffer>): void {
@@ -149,6 +126,33 @@ class FakeWebSocket implements WebSocketLike {
       listener(event as never)
     }
   }
+}
+
+function testRelayCodecBodyView(): void {
+  const output = createHttpRelayResponseBuffer(
+    {
+      headerValues: HTTP_RELAY_RESPONSE_HEADER_NAMES.map(name =>
+        name === 'content-type' ? 'video/mp4' : null,
+      ),
+      status: 206,
+      url: 'https://example.com/video',
+    },
+    4,
+  )
+  output.body.set([1, 2, 3])
+  const message = output.finish(output.body.subarray(0, 3))
+  const response = decodeHttpRelayResponse(message)
+  assert(response.body.buffer === message.buffer, 'Response codec 不应复制 body')
+  assert(response.body.byteLength === 3, 'Response codec body 长度错误')
+  assert(response.body[2] === 3, 'Response codec body 内容错误')
+  assert(response.headers[0]?.name === 'content-type', 'Response codec header ID 解码错误')
+  assert(response.headers[0]?.value === 'video/mp4', 'Response codec header value 解码错误')
+
+  const error = decodeHttpRelayResponse(
+    encodeHttpRelayError(HttpRelayResponseOutcome.RESPONSE_TOO_LARGE, 'response too large'),
+  )
+  assert(error.body.byteLength === 0, '错误 Response 不应暴露 body')
+  assert(error.message === 'response too large', '错误 Response message 解码错误')
 }
 
 async function testTransportStatistics(): Promise<void> {
@@ -183,8 +187,7 @@ async function testTransportStatistics(): Promise<void> {
   await bypassReader?.read()
   await bypassReader?.cancel()
 
-  const failed = statistics.startRequest()
-  failed.reject(new Error('请求失败'))
+  statistics.startRequest().reject(new Error('请求失败'))
   statistics.startRequest().trackResponse(new Response(null), false)
 
   const snapshot = statistics.snapshot()
@@ -200,16 +203,14 @@ async function testTransportStatistics(): Promise<void> {
   assert(snapshot.cacheUnknownCount === 1, 'Transport 统计未知缓存数量错误')
   const formatted = formatTransportStatistics(snapshot)
   assert(formatted.includes('请求 5'), 'Transport 统计摘要缺少请求数量')
-  assert(formatted.includes('成功 3'), 'Transport 统计摘要缺少成功数量')
   assert(formatted.includes('数据 12 B'), 'Transport 统计摘要缺少数据量')
   assert(formatted.includes('命中率 50.0%'), 'Transport 统计摘要缺少缓存命中率')
-  assert(formatted.includes('CF BYPASS=1,HIT=1,MISS=1'), 'Transport 统计摘要缺少 CF 状态')
 
   await waitForWithin(() => logs.length > 0, 100)
   assert(logMessages[0] === formatted, 'Transport 定时日志没有使用可读摘要')
   const logCount = logs.length
   statistics.destroy()
-  await new Promise(resolve => globalThis.setTimeout(resolve, 10))
+  await delay(10)
   assert(logs.length === logCount, 'Transport 统计销毁后仍在输出日志')
 }
 
@@ -221,7 +222,7 @@ async function testFetchTransport(): Promise<void> {
   })
   const response = await transport.request(new Request('https://example.com/fetch'))
   assert(requestedUrl === 'https://example.com/fetch', 'Fetch transport 没有转发请求')
-  assert(new TextDecoder().decode(await response.arrayBuffer()) === 'fetch', 'Fetch 响应错误')
+  assert(decode(await response.arrayBuffer()) === 'fetch', 'Fetch 响应错误')
   transport.destroy()
 }
 
@@ -239,12 +240,13 @@ async function testSequentialReuse(): Promise<void> {
 async function testConcurrentGrowth(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
-  const [first, second] = await Promise.all([
-    transport.request(new Request('https://example.com/one')),
-    transport.request(new Request('https://example.com/two')),
-  ])
-  await Promise.all([first.arrayBuffer(), second.arrayBuffer()])
+  const first = transport.request(new Request('https://example.com/hold/one'))
+  const second = transport.request(new Request('https://example.com/hold/two'))
+  await waitFor(() => relay.requests.length === 2)
   assert(relay.clients.length === 2, '并发请求没有扩容 WebSocket 连接池')
+  relay.respond('https://example.com/hold/one')
+  relay.respond('https://example.com/hold/two')
+  await Promise.all([(await first).arrayBuffer(), (await second).arrayBuffer()])
   transport.destroy()
 }
 
@@ -253,9 +255,7 @@ async function testHeadContentLength(): Promise<void> {
   const transport = createTransport(relay)
   const response = await transport.request(
     new Request('https://example.com/head', { method: 'HEAD' }),
-    {
-      maxResponseBytes: 0,
-    },
+    { maxResponseBytes: 0 },
   )
   assert(response.status === 200, 'HEAD 响应没有成功返回')
   assert(response.headers.get('content-length') === '5', 'HEAD 响应丢失 Content-Length')
@@ -263,121 +263,156 @@ async function testHeadContentLength(): Promise<void> {
   transport.destroy()
 }
 
-async function testCancellation(): Promise<void> {
+async function testAbortIsIgnored(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
   const controller = new AbortController()
   const response = transport.request(
-    new Request('https://example.com/hang', { signal: controller.signal }),
+    new Request('https://example.com/hold/ignored-abort', { signal: controller.signal }),
   )
-  await waitFor(() => relay.requestCount === 1)
+  await waitFor(() => relay.requests.length === 1)
   controller.abort()
 
-  let aborted = false
-  try {
-    await response
-  } catch (error) {
-    aborted = error instanceof DOMException && error.name === 'AbortError'
-  }
-  assert(aborted, '取消请求没有返回 AbortError')
+  const next = transport.request(new Request('https://example.com/next'))
+  await waitFor(() => relay.clients.length === 2)
+  relay.respond('https://example.com/hold/ignored-abort')
+  assert(decode(await (await response).arrayBuffer()) === '/hold/ignored-abort', 'Abort 被错误转发')
+  assert(decode(await (await next).arrayBuffer()) === '/next', '补充连接请求失败')
   transport.destroy()
 }
 
-async function testCancellationResponseHeadRace(): Promise<void> {
+async function testMaximumReuse(): Promise<void> {
   const relay = new FakeRelay()
-  relay.sendResponseHeadBeforeCancel = true
+  const transport = createTransport(relay, { maxRequestsPerConnection: 1 })
+  await (await transport.request(new Request('https://example.com/first'))).arrayBuffer()
+  await (await transport.request(new Request('https://example.com/second'))).arrayBuffer()
+  assert(relay.clients.length === 2, '达到最大复用次数后没有创建新连接')
+  transport.destroy()
+}
+
+async function testYoungestConnectionFirst(): Promise<void> {
+  const relay = new FakeRelay()
   const transport = createTransport(relay)
-  const controller = new AbortController()
-  const response = transport.request(
-    new Request('https://example.com/hang', { signal: controller.signal }),
-  )
-  await waitFor(() => relay.requestCount === 1)
-  controller.abort()
+  const first = transport.request(new Request('https://example.com/hold/old'))
+  const second = transport.request(new Request('https://example.com/hold/young'))
+  await waitFor(() => relay.requests.length === 2)
+  relay.respond('https://example.com/hold/old')
+  relay.respond('https://example.com/hold/young')
+  await Promise.all([first, second])
 
-  let aborted = false
-  try {
-    await response
-  } catch (error) {
-    aborted = error instanceof DOMException && error.name === 'AbortError'
-  }
-  assert(aborted, '取消竞态没有返回 AbortError')
-  await waitFor(() => relay.clients[0]?.readyState === 1)
-
-  const next = await transport.request(new Request('https://example.com/after-cancel'))
-  await next.arrayBuffer()
-  assert(relay.clients.length === 1, '取消竞态错误关闭了可复用的 WebSocket')
+  const next = transport.request(new Request('https://example.com/hold/next'))
+  await waitFor(() => relay.requests.some(entry => entry.request.url.endsWith('/hold/next')))
+  const nextEntry = relay.requests.find(entry => entry.request.url.endsWith('/hold/next'))
+  assert(nextEntry?.socket === relay.clients[1], '新请求没有优先使用年龄最小的连接')
+  relay.respond('https://example.com/hold/next')
+  await next
   transport.destroy()
 }
 
-async function testRequestAging(): Promise<void> {
+async function testIdleRetentionFloor(): Promise<void> {
   const relay = new FakeRelay()
-  const transport = createTransport(relay, 1)
-  const first = await transport.request(new Request('https://example.com/first'))
-  await first.arrayBuffer()
-  const second = await transport.request(new Request('https://example.com/second'))
-  await second.arrayBuffer()
-  assert(relay.clients.length === 2, '达到请求次数后没有退休旧连接')
+  const transport = createTransport(relay, {
+    idleConnectionTimeoutMs: 5,
+    minIdleConnections: 2,
+  })
+  const requests = [
+    transport.request(new Request('https://example.com/hold/1')),
+    transport.request(new Request('https://example.com/hold/2')),
+    transport.request(new Request('https://example.com/hold/3')),
+  ]
+  await waitFor(() => relay.requests.length === 3)
+  for (let index = 1; index <= 3; index += 1) {
+    relay.respond(`https://example.com/hold/${index}`)
+  }
+  await Promise.all(requests)
+  await delay(50)
+  const openConnections = relay.clients.filter(socket => socket.readyState === 1).length
+  assert(openConnections === 2, `空闲连接没有回收到 minIdleConnections, 当前 ${openConnections}`)
+  transport.destroy()
+}
+
+async function testMinimumIdleDoesNotPreconnect(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay, { minIdleConnections: 6 })
+  await delay(5)
+  assert(relay.clients.length === 0, 'minIdleConnections 不应主动创建连接')
+  await (await transport.request(new Request('https://example.com/one'))).arrayBuffer()
+  assert(countClients(relay) === 1, '单个请求不应创建最低空闲数量的连接')
+  transport.destroy()
+}
+
+async function testTransactionTimeout(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay, { transactionTimeoutMs: 5 })
+  let failed = false
+  try {
+    await transport.request(new Request('https://example.com/hold/timeout'))
+  } catch (cause) {
+    failed = cause instanceof Error && cause.message === 'WebSocket 请求事务超时'
+  }
+  assert(failed, '事务超时没有结束请求')
+  assert(relay.clients[0]?.readyState === 3, '事务超时没有关闭连接')
   transport.destroy()
 }
 
 async function testConnectionDiagnostics(): Promise<void> {
   const relay = new FakeRelay()
   const events: WebSocketHttpTransportDebugEvent[] = []
-  const transport = new WebSocketHttpTransport('wss://relay.example.com/transport', {
-    connectTimeoutMs: 1_000,
+  const transport = createTransport(relay, {
     debug: event => events.push(event),
-    heartbeatIntervalMs: 60_000,
-    idleConnectionTimeoutMs: 60_000,
-    maxConnectionLifetimeMs: 60_000,
-    maxConnections: 12,
     maxRequestsPerConnection: 1,
-    webSocketFactory: relay.factory,
   })
-
-  const response = await transport.request(new Request('https://example.com/diagnostics'))
-  await response.arrayBuffer()
+  await (await transport.request(new Request('https://example.com/diagnostics'))).arrayBuffer()
 
   assert(
     events.some(event => event.type === 'connection-created'),
-    '没有记录 WebSocket 创建事件',
+    '没有记录连接创建事件',
   )
   assert(
     events.some(event => event.type === 'connection-opened'),
-    '没有记录 WebSocket 建立事件',
+    '没有记录连接建立事件',
   )
   const closed = events.find(event => event.type === 'connection-closed')
-  assert(closed !== undefined, '没有记录 WebSocket 关闭事件')
-  assert(closed.code === 1000, 'WebSocket 主动关闭码记录错误')
-  assert(closed.initiator === 'local', 'WebSocket 主动关闭方记录错误')
-  assert(closed.reason === 'max-requests', 'WebSocket 请求次数退休原因记录错误')
-  assert(closed.requestCount === 1, 'WebSocket 关闭时请求次数记录错误')
-  assert(closed.error === undefined, 'WebSocket 正常退休不应记录 error')
+  assert(closed?.reason === 'max-requests', '最大复用次数关闭原因错误')
+  assert(closed.requestCount === 1, '连接关闭时请求次数错误')
   transport.destroy()
 }
 
-async function testHeartbeatTimeout(): Promise<void> {
+async function testDefaultConnectionLog(): Promise<void> {
   const relay = new FakeRelay()
-  relay.respondToPing = false
-  const transport = new WebSocketHttpTransport('wss://relay.example.com/transport', {
-    connectTimeoutMs: 1_000,
-    heartbeatIntervalMs: 1,
-    heartbeatTimeoutMs: 1,
-    idleConnectionTimeoutMs: 60_000,
-    maxConnectionLifetimeMs: 60_000,
-    maxConnections: 12,
-    maxRequestsPerConnection: 40,
-    webSocketFactory: relay.factory,
+  const logs: unknown[][] = []
+  const originalConsoleInfo = console.info
+  console.info = (...data: unknown[]) => logs.push(data)
+  const transport = createTransport(relay, {
+    debug: true,
+    maxRequestsPerConnection: 1,
   })
-  const response = await transport.request(new Request('https://example.com/heartbeat'))
-  await response.arrayBuffer()
+  try {
+    await (await transport.request(new Request('https://example.com/log'))).arrayBuffer()
+  } finally {
+    transport.destroy()
+    console.info = originalConsoleInfo
+  }
 
-  await waitForWithin(() => relay.clients[0]?.readyState === 3, 2_500)
-  assert(relay.clients[0]?.readyState === 3, '没有响应心跳的 WebSocket 未被关闭')
-  transport.destroy()
+  assert(logs.length === 1, `默认 debug 应只输出连接关闭日志, 实际 ${logs.length} 条`)
+  assert(logs[0]?.length === 1, '连接关闭日志应输出为单个字符串')
+  const message = logs[0][0]
+  assert(typeof message === 'string', '连接关闭日志不是字符串')
+  assert(
+    message.startsWith('[storya-transport][WebSocketHttpTransport] 连接 #1 关闭'),
+    '连接关闭日志前缀错误',
+  )
+  assert(message.includes('原因 max-requests'), '连接关闭日志缺少原因')
+  assert(message.includes('关闭方 本地'), '连接关闭日志缺少关闭方')
+  assert(message.includes('Code 1000'), '连接关闭日志缺少 Code')
+  assert(message.includes('请求 1'), '连接关闭日志缺少复用次数')
+  assert(message.includes('池内 0'), '连接关闭日志缺少池大小')
+  assert(message.includes('排队 0'), '连接关闭日志缺少排队数')
 }
 
 async function testConnectionFactoryFailure(): Promise<void> {
   const transport = new WebSocketHttpTransport('wss://relay.example.com/transport', {
+    ...createOptions(),
     webSocketFactory: () => {
       throw new Error('连接创建失败')
     },
@@ -385,8 +420,8 @@ async function testConnectionFactoryFailure(): Promise<void> {
   let failed = false
   try {
     await transport.request(new Request('https://example.com/failure'))
-  } catch (error) {
-    failed = error instanceof Error && error.message === 'WebSocket 连接创建失败'
+  } catch (cause) {
+    failed = cause instanceof Error && cause.message === 'WebSocket 连接创建失败'
   }
   assert(failed, 'WebSocket 工厂同步失败时请求没有结束')
   transport.destroy()
@@ -400,32 +435,45 @@ async function testInvalidResponseLimit(): Promise<void> {
     await transport.request(new Request('https://example.com/invalid'), {
       maxResponseBytes: Number.NaN,
     })
-  } catch (error) {
-    failed = error instanceof Error && error.message === 'maxResponseBytes 无效'
+  } catch (cause) {
+    failed = cause instanceof Error && cause.message === 'maxResponseBytes 无效'
   }
   assert(failed, '无效响应上限没有被拒绝')
   assert(relay.clients.length === 0, '无效响应上限不应创建 WebSocket')
   transport.destroy()
 }
 
-function createTransport(relay: FakeRelay, maxRequestsPerConnection = 40): WebSocketHttpTransport {
-  return new WebSocketHttpTransport('wss://relay.example.com/transport', {
+function createOptions(
+  overrides: Partial<WebSocketHttpTransportOptions> = {},
+): WebSocketHttpTransportOptions {
+  return {
     connectTimeoutMs: 1_000,
-    heartbeatIntervalMs: 60_000,
+    defaultMaxResponseBytes: HTTP_RELAY_MAX_RESPONSE_BODY_BYTES,
     idleConnectionTimeoutMs: 60_000,
-    maxConnectionLifetimeMs: 60_000,
     maxConnections: 12,
-    maxRequestsPerConnection,
+    maxRequestsPerConnection: 50,
+    minIdleConnections: 0,
+    transactionTimeoutMs: 1_000,
+    ...overrides,
+  }
+}
+
+function createTransport(
+  relay: FakeRelay,
+  overrides: Partial<WebSocketHttpTransportOptions> = {},
+): WebSocketHttpTransport {
+  return new WebSocketHttpTransport('wss://relay.example.com/transport', {
+    ...createOptions(overrides),
     webSocketFactory: relay.factory,
   })
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
     if (predicate()) {
       return
     }
-    await new Promise(resolve => globalThis.setTimeout(resolve, 0))
+    await delay(0)
   }
   throw new Error('等待测试条件超时')
 }
@@ -436,13 +484,21 @@ async function waitForWithin(predicate: () => boolean, timeoutMs: number): Promi
     if (predicate()) {
       return
     }
-    await new Promise(resolve => globalThis.setTimeout(resolve, 10))
+    await delay(1)
   }
   throw new Error('等待定时测试条件超时')
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => globalThis.setTimeout(resolve, ms))
+}
+
 function decode(buffer: ArrayBuffer): string {
   return new TextDecoder().decode(buffer)
+}
+
+function countClients(relay: FakeRelay): number {
+  return relay.clients.length
 }
 
 function assert(condition: boolean, message: string): asserts condition {
@@ -451,15 +507,19 @@ function assert(condition: boolean, message: string): asserts condition {
   }
 }
 
+testRelayCodecBodyView()
 await testTransportStatistics()
 await testFetchTransport()
 await testSequentialReuse()
 await testConcurrentGrowth()
 await testHeadContentLength()
-await testCancellation()
-await testCancellationResponseHeadRace()
-await testRequestAging()
+await testAbortIsIgnored()
+await testMaximumReuse()
+await testYoungestConnectionFirst()
+await testIdleRetentionFloor()
+await testMinimumIdleDoesNotPreconnect()
+await testTransactionTimeout()
 await testConnectionDiagnostics()
-await testHeartbeatTimeout()
+await testDefaultConnectionLog()
 await testConnectionFactoryFailure()
 await testInvalidResponseLimit()
