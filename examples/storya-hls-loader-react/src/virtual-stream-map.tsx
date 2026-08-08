@@ -361,7 +361,7 @@ function getChunkStyleState(chunk: ChunkDiagnostics): string {
     return 'complete'
   }
   if (chunk.state === 'filling') {
-    return 'loading'
+    return chunk.attempt > 1 ? 'retrying' : 'loading'
   }
   return chunk.state === 'empty' ? 'queued' : 'failed'
 }

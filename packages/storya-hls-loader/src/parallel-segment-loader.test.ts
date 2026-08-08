@@ -16,10 +16,12 @@ const resources = new Map([
   ['https://example.com/segment-3.ts', new Uint8Array([20, 21, 22, 23, 24])],
   ['https://example.com/segment-4.ts', new Uint8Array([30, 31, 32, 33, 34])],
   ['https://example.com/segment-5.ts', new Uint8Array([40, 41, 42, 43, 44, 45, 46, 47, 48, 49])],
+  ['https://example.com/segment-6.ts', new Uint8Array([50, 51, 52, 53, 54, 55, 56, 57])],
 ])
 const fetchCounts = new Map<string, number>()
 let activeFetches = 0
 let maxActiveFetches = 0
+let stalledBodyCanceled = false
 
 globalThis.fetch = async input => {
   const request = input instanceof Request ? input : new Request(input)
@@ -46,6 +48,27 @@ globalThis.fetch = async input => {
       })
     }
     const range = parseRange(request.headers.get('range'), payload.byteLength)
+    if (
+      request.url.endsWith('segment-6.ts') &&
+      range.start === 4 &&
+      fetchCount(request.url) === 2
+    ) {
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          stalledBodyCanceled = true
+        },
+        start(controller) {
+          controller.enqueue(payload.slice(range.start, range.start + 2))
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
     return new Response(payload.slice(range.start, range.endExclusive).buffer, {
       headers: {
         age: '3',
@@ -179,6 +202,37 @@ try {
     throw new Error('Content-Range 不可见时应使用一次 HEAD 规划 3 个 Chunk')
   }
   hiddenContentRange.loader.destroy()
+
+  const rescueOwner = new ParallelSegmentLoader({
+    chunkSize: 4,
+    idleTimeoutMs: 50,
+    maxConcurrency: 2,
+    maxRescueAttempts: 1,
+  })
+  try {
+    const rescueFragment = createFragment(6)
+    const rescueContext = createContext(rescueFragment)
+    rescueOwner.replaceWindow('main:0', [createWindowDescriptor(rescueFragment)], config)
+    const rescued = startLoad(rescueOwner, rescueContext, config)
+    await waitForCondition(() => {
+      const segment = rescueOwner.getDiagnostics().streams[0]?.segments[0]
+      return segment?.chunks[1]?.state === 'filling' && segment.chunks[1].loadedBytes === 2
+    })
+    assertPayload(await rescued.promise, resources.get(rescueContext.url))
+    if (fetchCount(rescueContext.url) !== 3) {
+      throw new Error('无数据的 Fetch body 应取消并重新领取同一个 Chunk')
+    }
+    if (!stalledBodyCanceled) {
+      throw new Error('Chunk 空闲超时后应取消原 Fetch body')
+    }
+    const rescuedSegment = rescueOwner.getDiagnostics().streams[0]?.segments[0]
+    if (rescuedSegment?.chunks[1]?.attempt !== 2 || rescuedSegment.loadedBytes !== 8) {
+      throw new Error('Chunk 补救完成后诊断状态错误')
+    }
+    rescued.loader.destroy()
+  } finally {
+    rescueOwner.destroy()
+  }
 } finally {
   owner.destroy()
   globalThis.fetch = originalFetch
@@ -293,4 +347,14 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
 
 function fetchCount(url: string): number {
   return fetchCounts.get(url) ?? 0
+}
+
+async function waitForCondition(predicate: () => boolean): Promise<void> {
+  const deadline = performance.now() + 1_000
+  while (!predicate()) {
+    if (performance.now() >= deadline) {
+      throw new Error('等待测试状态超时')
+    }
+    await new Promise(resolve => globalThis.setTimeout(resolve, 1))
+  }
 }

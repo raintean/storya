@@ -20,7 +20,7 @@
 - 让多个 Segment 同时进入 transmux 或 SourceBuffer。
 - LL-HLS Part 的向前预加载窗口。Part 的正式 fLoader 请求仍然可以按 Chunk 加载。
 - alternate audio 和 subtitle 的向前预加载窗口。数据模型支持多轨道, 当前只有 main Controller 维护窗口。
-- 慢速连接识别、吞吐补救和网络重试策略。相关能力在基础 Chunk 调度稳定后再加入。
+- 基于历史吞吐基线识别“持续有数据但明显过慢”的连接。当前只处理响应头超时、连续无数据超时和完整请求超时。
 
 ## 总体结构
 
@@ -42,7 +42,7 @@ ParallelSegmentLoader
   |
   +-- streams: Map<StreamId, VirtualStream>
   +-- revision + listeners
-  +-- logical workers
+  +-- workers: ChunkFillWorker[]
   +-- HttpTransport
   +-- fLoader 构造器
   +-- getDiagnostics()
@@ -102,7 +102,19 @@ Controller 在以下情况不建立完整 Segment 预加载窗口:
 - revision/listener 状态通知。
 - 同步诊断快照。
 
-它不把这些职责拆成独立运行时组件。Worker 是类内部启动的异步函数, Chunk 选择是同步私有方法。
+共享状态所有权、Chunk 选择和所有原子状态变更仍然集中在 Loader。异步网络执行拆到内部 `ChunkFillWorker`, 不再堆叠在 Loader 文件中。
+
+### ChunkFillWorker
+
+`ChunkFillWorker` 位于独立的 `chunk-fill-worker.ts`, 是包内部实现类, 不从 `storya-hls-loader` 入口导出。它负责:
+
+- Worker 启动、停止和当前 attempt 生命周期。
+- 调用共享 `HttpTransport`。
+- 流式读取 response body 和上报已接收字节。
+- 响应头、流量空闲和完整请求超时。
+- 根据全局 revision 取消失效或被抢占的 attempt。
+
+Worker 不持有也不能直接访问 `streams`、`segments` 或 `window`。Loader 为所有 Worker 共享一个窄的内部 host adapter, 只提供领取 Chunk、检查 `fillId`、订阅 revision、提交完成、释放、补救、失败和进度这些同步操作。这样异步代码可以独立维护, 共享状态 authority 仍然只有 Loader。
 
 ## 多 VirtualStream
 
@@ -137,9 +149,10 @@ Chunk 保存:
 - Segment 内本地 `[start, endExclusive)` 范围。
 - `empty`、`filling`、`ready` 或 `failed` 状态。
 - 当前 `fillId`、attempt 数量和失败描述。
-- 完成前的 Uint8Array 数据。
+- `filling` 期间已经收到的字节数, 用于进度诊断和空闲超时判断。
+- Chunk 完整后、Segment 拼装前暂存的 Uint8Array 数据。
 
-Chunk 不保存 AbortController。AbortController 始终属于正在执行 Fetch 的 Worker 局部状态。
+Chunk 不保存 AbortController。AbortController 始终属于正在执行 Fetch 的 Worker 局部状态。响应 body 的分片数据也先保存在 Worker attempt 局部, 完整 Chunk 验证成功后才一次性提交到共享状态; 共享 Chunk 只实时记录 `loadedBytes`。
 
 ## Chunk 规划
 
@@ -184,7 +197,7 @@ discovery 请求本身始终贡献 Chunk 0 数据。HEAD 只在 Range 响应是 
 
 ## Transport
 
-`ParallelSegmentLoader` 持有一个 `HttpTransport`。未提供时创建 `FetchHttpTransport`; 应用也可以传入 `ProxyHttpTransport` 或 `WebSocketHttpTransport`。Loader 只依赖标准 `Request`、response status/header/body 和 AbortSignal, Transport 不理解 Segment、窗口或 Chunk 优先级。
+`ParallelSegmentLoader` 持有一个 `HttpTransport`。未提供时创建 `FetchHttpTransport`; 应用也可以传入 `ProxyHttpTransport` 或 `WebSocketHttpTransport`。Loader 把同一个 Transport 借给其持有的所有 `ChunkFillWorker`, 但 Transport 生命周期仍由 Loader 管理。Worker 只依赖标准 `Request`、response status/header/body 和 AbortSignal, Transport 不理解 Segment、窗口、Chunk 优先级或补救次数。Worker 逐段读取 `ReadableStream`, 而不是用 `arrayBuffer()` 等待整个 Chunk。
 
 Proxy 为获得 CDN 缓存语义会把上游 `206` 包装成物理 `200`, `ProxyHttpTransport` 在返回 Loader 前恢复逻辑 status 和 `Content-Range`。因此浏览器 Network 面板可能显示 `200`, 而 Segment 诊断显示逻辑 `206`; 两者描述的是不同层级。
 
@@ -192,7 +205,7 @@ Loader 拥有传入的 Transport 生命周期, `ParallelSegmentLoader.destroy()`
 
 ## Worker 调度
 
-`ParallelSegmentLoader` 构造时立即启动固定数量的逻辑 Worker。逻辑 Worker 是同一 JavaScript realm 中的异步循环, 不是浏览器 Web Worker。
+`ParallelSegmentLoader` 构造时创建并启动固定数量的 `ChunkFillWorker`。它们是同一 JavaScript realm 中的逻辑 Worker, 不是浏览器 Web Worker。
 
 ```text
 while not destroyed
@@ -243,6 +256,10 @@ listener 不携带 Segment、Chunk 或结果数据, 只表达“共享状态可�
 3. response 返回后重新按 stream/segment/chunk key 查找状态, 只有 `fillId` 仍匹配才提交。
 
 窗口变化、取消或重新分配会使旧 `fillId` 失效。迟到的 Fetch 结果无法覆盖新状态。
+
+body 流每返回一段数据, `ChunkFillWorker` 通过 host adapter 同步更新当前 `fillId` 对应 Chunk 的 `loadedBytes`, 然后继续 `await reader.read()`。连续 5 秒没有收到数据会中止当前 attempt。响应头等待和完整请求时间继续遵循 hls.js `fragLoadPolicy` 的 `maxTimeToFirstByteMs` 与 `maxLoadTimeMs`。
+
+空闲或超时 attempt 会丢弃局部的未完成 body, 释放 Chunk 并立即重新参与全局选择。默认最多补救 2 次, 即同一个 Chunk 最多执行 3 个 attempt。补救仍然重新走普通优先级选择, 不占用额外 Worker, 也不保存 callback。超过次数后 Segment 才进入失败状态。
 
 同一 JavaScript realm 的同步代码具有 run-to-completion 语义, 因此不需要 mutex。若未来把 Worker 迁移到真正的 Web Worker, 必须改成单一状态 authority 加消息协议, 不能直接共享本设计中的 Map。
 
@@ -307,7 +324,7 @@ Worker Fill 不构成独立存活依据。
 - 没有 reader 的预加载 Chunk 失败: Segment 标记失败并停止继续填充, 不无限重试。
 - 后续 fLoader 正式读取失败的预加载 Segment: 清除失败 Chunk 并重新排队缺失部分。
 - 有 reader 时请求失败: fLoader 收到 `onError`, 由 hls.js 原生重试状态机决定是否重新调用。
-- timeout: 每个 fLoader 保持自己的完整加载 timeout; Worker request 同时遵循 hls.js 默认最大加载时间。
+- timeout: 每个 fLoader 保持自己的完整加载 timeout; Worker request 同时遵循 hls.js 响应头和最大加载时间。连续 5 秒没有 body 数据时取消 attempt, 默认补救 2 次后才把 Segment 标记失败。
 - abort: 只结束当前 fLoader 读取。Segment 仍在 window 中时 Worker 继续填充。
 
 ## 诊断
@@ -319,7 +336,7 @@ Worker Fill 不构成独立存活依据。
 - 每个 Worker 的 idle/loading/stopped 状态和当前 Range。
 - 每条 VirtualStream 的 window。
 - Segment 的位置、状态、windowIndex、readerCount、逻辑 HTTP status、sequential 标记和字节统计。
-- Chunk 的范围、状态、字节、fillId、attempt 和 failure。
+- Chunk 的范围、状态、实时已接收字节、fillId、attempt 和 failure。
 
 诊断不返回媒体 ArrayBuffer、Response、callback、listener、AbortController 或可变内部对象, 不修改 revision, 也不参与调度。example 通过定时轮询快照绘制时间线。
 
@@ -327,7 +344,7 @@ Worker Fill 不构成独立存活依据。
 
 `ParallelStreamController` 由 hls.js 创建和销毁。它在一个 Hls 实例内经历多次 start/stop/seek/level switch, `stopLoad()` 只清理窗口。
 
-`ParallelSegmentLoader` 由应用创建和销毁。一个实例只服务一个 Hls session, 构造时启动 Worker, `destroy()` 时取消 request、停止 Worker、销毁 Transport、唤醒 listener 并清空全部状态。销毁后不可复用。
+`ParallelSegmentLoader` 由应用创建和销毁。一个实例只服务一个 Hls session, 构造时创建并启动 `ChunkFillWorker`, `destroy()` 时先停止 Worker 和取消 request, 再销毁 Transport、唤醒 listener 并清空全部状态。销毁后不可复用。
 
 推荐顺序:
 
@@ -361,9 +378,11 @@ const hls = new Hls({
 const diagnostics = loader.getDiagnostics()
 ```
 
-公开运行组件只有两个类。包同时导出默认配置常量、Loader options 和诊断 TypeScript 类型。
+公开运行组件只有两个类。包同时导出默认配置常量、Loader options 和诊断 TypeScript 类型。`ParallelSegmentLoaderOptions` 可以调整 `chunkSize`、`maxConcurrency`、`idleTimeoutMs`、`maxRescueAttempts` 和 `transport`。
 
 ## 修改历史
 
+- 2026-08-08: 把异步填充循环、Transport 请求、流式读取和 attempt 超时从 Loader 拆到内部 `ChunkFillWorker`; Worker 使用 host adapter 调用 Loader 的同步原子操作, 不直接访问共享 Map, 公开 API 不变。
+- 2026-08-08: Worker 改为流式读取 Transport body, 实时记录 Chunk 已接收字节; 增加响应头、连续无数据和完整请求三层超时, 停滞 attempt 默认就地补救 2 次。
 - 2026-08-08: 完成新并行模型设计与实现。Controller 只维护有序窗口; Loader 直接持有多 VirtualStream、Segment、Chunk、revision/listeners、逻辑 Worker、fLoader、Transport 和诊断; Chunk 从第一版即为调度单位; 明确同步 transaction、fillId 一致性和窗口/reader 驱离规则; 对 CORS 隐藏 Content-Range 增加保留 discovery Chunk 的 HEAD 长度发现。
 - 2026-08-07: 删除旧 VirtualStreamRegistry、StreamFiller、frontier 和相关诊断, 验证 hls.js 自定义 StreamController 与 fLoader 替换入口。

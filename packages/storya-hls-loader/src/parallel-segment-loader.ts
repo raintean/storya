@@ -5,12 +5,15 @@ import type {
   HlsConfig,
   LoaderStats,
 } from 'hls.js'
-import {
-  FetchHttpTransport,
-  type HttpTransport,
-  type HttpTransportResponse,
-} from 'storya-transport'
+import { FetchHttpTransport, type HttpTransport } from 'storya-transport'
 import { splitByteRanges } from './byte-ranges'
+import {
+  ChunkFillWorker,
+  ChunkRequestFailure,
+  type ChunkFillResult,
+  type ChunkFillWork,
+  type ChunkFillWorkerHost,
+} from './chunk-fill-worker'
 import type {
   ChunkDiagnostics,
   DiagnosticChunkState,
@@ -18,7 +21,6 @@ import type {
   ParallelSegmentLoaderDiagnostics,
   SegmentDiagnostics,
   VirtualStreamDiagnostics,
-  WorkerDiagnostics,
 } from './diagnostics'
 import {
   createStoryaFragmentLoader,
@@ -34,7 +36,9 @@ export const DEFAULT_WINDOW_SIZE = 6
 
 export interface ParallelSegmentLoaderOptions {
   chunkSize?: number
+  idleTimeoutMs?: number
   maxConcurrency?: number
+  maxRescueAttempts?: number
   transport?: HttpTransport
 }
 
@@ -88,40 +92,14 @@ interface VirtualStreamChunk {
   key: string
   loadedBytes: number
   rangeEnabled: boolean
+  rescueAttempts: number
   start: number
   state: ChunkState
 }
 
-interface ChunkWork {
-  chunkKey: string
-  context: FragmentLoaderContext
-  fillId: number
-  rangeEnabled: boolean
-  requestEnd: number | undefined
-  requestStart: number
-  resourceLength: number | undefined
-  segmentKey: string
-  streamId: string
-}
-
-interface WorkerRuntime {
-  active: ChunkWork | undefined
-  controller: AbortController
-  done: Promise<void>
-  id: number
-  requestController: AbortController | undefined
-  startedAt: number | undefined
-  state: 'idle' | 'loading' | 'stopped'
-}
-
-interface ChunkFetchResult {
-  data: Uint8Array
-  firstByteAt: number
-  response: Response
-  url: string
-}
-
 const contentRangePattern = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i
+const defaultIdleTimeoutMs = 5_000
+const defaultMaxRescueAttempts = 2
 
 export class ParallelSegmentLoader implements FragmentLoaderOwner {
   private static readonly owners = new WeakMap<FragmentLoaderConstructor, ParallelSegmentLoader>()
@@ -131,39 +109,42 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
   private readonly chunkSize: number
   private config: HlsConfig | undefined
   private destroyed = false
+  private readonly maxRescueAttempts: number
   private nextFillId = 0
   private notificationScheduled = false
   private readonly listeners = new Set<() => void>()
   private readonly maxConcurrency: number
   private readonly streams = new Map<string, VirtualStream>()
   private readonly transport: HttpTransport
-  private readonly workers: WorkerRuntime[]
+  private readonly workers: ChunkFillWorker[]
   revision = 0
 
   constructor(options: ParallelSegmentLoaderOptions = {}) {
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
+    const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
     this.maxConcurrency = options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY
+    this.maxRescueAttempts = options.maxRescueAttempts ?? defaultMaxRescueAttempts
     requirePositiveInteger(this.chunkSize, 'chunkSize')
+    requirePositiveInteger(idleTimeoutMs, 'idleTimeoutMs')
     requirePositiveInteger(this.maxConcurrency, 'maxConcurrency')
+    requireNonNegativeInteger(this.maxRescueAttempts, 'maxRescueAttempts')
     this.transport = options.transport ?? new FetchHttpTransport()
 
     this.fLoader = createStoryaFragmentLoader(this)
     ParallelSegmentLoader.owners.set(this.fLoader, this)
-    this.workers = Array.from({ length: this.maxConcurrency }, (_, index) => {
-      const controller = new AbortController()
-      return {
-        active: undefined,
-        controller,
-        done: Promise.resolve(),
-        id: index + 1,
-        requestController: undefined,
-        startedAt: undefined,
-        state: 'idle',
-      }
-    })
-    for (const runtime of this.workers) {
-      runtime.done = this.runWorker(runtime)
-      void runtime.done.catch(() => undefined)
+    const workerHost = this.createChunkFillWorkerHost()
+    this.workers = Array.from(
+      { length: this.maxConcurrency },
+      (_, index) =>
+        new ChunkFillWorker({
+          host: workerHost,
+          id: index + 1,
+          idleTimeoutMs,
+          transport: this.transport,
+        }),
+    )
+    for (const worker of this.workers) {
+      worker.start()
     }
   }
 
@@ -238,6 +219,7 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
       for (const chunk of segment.chunks) {
         if (chunk.state === 'failed') {
           chunk.failure = undefined
+          chunk.rescueAttempts = 0
           chunk.state = 'empty'
         }
       }
@@ -322,7 +304,7 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
 
   getDiagnostics(): ParallelSegmentLoaderDiagnostics {
     return {
-      activeRequests: this.workers.filter(worker => worker.state === 'loading').length,
+      activeRequests: this.workers.filter(worker => worker.loading).length,
       destroyed: this.destroyed,
       maxConcurrency: this.maxConcurrency,
       revision: this.revision,
@@ -330,7 +312,7 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
         .sort((left, right) => left.id.localeCompare(right.id))
         .map(stream => this.createStreamDiagnostics(stream)),
       timestamp: Date.now(),
-      workers: this.workers.map(worker => this.createWorkerDiagnostics(worker)),
+      workers: this.workers.map(worker => worker.getDiagnostics()),
     }
   }
 
@@ -341,41 +323,34 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
     this.destroyed = true
     ParallelSegmentLoader.owners.delete(this.fLoader)
     for (const worker of this.workers) {
-      worker.controller.abort()
-      worker.requestController?.abort()
-      worker.state = 'stopped'
+      worker.destroy()
     }
     this.streams.clear()
     this.transport.destroy()
     this.markChanged()
   }
 
-  private async runWorker(runtime: WorkerRuntime): Promise<void> {
-    while (!this.destroyed && !runtime.controller.signal.aborted) {
-      const revision = this.revision
-      const work = this.takeNextChunk()
-      if (work === undefined) {
-        runtime.state = 'idle'
-        try {
-          await this.waitForChange(revision, runtime.controller.signal)
-        } catch {
-          break
-        }
-        continue
-      }
-
-      runtime.active = work
-      runtime.startedAt = performance.now()
-      runtime.state = 'loading'
-      await this.fillChunk(runtime, work)
-      runtime.active = undefined
-      runtime.requestController = undefined
-      runtime.startedAt = undefined
+  private createChunkFillWorkerHost(): ChunkFillWorkerHost {
+    return {
+      completeChunk: (work, result) => this.completeChunk(work, result),
+      failChunk: (work, cause) => this.failChunk(work, cause),
+      getConfig: () => this.config,
+      getRevision: () => this.revision,
+      isFillCurrent: work => this.isFillCurrent(work),
+      releaseChunk: (work, preempted) => this.releaseChunk(work, preempted),
+      rescueChunk: (work, reason) => this.rescueChunk(work, reason),
+      shouldPreempt: workerId => this.shouldPreempt(workerId),
+      subscribe: listener => {
+        this.listeners.add(listener)
+        return () => this.listeners.delete(listener)
+      },
+      takeNextChunk: () => this.takeNextChunk(),
+      updateChunkProgress: (work, loadedBytes) => this.updateChunkProgress(work, loadedBytes),
+      waitForChange: (afterRevision, signal) => this.waitForChange(afterRevision, signal),
     }
-    runtime.state = 'stopped'
   }
 
-  private takeNextChunk(): ChunkWork | undefined {
+  private takeNextChunk(): ChunkFillWork | undefined {
     const candidate = this.selectBestChunk()
     if (candidate === undefined) {
       return undefined
@@ -414,189 +389,7 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
     }
   }
 
-  private async fillChunk(runtime: WorkerRuntime, work: ChunkWork): Promise<void> {
-    const requestController = new AbortController()
-    runtime.requestController = requestController
-    let preempted = false
-    const onWorkerAbort = () => requestController.abort(runtime.controller.signal.reason)
-    const onChange = () => {
-      if (!this.isFillCurrent(work)) {
-        requestController.abort()
-        return
-      }
-      if (this.shouldPreempt(runtime)) {
-        preempted = true
-        requestController.abort()
-      }
-    }
-    runtime.controller.signal.addEventListener('abort', onWorkerAbort, { once: true })
-    this.listeners.add(onChange)
-
-    try {
-      const result = await this.fetchChunk(work, requestController)
-      this.completeChunk(work, result)
-    } catch (cause) {
-      if (requestController.signal.aborted) {
-        if (isTimeoutAbort(requestController.signal.reason)) {
-          this.failChunk(work, createFailure('Chunk 请求超时'))
-        } else {
-          this.releaseChunk(work, preempted)
-        }
-      } else {
-        this.failChunk(work, toFailure(cause))
-      }
-    } finally {
-      runtime.controller.signal.removeEventListener('abort', onWorkerAbort)
-      this.listeners.delete(onChange)
-    }
-  }
-
-  private async fetchChunk(
-    work: ChunkWork,
-    controller: AbortController,
-  ): Promise<ChunkFetchResult> {
-    const config = this.config
-    if (config === undefined) {
-      throw new Error('ParallelSegmentLoader 尚未取得 hls.js 配置')
-    }
-    const headers = new Headers(work.context.headers)
-    if (work.rangeEnabled && work.requestEnd !== undefined) {
-      headers.set('range', `bytes=${work.requestStart}-${work.requestEnd - 1}`)
-    } else {
-      headers.delete('range')
-    }
-    const requestContext: FragmentLoaderContext = {
-      ...work.context,
-      headers: Object.fromEntries(headers.entries()),
-      rangeEnd: work.rangeEnabled ? (work.requestEnd ?? 0) : 0,
-      rangeStart: work.rangeEnabled ? work.requestStart : 0,
-    }
-    const init: RequestInit = {
-      credentials: 'same-origin',
-      headers,
-      method: 'GET',
-      mode: 'cors',
-      signal: controller.signal,
-    }
-    const request =
-      (await config.fetchSetup?.(requestContext, init)) ?? new Request(work.context.url, init)
-    if (!this.isFillCurrent(work)) {
-      throw new DOMException('Chunk Fill 已经失效', 'AbortError')
-    }
-
-    const timeoutMs = config.fragLoadPolicy.default.maxLoadTimeMs
-    const timer =
-      Number.isFinite(timeoutMs) && timeoutMs > 0
-        ? globalThis.setTimeout(() => {
-            if (!controller.signal.aborted) {
-              controller.abort(new DOMException('Chunk 请求超时', 'TimeoutError'))
-            }
-          }, timeoutMs)
-        : undefined
-    try {
-      const transportResponse = await this.transport.request(request)
-      const firstByteAt = performance.now()
-      if (!transportResponse.ok) {
-        const response = createNetworkDetails(transportResponse)
-        throw new ChunkRequestFailure(
-          `HTTP ${transportResponse.status} ${transportResponse.statusText}`.trim(),
-          transportResponse.status,
-          response,
-        )
-      }
-      const data = new Uint8Array(await transportResponse.arrayBuffer())
-      const response = await this.createReadableRangeResponse(
-        work,
-        request,
-        transportResponse,
-        data.byteLength,
-        controller.signal,
-      )
-      return { data, firstByteAt, response, url: transportResponse.url }
-    } catch (cause) {
-      if (cause instanceof ChunkRequestFailure || controller.signal.aborted) {
-        throw cause
-      }
-      throw new ChunkRequestFailure(cause instanceof Error ? cause.message : 'Transport 请求失败')
-    } finally {
-      if (timer !== undefined) {
-        globalThis.clearTimeout(timer)
-      }
-    }
-  }
-
-  private async createReadableRangeResponse(
-    work: ChunkWork,
-    request: Request,
-    response: HttpTransportResponse,
-    receivedBytes: number,
-    signal: AbortSignal,
-  ): Promise<Response> {
-    if (
-      response.status !== 206 ||
-      response.headers.has('content-range') ||
-      !work.rangeEnabled ||
-      work.requestEnd === undefined
-    ) {
-      return createNetworkDetails(response)
-    }
-
-    const requestedBytes = work.requestEnd - work.requestStart
-    let resourceLength: number | undefined
-    if (receivedBytes < requestedBytes) {
-      resourceLength = work.requestStart + receivedBytes
-    } else if (work.resourceLength !== undefined) {
-      resourceLength = work.resourceLength
-    } else {
-      resourceLength = await this.discoverResourceLength(request, signal)
-    }
-    if (resourceLength === undefined || receivedBytes <= 0) {
-      return createNetworkDetails(response)
-    }
-
-    const endInclusive = work.requestStart + receivedBytes - 1
-    if (resourceLength <= endInclusive) {
-      resourceLength = endInclusive + 1
-    }
-    const headers = new Headers(response.headers)
-    headers.set('content-range', `bytes ${work.requestStart}-${endInclusive}/${resourceLength}`)
-    return new Response(null, {
-      headers,
-      status: response.status,
-      statusText: response.statusText,
-    })
-  }
-
-  private async discoverResourceLength(
-    request: Request,
-    signal: AbortSignal,
-  ): Promise<number | undefined> {
-    const headers = new Headers(request.headers)
-    headers.delete('range')
-    const headRequest = new Request(request.url, {
-      cache: request.cache,
-      credentials: request.credentials,
-      headers,
-      method: 'HEAD',
-      mode: request.mode,
-      redirect: request.redirect,
-      signal,
-    })
-    try {
-      const response = await this.transport.request(headRequest)
-      const contentLength = Number.parseInt(response.headers.get('content-length') ?? '', 10)
-      return response.ok && Number.isSafeInteger(contentLength) && contentLength > 0
-        ? contentLength
-        : undefined
-    } catch (cause) {
-      if (signal.aborted) {
-        throw cause
-      }
-      return undefined
-    }
-  }
-
-  private completeChunk(work: ChunkWork, result: ChunkFetchResult): void {
+  private completeChunk(work: ChunkFillWork, result: ChunkFillResult): void {
     const located = this.locateChunk(work)
     if (located === undefined) {
       return
@@ -719,22 +512,48 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
     this.markChanged()
   }
 
-  private failChunk(work: ChunkWork, failure: SegmentLoadFailure): void {
+  private failChunk(work: ChunkFillWork, cause: unknown): void {
     const located = this.locateChunk(work)
     if (located === undefined) {
       return
     }
-    this.setSegmentFailure(located.segment, failure)
+    this.setSegmentFailure(located.segment, toFailure(cause))
     this.markChanged()
   }
 
-  private releaseChunk(work: ChunkWork, preempted: boolean): void {
+  private rescueChunk(work: ChunkFillWork, reason: string): void {
+    const located = this.locateChunk(work)
+    if (located === undefined) {
+      return
+    }
+    const { chunk, segment } = located
+    if (chunk.rescueAttempts >= this.maxRescueAttempts) {
+      this.setSegmentFailure(segment, createFailure(reason))
+      this.markChanged()
+      return
+    }
+
+    chunk.failure = reason
+    chunk.fillId = undefined
+    chunk.loadedBytes = 0
+    chunk.rescueAttempts += 1
+    chunk.state = 'empty'
+    segment.stats.retry += 1
+    segment.state = segment.chunks.some(candidate => candidate.state === 'filling')
+      ? 'filling'
+      : 'empty'
+    this.updateSegmentStats(segment)
+    this.markChanged()
+  }
+
+  private releaseChunk(work: ChunkFillWork, preempted: boolean): void {
     const located = this.locateChunk(work)
     if (located === undefined) {
       return
     }
     const { chunk, segment } = located
     chunk.fillId = undefined
+    chunk.loadedBytes = 0
     chunk.state = 'empty'
     segment.state = segment.chunks.some(candidate => candidate.state === 'filling')
       ? 'filling'
@@ -744,6 +563,16 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
       stream?.segments.delete(segment.key)
       this.deleteEmptyStream(segment.streamId)
     }
+    this.markChanged()
+  }
+
+  private updateChunkProgress(work: ChunkFillWork, loadedBytes: number): void {
+    const located = this.locateChunk(work)
+    if (located === undefined || located.chunk.loadedBytes === loadedBytes) {
+      return
+    }
+    located.chunk.loadedBytes = loadedBytes
+    this.updateSegmentStats(located.segment)
     this.markChanged()
   }
 
@@ -851,19 +680,20 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
     return candidates[0]
   }
 
-  private shouldPreempt(runtime: WorkerRuntime): boolean {
+  private shouldPreempt(workerId: number): boolean {
     const urgent = this.selectBestChunk()
     if (urgent === undefined || urgent.segment.readerCount === 0) {
       return false
     }
-    const active = runtime.active === undefined ? undefined : this.locateChunk(runtime.active)
+    const activeWork = this.workers.find(worker => worker.id === workerId)?.activeWork
+    const active = activeWork === undefined ? undefined : this.locateChunk(activeWork)
     if (active === undefined || active.segment.readerCount > 0) {
       return false
     }
 
     const victims = this.workers
       .map(worker => ({
-        located: worker.active === undefined ? undefined : this.locateChunk(worker.active),
+        located: worker.activeWork === undefined ? undefined : this.locateChunk(worker.activeWork),
         worker,
       }))
       .filter(
@@ -871,20 +701,20 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
           entry,
         ): entry is {
           located: { chunk: VirtualStreamChunk; segment: VirtualStreamSegment }
-          worker: WorkerRuntime
+          worker: ChunkFillWorker
         } => entry.located !== undefined && entry.located.segment.readerCount === 0,
       )
       .sort((left, right) => compareChunkCandidates(right.located, left.located))
     const victim = victims[0]
-    return victim?.worker === runtime && compareChunkCandidates(urgent, active) < 0
+    return victim?.worker.id === workerId && compareChunkCandidates(urgent, active) < 0
   }
 
-  private isFillCurrent(work: ChunkWork): boolean {
+  private isFillCurrent(work: ChunkFillWork): boolean {
     return this.locateChunk(work) !== undefined
   }
 
   private locateChunk(
-    work: Pick<ChunkWork, 'chunkKey' | 'fillId' | 'segmentKey' | 'streamId'>,
+    work: Pick<ChunkFillWork, 'chunkKey' | 'fillId' | 'segmentKey' | 'streamId'>,
   ): { chunk: VirtualStreamChunk; segment: VirtualStreamSegment } | undefined {
     const segment = this.streams.get(work.streamId)?.segments.get(work.segmentKey)
     const chunk = segment?.chunks.find(candidate => candidate.key === work.chunkKey)
@@ -974,6 +804,7 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
       key: `${segment.key}\nchunk:${start}`,
       loadedBytes: 0,
       rangeEnabled,
+      rescueAttempts: 0,
       start,
       state: 'empty',
     }
@@ -1083,31 +914,6 @@ export class ParallelSegmentLoader implements FragmentLoaderOwner {
       start: chunk.start,
       state: chunk.state as DiagnosticChunkState,
     }
-  }
-
-  private createWorkerDiagnostics(worker: WorkerRuntime): WorkerDiagnostics {
-    return {
-      chunkKey: worker.active?.chunkKey,
-      id: worker.id,
-      requestEnd: worker.active?.requestEnd,
-      requestStart: worker.active?.requestStart,
-      segmentKey: worker.active?.segmentKey,
-      startedAt: worker.startedAt,
-      state: worker.state,
-      streamId: worker.active?.streamId,
-    }
-  }
-}
-
-class ChunkRequestFailure extends Error {
-  readonly code: number
-  readonly response: Response | null
-
-  constructor(message: string, code = 0, response: Response | null = null) {
-    super(message)
-    this.name = 'ChunkRequestFailure'
-    this.code = code
-    this.response = response
   }
 }
 
@@ -1223,14 +1029,8 @@ function requirePositiveInteger(value: number, name: string): void {
   }
 }
 
-function isTimeoutAbort(reason: unknown): boolean {
-  return reason instanceof DOMException && reason.name === 'TimeoutError'
-}
-
-function createNetworkDetails(response: HttpTransportResponse): Response {
-  return new Response(null, {
-    headers: response.headers,
-    status: response.status,
-    statusText: response.statusText,
-  })
+function requireNonNegativeInteger(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} 必须是非负整数`)
+  }
 }
