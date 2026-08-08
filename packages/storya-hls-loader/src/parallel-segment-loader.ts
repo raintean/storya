@@ -1,6 +1,6 @@
 import type { FragmentLoaderConstructor, HlsConfig } from 'hls.js'
 import { FetchHttpTransport, type HttpTransport } from 'storya-transport'
-import { ChunkFillWorker } from './chunk-fill-worker'
+import { SegmentLoadWorker } from './segment-load-worker'
 import {
   createParallelSegmentLoaderDiagnostics,
   type ParallelSegmentLoaderDiagnostics,
@@ -13,7 +13,7 @@ export const DEFAULT_MAX_CONCURRENCY = 6
 export const DEFAULT_WINDOW_SIZE = 6
 
 const defaultIdleTimeoutMs = 5_000
-const defaultMaxRescueAttempts = 2
+const defaultMaxRescueAttempts = 1
 
 export interface ParallelSegmentLoaderOptions {
   chunkSize?: number
@@ -21,6 +21,7 @@ export interface ParallelSegmentLoaderOptions {
   maxConcurrency?: number
   maxRescueAttempts?: number
   transport?: HttpTransport
+  windowSize?: number
 }
 
 export class ParallelSegmentLoader {
@@ -32,23 +33,26 @@ export class ParallelSegmentLoader {
   readonly maxConcurrency: number
   readonly maxRescueAttempts: number
   readonly state: ParallelSegmentLoaderState
+  readonly windowSize: number
 
   private config: HlsConfig | undefined
   private readonly listeners = new Set<() => void>()
   private notificationScheduled = false
   private readonly transport: HttpTransport
   private updating = false
-  private readonly workers: ChunkFillWorker[]
+  private readonly workers: SegmentLoadWorker[]
 
   constructor(options: ParallelSegmentLoaderOptions = {}) {
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
     this.idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
     this.maxConcurrency = options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY
     this.maxRescueAttempts = options.maxRescueAttempts ?? defaultMaxRescueAttempts
+    this.windowSize = options.windowSize ?? DEFAULT_WINDOW_SIZE
     requirePositiveInteger(this.chunkSize, 'chunkSize')
     requirePositiveInteger(this.idleTimeoutMs, 'idleTimeoutMs')
     requirePositiveInteger(this.maxConcurrency, 'maxConcurrency')
     requireNonNegativeInteger(this.maxRescueAttempts, 'maxRescueAttempts')
+    requirePositiveInteger(this.windowSize, 'windowSize')
 
     this.state = new ParallelSegmentLoaderState()
     this.transport = options.transport ?? new FetchHttpTransport()
@@ -58,7 +62,7 @@ export class ParallelSegmentLoader {
     this.workers = Array.from(
       { length: this.maxConcurrency },
       (_, index) =>
-        new ChunkFillWorker({
+        new SegmentLoadWorker({
           id: index + 1,
           loader: this,
           transport: this.transport,

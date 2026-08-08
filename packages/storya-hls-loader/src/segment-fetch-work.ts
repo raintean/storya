@@ -5,55 +5,63 @@ import type { ParallelSegmentLoaderState } from './parallel-segment-loader-state
 import type { VirtualStreamChunk } from './virtual-stream-chunk'
 import type { SegmentLoadFailure, VirtualStreamSegment } from './virtual-stream-segment'
 
-export interface ChunkFillWorkOptions {
+export interface SegmentFetchWorkOptions {
   chunkKey: string
   context: FragmentLoaderContext
   generation: number
   loader: ParallelSegmentLoader
+  planning: boolean
   rangeEnabled: boolean
   requestEnd: number | undefined
   requestStart: number
   resourceLength: number | undefined
   segmentKey: string
+  slowRescueEnabled: boolean
   startedAt: number
   streamId: string
   transport: HttpTransport
 }
 
-interface ChunkFillResult {
+interface SegmentFetchResult {
   data: Uint8Array
   firstByteAt: number
   response: Response
   url: string
 }
 
-export class ChunkFillWork {
+export class SegmentFetchWork {
   readonly chunkKey: string
   readonly generation: number
+  readonly method = 'GET'
   readonly requestEnd: number | undefined
   readonly requestStart: number
   readonly segmentKey: string
   readonly startedAt: number
   readonly streamId: string
+  readonly task = 'chunk'
 
   private readonly context: FragmentLoaderContext
   private readonly controller = new AbortController()
   private readonly loader: ParallelSegmentLoader
+  private readonly planning: boolean
   private readonly rangeEnabled: boolean
   private readonly resourceLength: number | undefined
+  private readonly slowRescueEnabled: boolean
   private started = false
   private readonly transport: HttpTransport
 
-  constructor(options: ChunkFillWorkOptions) {
+  constructor(options: SegmentFetchWorkOptions) {
     this.chunkKey = options.chunkKey
     this.context = options.context
     this.generation = options.generation
     this.loader = options.loader
+    this.planning = options.planning
     this.rangeEnabled = options.rangeEnabled
     this.requestEnd = options.requestEnd
     this.requestStart = options.requestStart
     this.resourceLength = options.resourceLength
     this.segmentKey = options.segmentKey
+    this.slowRescueEnabled = options.slowRescueEnabled
     this.startedAt = options.startedAt
     this.streamId = options.streamId
     this.transport = options.transport
@@ -61,7 +69,7 @@ export class ChunkFillWork {
 
   async run(): Promise<void> {
     if (this.started) {
-      throw new Error('ChunkFillWork 只能执行一次')
+      throw new Error('SegmentFetchWork 只能执行一次')
     }
     this.started = true
     try {
@@ -82,7 +90,7 @@ export class ChunkFillWork {
     return this.locateChunk(this.loader.state) !== undefined
   }
 
-  private async fetchChunk(): Promise<ChunkFillResult> {
+  private async fetchChunk(): Promise<SegmentFetchResult> {
     const config = this.loader.hlsConfig
     if (config === undefined) {
       throw new Error('ParallelSegmentLoader 尚未取得 hls.js 配置')
@@ -144,6 +152,11 @@ export class ChunkFillWork {
           response,
         )
       }
+      this.prepareResponseHeaders(createNetworkDetails(transportResponse), firstByteAt)
+      if (!this.isCurrent()) {
+        await transportResponse.body?.cancel('Chunk response headers 校验失败')
+        throw new ChunkRequestFailure('Chunk response headers 校验失败')
+      }
       const data = await this.readResponseBody(transportResponse)
       const response = await this.createReadableRangeResponse(
         request,
@@ -171,6 +184,9 @@ export class ChunkFillWork {
     let receivedBytes = 0
     let idleTimer: ReturnType<typeof globalThis.setTimeout> | undefined
     const resetIdleTimer = () => {
+      if (!this.slowRescueEnabled) {
+        return
+      }
       if (idleTimer !== undefined) {
         globalThis.clearTimeout(idleTimer)
       }
@@ -179,7 +195,7 @@ export class ChunkFillWork {
           this.controller.abort(
             new DOMException(
               `Chunk 连续 ${this.loader.idleTimeoutMs}ms 没有收到数据`,
-              'TimeoutError',
+              'RescueError',
             ),
           )
         }
@@ -251,23 +267,19 @@ export class ChunkFillWork {
       return createNetworkDetails(response)
     }
 
-    const requestedBytes = this.requestEnd - this.requestStart
-    let resourceLength: number | undefined
-    if (receivedBytes < requestedBytes) {
-      resourceLength = this.requestStart + receivedBytes
-    } else if (this.resourceLength !== undefined) {
-      resourceLength = this.resourceLength
-    } else {
-      resourceLength = await this.discoverResourceLength(request)
-    }
+    const resourceLength =
+      this.resourceLength === undefined
+        ? await this.discoverResourceLength(request)
+        : this.resourceLength
     if (resourceLength === undefined || receivedBytes <= 0) {
       return createNetworkDetails(response)
     }
 
-    const endInclusive = this.requestStart + receivedBytes - 1
-    if (resourceLength <= endInclusive) {
-      resourceLength = endInclusive + 1
+    const expectedEnd = Math.min(this.requestEnd, resourceLength)
+    if (receivedBytes !== expectedEnd - this.requestStart) {
+      return createNetworkDetails(response)
     }
+    const endInclusive = expectedEnd - 1
     const headers = new Headers(response.headers)
     headers.set('content-range', `bytes ${this.requestStart}-${endInclusive}/${resourceLength}`)
     return new Response(null, {
@@ -313,7 +325,95 @@ export class ChunkFillWork {
     })
   }
 
-  private completeChunk(result: ChunkFillResult): void {
+  private prepareResponseHeaders(response: Response, firstByteAt: number): void {
+    if (response.status === 200) {
+      this.loader.update(state => {
+        const located = this.locateChunk(state)
+        if (located === undefined) {
+          return undefined
+        }
+        const { chunk, segment } = located
+        if (segment.declaredRange || (chunk.rangeEnabled && chunk.start !== 0)) {
+          segment.fail(
+            createFailure('服务器忽略了带边界的 Range 请求', response.status, response),
+            firstByteAt,
+          )
+          return undefined
+        }
+        segment.firstByteAt ??= firstByteAt
+        segment.useSequentialRange()
+        return undefined
+      })
+      return
+    }
+    if (response.status !== 206 || !this.rangeEnabled) {
+      return
+    }
+
+    let contentRange: ParsedContentRange | undefined
+    try {
+      contentRange = parseContentRange(response.headers.get('content-range'))
+    } catch (cause) {
+      this.loader.update(state => {
+        this.locateChunk(state)?.segment.fail(toFailure(cause), firstByteAt)
+        return undefined
+      })
+      return
+    }
+    if (contentRange === undefined) {
+      return
+    }
+
+    this.loader.update(state => {
+      const located = this.locateChunk(state)
+      if (located === undefined) {
+        return undefined
+      }
+      const { chunk, segment } = located
+      const expectedStart = segment.resourceStart + chunk.start
+      const expectedEnd =
+        this.requestEnd === undefined || contentRange.total === undefined || segment.declaredRange
+          ? this.requestEnd
+          : Math.min(this.requestEnd, contentRange.total)
+      if (
+        contentRange.start !== expectedStart ||
+        (expectedEnd !== undefined && contentRange.endExclusive !== expectedEnd)
+      ) {
+        segment.fail(createFailure('Content-Range 与请求范围不匹配', 206, response), firstByteAt)
+        return undefined
+      }
+
+      const discoveredLength =
+        segment.declaredRange || contentRange.total === undefined
+          ? segment.length
+          : contentRange.total - segment.resourceStart
+      const localEnd = contentRange.endExclusive - segment.resourceStart
+      if (discoveredLength === undefined || localEnd > discoveredLength) {
+        segment.fail(createFailure('Content-Range 缺少可用的资源长度', 206, response), firstByteAt)
+        return undefined
+      }
+
+      chunk.endExclusive = localEnd
+      if (this.planning && segment.isPlanningCurrent(this.generation)) {
+        segment.completePlanning(
+          discoveredLength,
+          'content-range',
+          this.loader.chunkSize,
+          this.generation,
+        )
+      } else if (segment.length !== discoveredLength) {
+        segment.fail(createFailure('Segment 长度在 Range 请求之间发生变化'), firstByteAt)
+        return undefined
+      }
+      const validator = response.headers.get('etag') ?? response.headers.get('last-modified')
+      segment.validator ??= validator
+      segment.firstByteAt ??= firstByteAt
+      segment.verifyRange()
+      return undefined
+    })
+  }
+
+  private completeChunk(result: SegmentFetchResult): void {
     if (this.loader.state.destroyed || !this.isCurrent()) {
       return
     }
@@ -348,8 +448,17 @@ export class ChunkFillWork {
           segment.fail(createFailure('服务器忽略了带边界的 Range 请求', 200, response), completedAt)
           return undefined
         }
-        segment.sequential = true
-        segment.length = result.data.byteLength
+        segment.useSequentialRange()
+        if (this.planning) {
+          segment.completePlanning(
+            result.data.byteLength,
+            'response',
+            this.loader.chunkSize,
+            this.generation,
+          )
+        } else {
+          segment.length = result.data.byteLength
+        }
         segment.chunks.splice(0, segment.chunks.length, chunk)
         chunk.endExclusive = result.data.byteLength
         chunk.rangeEnabled = false
@@ -380,7 +489,7 @@ export class ChunkFillWork {
         (segment.length === undefined && contentRange.total === undefined)
       ) {
         if (!segment.declaredRange && !segment.fallbackAttempted) {
-          segment.fallbackToSequential()
+          segment.fallbackToSequential('Range 响应缺少可用的 Content-Range')
         } else {
           segment.fail(createFailure('Range 响应缺少可用的 Content-Range'), completedAt)
         }
@@ -419,18 +528,35 @@ export class ChunkFillWork {
         return undefined
       }
 
-      if (segment.length === undefined && contentRange.total !== undefined) {
-        segment.length = contentRange.total - segment.resourceStart
-      }
       const localEnd = contentRange.endExclusive - segment.resourceStart
-      if (segment.length === undefined || localEnd > segment.length) {
+      const discoveredLength =
+        segment.declaredRange || contentRange.total === undefined
+          ? segment.length
+          : contentRange.total - segment.resourceStart
+      if (discoveredLength === undefined || localEnd > discoveredLength) {
         segment.fail(createFailure('Chunk 超出了 Segment 边界'), completedAt)
         return undefined
       }
 
       chunk.endExclusive = localEnd
+      if (this.planning && segment.isPlanningCurrent(this.generation)) {
+        if (
+          !segment.completePlanning(
+            discoveredLength,
+            'content-range',
+            this.loader.chunkSize,
+            this.generation,
+          )
+        ) {
+          segment.fail(createFailure('Segment 长度规划已经失效'), completedAt)
+          return undefined
+        }
+      } else if (segment.length !== discoveredLength) {
+        segment.fail(createFailure('Segment 长度在 Range 请求之间发生变化'), completedAt)
+        return undefined
+      }
+      segment.verifyRange()
       chunk.complete(this.generation, completion)
-      segment.planChunks(this.loader.chunkSize)
       if (
         !segment.assemble(completedAt) &&
         segment.chunks.every(item => item.phase.type === 'ready')
@@ -457,16 +583,19 @@ export class ChunkFillWork {
         segment.fail(toFailure(cause), completedAt)
         return undefined
       }
-      if (!isTimeoutAbort(this.controller.signal.reason)) {
+      if (!isRescueAbort(this.controller.signal.reason)) {
+        if (isTimeoutAbort(this.controller.signal.reason)) {
+          const reason = this.controller.signal.reason
+          segment.fail(
+            createFailure(reason instanceof Error ? reason.message : 'Chunk 请求超时'),
+            completedAt,
+          )
+          return undefined
+        }
         chunk.release(this.generation)
-        return undefined
-      }
-      if (chunk.rescueAttempts >= this.loader.maxRescueAttempts) {
-        const reason = this.controller.signal.reason
-        segment.fail(
-          createFailure(reason instanceof Error ? reason.message : 'Chunk 请求超时'),
-          completedAt,
-        )
+        if (this.planning) {
+          segment.releasePlanning(this.generation)
+        }
         return undefined
       }
 
@@ -475,6 +604,9 @@ export class ChunkFillWork {
         chunk.rescue(this.generation, reason instanceof Error ? reason.message : 'Chunk 请求超时')
       ) {
         segment.retryCount += 1
+        if (this.planning) {
+          segment.releasePlanning(this.generation, 'Chunk 慢速补救')
+        }
       }
       return undefined
     })
@@ -548,6 +680,10 @@ function toFailure(cause: unknown): SegmentLoadFailure {
     return createFailure(cause.message, cause.code, cause.response)
   }
   return createFailure(cause instanceof Error ? cause.message : '未知 Chunk 加载错误')
+}
+
+function isRescueAbort(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === 'RescueError'
 }
 
 function isTimeoutAbort(reason: unknown): boolean {

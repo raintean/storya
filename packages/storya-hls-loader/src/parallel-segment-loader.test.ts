@@ -17,10 +17,22 @@ const resources = new Map([
   ['https://example.com/segment-4.ts', new Uint8Array([30, 31, 32, 33, 34])],
   ['https://example.com/segment-5.ts', new Uint8Array([40, 41, 42, 43, 44, 45, 46, 47, 48, 49])],
   ['https://example.com/segment-6.ts', new Uint8Array([50, 51, 52, 53, 54, 55, 56, 57])],
+  ['https://example.com/segment-7.ts', new Uint8Array([60, 61, 62, 63, 64, 65])],
+  [
+    'https://example.com/segment-8.ts',
+    new Uint8Array([70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]),
+  ],
+  ['https://example.com/segment-9.ts', new Uint8Array([80, 81, 82, 83])],
+  ['https://example.com/segment-10.ts', new Uint8Array([90, 91, 92, 93, 94, 95, 96, 97])],
+  ['https://example.com/segment-11.ts', new Uint8Array([100, 101, 102, 103, 104, 105])],
+  ['https://example.com/segment-12.ts', new Uint8Array([110, 111, 112, 113, 114])],
 ])
 const fetchCounts = new Map<string, number>()
+const requestMethods = new Map<string, string[]>()
+const requestRanges = new Map<string, (string | null)[]>()
 let activeFetches = 0
 let maxActiveFetches = 0
+let prefetchBodyCanceled = false
 let stalledBodyCanceled = false
 
 globalThis.fetch = async input => {
@@ -31,6 +43,13 @@ globalThis.fetch = async input => {
   }
 
   fetchCounts.set(request.url, (fetchCounts.get(request.url) ?? 0) + 1)
+  requestMethods.set(request.url, [...(requestMethods.get(request.url) ?? []), request.method])
+  if (request.method === 'GET') {
+    requestRanges.set(request.url, [
+      ...(requestRanges.get(request.url) ?? []),
+      request.headers.get('range'),
+    ])
+  }
   activeFetches += 1
   maxActiveFetches = Math.max(maxActiveFetches, activeFetches)
   try {
@@ -41,6 +60,9 @@ globalThis.fetch = async input => {
         status: 200,
       })
     }
+    if (request.url.endsWith('segment-10.ts')) {
+      await abortableDelay(60, request.signal)
+    }
     if (request.url.endsWith('segment-3.ts') || request.url.endsWith('segment-4.ts')) {
       return new Response(payload.slice().buffer, {
         headers: { age: '3', etag: '"stable"' },
@@ -48,6 +70,53 @@ globalThis.fetch = async input => {
       })
     }
     const range = parseRange(request.headers.get('range'), payload.byteLength)
+    if (request.url.endsWith('segment-12.ts') && range.start === 0) {
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          if (timer !== undefined) {
+            globalThis.clearTimeout(timer)
+          }
+        },
+        start(controller) {
+          timer = globalThis.setTimeout(() => {
+            controller.enqueue(payload.slice(range.start, range.endExclusive))
+            controller.close()
+          }, 80)
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
+    if (request.url.endsWith('segment-9.ts')) {
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          prefetchBodyCanceled = true
+          if (timer !== undefined) {
+            globalThis.clearTimeout(timer)
+          }
+        },
+        start(controller) {
+          timer = globalThis.setTimeout(() => {
+            controller.enqueue(payload.slice(range.start, range.endExclusive))
+            controller.close()
+          }, 80)
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
     if (
       request.url.endsWith('segment-6.ts') &&
       range.start === 4 &&
@@ -59,6 +128,36 @@ globalThis.fetch = async input => {
         },
         start(controller) {
           controller.enqueue(payload.slice(range.start, range.start + 2))
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
+    if (
+      (request.url.endsWith('segment-6.ts') &&
+        range.start === 4 &&
+        fetchCount(request.url) === 3) ||
+      (request.url.endsWith('segment-7.ts') && range.start === 0)
+    ) {
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          if (timer !== undefined) {
+            globalThis.clearTimeout(timer)
+          }
+        },
+        start(controller) {
+          const middle = Math.min(range.start + 2, range.endExclusive)
+          controller.enqueue(payload.slice(range.start, middle))
+          timer = globalThis.setTimeout(() => {
+            controller.enqueue(payload.slice(middle, range.endExclusive))
+            controller.close()
+          }, 80)
         },
       })
       return new Response(body, {
@@ -92,6 +191,9 @@ const firstFragment = createFragment(1)
 const firstContext = createContext(firstFragment)
 
 try {
+  if (owner.maxRescueAttempts !== 1) {
+    throw new Error('默认应只允许一次慢速补救')
+  }
   replaceWindow(owner, [firstFragment], config)
   const first = startLoad(owner, firstContext, config)
   const second = startLoad(owner, firstContext, config)
@@ -170,7 +272,7 @@ try {
   const sequential = startLoad(owner, sequentialContext, config)
   assertPayload(await sequential.promise, resources.get(sequentialContext.url))
   if (fetchCount(sequentialContext.url) !== 1) {
-    throw new Error('Origin 忽略 discovery Range 时应复用 200 响应, 不重复完整 GET')
+    throw new Error('Origin 忽略首个 Range GET 时应复用 200 响应, 不重复完整 GET')
   }
   sequential.loader.destroy()
 
@@ -228,6 +330,110 @@ try {
     rescued.loader.destroy()
   } finally {
     rescueOwner.destroy()
+  }
+
+  const rescueDisabledOwner = new ParallelSegmentLoader({
+    chunkSize: 4,
+    idleTimeoutMs: 50,
+    maxConcurrency: 1,
+    maxRescueAttempts: 0,
+  })
+  try {
+    const rescueDisabledFragment = createFragment(7)
+    const rescueDisabledContext = createContext(rescueDisabledFragment)
+    const rescueDisabled = startLoad(rescueDisabledOwner, rescueDisabledContext, config)
+    assertPayload(await rescueDisabled.promise, resources.get(rescueDisabledContext.url))
+    if (fetchCount(rescueDisabledContext.url) !== 2) {
+      throw new Error('禁用 rescue 时不应因为 body idle 创建额外 Work')
+    }
+    rescueDisabled.loader.destroy()
+  } finally {
+    rescueDisabledOwner.destroy()
+  }
+
+  const nonPreemptiveOwner = new ParallelSegmentLoader({ chunkSize: 4, maxConcurrency: 2 })
+  try {
+    const readerFragment = createFragment(8)
+    const prefetchFragment = createFragment(9)
+    const readerContext = createContext(readerFragment)
+    replaceWindow(nonPreemptiveOwner, [readerFragment, prefetchFragment], config)
+    const reader = startLoad(nonPreemptiveOwner, readerContext, config)
+
+    assertPayload(await reader.promise, resources.get(readerContext.url))
+    await waitForCondition(() => {
+      const prefetch = nonPreemptiveOwner
+        .getDiagnostics()
+        .streams[0]?.segments.find(segment => segment.url === prefetchFragment.url)
+      return prefetch?.state === 'ready'
+    })
+    if (prefetchBodyCanceled || fetchCount(prefetchFragment.url) !== 2) {
+      throw new Error('已经发出的 Prefetch Work 不应被新规划的 Reader Chunk 抢占')
+    }
+    reader.loader.destroy()
+  } finally {
+    nonPreemptiveOwner.destroy()
+  }
+
+  const orderedPlanningOwner = new ParallelSegmentLoader({ chunkSize: 4, maxConcurrency: 2 })
+  try {
+    const leadingFragment = createFragment(10)
+    const followingFragment = createFragment(11)
+    replaceWindow(orderedPlanningOwner, [leadingFragment, followingFragment], config)
+    await waitForCondition(() => {
+      const following = orderedPlanningOwner
+        .getDiagnostics()
+        .streams[0]?.segments.find(segment => segment.url === followingFragment.url)
+      return following?.planningState === 'planned'
+    })
+    const followingWhileLeadingIsUnverified = orderedPlanningOwner
+      .getDiagnostics()
+      .streams[0]?.segments.find(segment => segment.url === followingFragment.url)
+    if (
+      followingWhileLeadingIsUnverified?.state !== 'queued' ||
+      requestMethods.get(followingFragment.url)?.join(',') !== 'HEAD'
+    ) {
+      throw new Error('后续 Segment 的 HEAD 可以提前完成, 但不能越过前序 Segment 发起 GET')
+    }
+
+    await waitForCondition(() =>
+      Boolean(
+        orderedPlanningOwner
+          .getDiagnostics()
+          .streams[0]?.segments.every(segment => segment.state === 'ready'),
+      ),
+    )
+    if (requestMethods.get(followingFragment.url)?.[0] !== 'HEAD') {
+      throw new Error('后续 Segment 必须先通过 HEAD 规划长度')
+    }
+  } finally {
+    orderedPlanningOwner.destroy()
+  }
+
+  const responseHeaderPlanningOwner = new ParallelSegmentLoader({
+    chunkSize: 4,
+    maxConcurrency: 2,
+  })
+  try {
+    const fragment = createFragment(12)
+    const context = createContext(fragment)
+    replaceWindow(responseHeaderPlanningOwner, [fragment], config)
+    const load = startLoad(responseHeaderPlanningOwner, context, config)
+    await waitForCondition(() => {
+      const segment = responseHeaderPlanningOwner.getDiagnostics().streams[0]?.segments[0]
+      return segment?.planningState === 'planned' && segment.chunks.length === 2
+    })
+    const plannedFromHeaders = responseHeaderPlanningOwner.getDiagnostics().streams[0]?.segments[0]
+    if (plannedFromHeaders?.rangeMode !== 'parallel' || plannedFromHeaders.totalBytes !== 5) {
+      throw new Error('首个 Range GET 收到响应头后应立即规划剩余 Chunk')
+    }
+
+    assertPayload(await load.promise, resources.get(context.url))
+    if (requestRanges.get(context.url)?.join(',') !== 'bytes=0-3,bytes=4-4') {
+      throw new Error('Segment 尾部必须规划成独立且边界准确的 Chunk')
+    }
+    load.loader.destroy()
+  } finally {
+    responseHeaderPlanningOwner.destroy()
   }
 } finally {
   owner.destroy()

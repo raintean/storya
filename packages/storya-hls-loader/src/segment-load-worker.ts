@@ -1,26 +1,28 @@
 import type { HttpTransport } from 'storya-transport'
 import type { WorkerDiagnostics } from './diagnostics'
 import type { ParallelSegmentLoader } from './parallel-segment-loader'
-import { ChunkFillWork, type ChunkFillWorkOptions } from './chunk-fill-work'
+import { SegmentFetchWork, type SegmentFetchWorkOptions } from './segment-fetch-work'
+import { SegmentPlanningWork, type SegmentPlanningWorkOptions } from './segment-planning-work'
 import type { VirtualStreamChunk } from './virtual-stream-chunk'
 import type { VirtualStreamSegment } from './virtual-stream-segment'
 
-interface ChunkCandidate {
-  chunk: VirtualStreamChunk
+interface WorkCandidate {
+  chunk: VirtualStreamChunk | undefined
   segment: VirtualStreamSegment
+  type: 'chunk' | 'head' | 'range' | 'sequential'
   windowIndex: number
 }
 
-interface ChunkFillWorkerOptions {
+interface SegmentLoadWorkerOptions {
   id: number
   loader: ParallelSegmentLoader
   transport: HttpTransport
 }
 
-export class ChunkFillWorker {
+export class SegmentLoadWorker {
   readonly id: number
 
-  private activeWork: ChunkFillWork | undefined
+  private activeWork: SegmentFetchWork | SegmentPlanningWork | undefined
   private destroyed = false
   private readonly loader: ParallelSegmentLoader
   private scheduled = false
@@ -28,7 +30,7 @@ export class ChunkFillWorker {
   private readonly transport: HttpTransport
   private unsubscribe: (() => void) | undefined
 
-  constructor(options: ChunkFillWorkerOptions) {
+  constructor(options: SegmentLoadWorkerOptions) {
     this.id = options.id
     this.loader = options.loader
     this.transport = options.transport
@@ -49,7 +51,7 @@ export class ChunkFillWorker {
     this.destroyed = true
     this.unsubscribe?.()
     this.unsubscribe = undefined
-    this.activeWork?.cancel(new DOMException('ChunkFillWorker 已销毁', 'AbortError'))
+    this.activeWork?.cancel(new DOMException('SegmentLoadWorker 已销毁', 'AbortError'))
     this.state = 'stopped'
   }
 
@@ -57,12 +59,14 @@ export class ChunkFillWorker {
     return {
       chunkKey: this.activeWork?.chunkKey,
       id: this.id,
+      method: this.activeWork?.method,
       requestEnd: this.activeWork?.requestEnd,
       requestStart: this.activeWork?.requestStart,
       segmentKey: this.activeWork?.segmentKey,
       startedAt: this.activeWork?.startedAt,
       state: this.state,
       streamId: this.activeWork?.streamId,
+      task: this.activeWork?.task,
     }
   }
 
@@ -98,28 +102,56 @@ export class ChunkFillWorker {
     })
   }
 
-  private takeNextWork(): ChunkFillWork | undefined {
-    const candidate = this.selectBestChunk()
+  private takeNextWork(): SegmentFetchWork | SegmentPlanningWork | undefined {
+    const candidate = this.selectBestWork()
     if (candidate === undefined) {
       return undefined
     }
 
     const startedAt = performance.now()
-    let options: ChunkFillWorkOptions | undefined
+    let chunkOptions: SegmentFetchWorkOptions | undefined
+    let planningOptions: SegmentPlanningWorkOptions | undefined
     this.loader.update(state => {
       const segment = state.streams
         .get(candidate.segment.streamId)
         ?.segments.get(candidate.segment.key)
-      const chunk = segment?.chunks.find(item => item.key === candidate.chunk.key)
-      if (segment === undefined || chunk === undefined || segment.outcome.type !== 'pending') {
+      if (segment === undefined || segment.outcome.type !== 'pending') {
         return undefined
       }
 
       const generation = state.allocateGeneration()
-      if (!chunk.claim(this.id, generation, startedAt)) {
+      segment.startedAt ??= startedAt
+      if (candidate.type === 'head') {
+        if (!segment.claimPlanning(this.id, generation, startedAt)) {
+          return undefined
+        }
+        planningOptions = {
+          context: segment.context,
+          generation,
+          loader: this.loader,
+          segmentKey: segment.key,
+          startedAt,
+          streamId: segment.streamId,
+          transport: this.transport,
+        }
         return undefined
       }
-      segment.startedAt ??= startedAt
+
+      const planning = candidate.type === 'range' || candidate.type === 'sequential'
+      if (planning && !segment.claimPlanning(this.id, generation, startedAt)) {
+        return undefined
+      }
+      const chunk = planning
+        ? segment.ensureLeadingChunk(this.loader.chunkSize, candidate.type === 'range')
+        : candidate.chunk === undefined
+          ? undefined
+          : segment.chunks.find(item => item.key === candidate.chunk?.key)
+      if (chunk === undefined || !chunk.claim(this.id, generation, startedAt)) {
+        if (planning) {
+          segment.releasePlanning(generation)
+        }
+        return undefined
+      }
       const requestStart = chunk.rangeEnabled
         ? segment.resourceStart + chunk.start
         : segment.resourceStart
@@ -128,28 +160,33 @@ export class ChunkFillWorker {
           ? undefined
           : segment.resourceStart + chunk.endExclusive
         : undefined
-      options = {
+      chunkOptions = {
         chunkKey: chunk.key,
         context: segment.context,
         generation,
         loader: this.loader,
+        planning,
         rangeEnabled: chunk.rangeEnabled,
         requestEnd,
         requestStart,
         resourceLength:
           segment.length === undefined ? undefined : segment.resourceStart + segment.length,
         segmentKey: segment.key,
+        slowRescueEnabled: chunk.rescueAttempts < this.loader.maxRescueAttempts,
         startedAt,
         streamId: segment.streamId,
         transport: this.transport,
       }
       return undefined
     })
-    return options === undefined ? undefined : new ChunkFillWork(options)
+    if (planningOptions !== undefined) {
+      return new SegmentPlanningWork(planningOptions)
+    }
+    return chunkOptions === undefined ? undefined : new SegmentFetchWork(chunkOptions)
   }
 
-  private selectBestChunk(): ChunkCandidate | undefined {
-    let best: ChunkCandidate | undefined
+  private selectBestWork(): WorkCandidate | undefined {
+    let best: WorkCandidate | undefined
     for (const stream of this.loader.state.streams.values()) {
       for (const segment of stream.segments.values()) {
         if (segment.outcome.type !== 'pending') {
@@ -160,12 +197,33 @@ export class ChunkFillWorker {
           continue
         }
         const windowIndex = index === -1 ? Number.MAX_SAFE_INTEGER : index
+        if (segment.planning.type === 'pending') {
+          const candidate: WorkCandidate = {
+            chunk: undefined,
+            segment,
+            type: segment.planning.method,
+            windowIndex,
+          }
+          if (
+            (candidate.type === 'head' || stream.canScheduleData(segment.key)) &&
+            (best === undefined || compareWorkCandidates(candidate, best) < 0)
+          ) {
+            best = candidate
+          }
+          continue
+        }
+        if (segment.planning.type === 'probing' || !stream.canScheduleData(segment.key)) {
+          continue
+        }
         for (const chunk of segment.chunks) {
-          if (chunk.phase.type !== 'empty') {
+          if (
+            chunk.phase.type !== 'empty' ||
+            (segment.rangeMode === 'unverified' && chunk.index !== 0)
+          ) {
             continue
           }
-          const candidate = { chunk, segment, windowIndex }
-          if (best === undefined || compareChunkCandidates(candidate, best) < 0) {
+          const candidate: WorkCandidate = { chunk, segment, type: 'chunk', windowIndex }
+          if (best === undefined || compareWorkCandidates(candidate, best) < 0) {
             best = candidate
           }
         }
@@ -182,68 +240,13 @@ export class ChunkFillWorker {
       this.schedule()
       return
     }
-    if (!this.activeWork.isCurrent() || this.shouldPreempt(this.activeWork)) {
+    if (!this.activeWork.isCurrent()) {
       this.activeWork.cancel(new DOMException('Chunk Fill 已失效', 'AbortError'))
     }
   }
-
-  private shouldPreempt(work: ChunkFillWork): boolean {
-    const urgent = this.selectBestChunk()
-    if (urgent === undefined || urgent.segment.readerCount === 0) {
-      return false
-    }
-
-    const active = this.locateActiveWork(work)
-    if (active === undefined || active.segment.readerCount > 0) {
-      return false
-    }
-    const activeStream = this.loader.state.streams.get(active.segment.streamId)
-    const activeIndex = activeStream?.window.indexOf(active.segment.key) ?? -1
-    const activeCandidate: ChunkCandidate = {
-      chunk: active.chunk,
-      segment: active.segment,
-      windowIndex: activeIndex === -1 ? Number.MAX_SAFE_INTEGER : activeIndex,
-    }
-
-    let victim: ChunkCandidate | undefined
-    for (const stream of this.loader.state.streams.values()) {
-      for (const segment of stream.segments.values()) {
-        if (segment.readerCount > 0) {
-          continue
-        }
-        const index = stream.window.indexOf(segment.key)
-        const windowIndex = index === -1 ? Number.MAX_SAFE_INTEGER : index
-        for (const chunk of segment.chunks) {
-          if (chunk.phase.type !== 'filling') {
-            continue
-          }
-          const candidate = { chunk, segment, windowIndex }
-          if (victim === undefined || compareChunkCandidates(candidate, victim) > 0) {
-            victim = candidate
-          }
-        }
-      }
-    }
-
-    return (
-      victim?.chunk.phase.type === 'filling' &&
-      victim.chunk.phase.workerId === this.id &&
-      compareChunkCandidates(urgent, activeCandidate) < 0
-    )
-  }
-
-  private locateActiveWork(
-    work: ChunkFillWork,
-  ): { chunk: VirtualStreamChunk; segment: VirtualStreamSegment } | undefined {
-    const segment = this.loader.state.streams.get(work.streamId)?.segments.get(work.segmentKey)
-    const chunk = segment?.chunks.find(item => item.key === work.chunkKey)
-    return segment !== undefined && chunk?.isCurrent(work.generation)
-      ? { chunk, segment }
-      : undefined
-  }
 }
 
-function compareChunkCandidates(left: ChunkCandidate, right: ChunkCandidate): number {
+function compareWorkCandidates(left: WorkCandidate, right: WorkCandidate): number {
   const leftDirect = left.segment.readerCount > 0
   const rightDirect = right.segment.readerCount > 0
   if (leftDirect !== rightDirect) {
@@ -251,7 +254,7 @@ function compareChunkCandidates(left: ChunkCandidate, right: ChunkCandidate): nu
   }
   return (
     left.windowIndex - right.windowIndex ||
-    left.chunk.index - right.chunk.index ||
-    left.chunk.key.localeCompare(right.chunk.key)
+    (left.chunk?.index ?? 0) - (right.chunk?.index ?? 0) ||
+    (left.chunk?.key ?? left.segment.key).localeCompare(right.chunk?.key ?? right.segment.key)
   )
 }

@@ -2,7 +2,34 @@ import type { FragmentLoaderContext } from 'hls.js'
 import { splitByteRanges } from './byte-ranges'
 import { VirtualStreamChunk } from './virtual-stream-chunk'
 
-export type VirtualStreamSegmentState = 'empty' | 'failed' | 'filling' | 'ready'
+export type SegmentPlanningMethod = 'head' | 'range' | 'sequential'
+export type SegmentPlanningSource = 'content-range' | 'head' | 'playlist' | 'response'
+export type SegmentRangeMode = 'parallel' | 'sequential' | 'unverified'
+export type VirtualStreamSegmentState =
+  | 'failed'
+  | 'filling'
+  | 'planning'
+  | 'queued'
+  | 'ready'
+  | 'verifying'
+
+export type SegmentPlanningPhase =
+  | {
+      lastFailure: string | undefined
+      method: SegmentPlanningMethod
+      type: 'pending'
+    }
+  | {
+      generation: number
+      method: SegmentPlanningMethod
+      startedAt: number
+      type: 'probing'
+      workerId: number
+    }
+  | {
+      source: SegmentPlanningSource
+      type: 'planned'
+    }
 
 export interface SegmentLoadFailure {
   code: number
@@ -35,9 +62,10 @@ export class VirtualStreamSegment {
   readonly key: string
   length: number | undefined
   outcome: VirtualStreamSegmentOutcome = { type: 'pending' }
+  planning: SegmentPlanningPhase
+  rangeMode: SegmentRangeMode = 'unverified'
   readerCount = 0
   readonly resourceStart: number
-  sequential = false
   start: number
   readonly streamId: string
   firstByteAt: number | undefined
@@ -45,7 +73,12 @@ export class VirtualStreamSegment {
   startedAt: number | undefined
   validator: string | null = null
 
-  constructor(streamId: string, context: FragmentLoaderContext, chunkSize: number) {
+  constructor(
+    streamId: string,
+    context: FragmentLoaderContext,
+    chunkSize: number,
+    planningMethod: SegmentPlanningMethod,
+  ) {
     const rangeStart = context.rangeStart ?? 0
     const rangeEnd = context.rangeEnd ?? 0
     this.streamId = streamId
@@ -54,6 +87,9 @@ export class VirtualStreamSegment {
     this.duration = context.part?.duration ?? context.frag.duration
     this.key = VirtualStreamSegment.createKey(context)
     this.length = this.declaredRange ? rangeEnd - rangeStart : undefined
+    this.planning = this.declaredRange
+      ? { source: 'playlist', type: 'planned' }
+      : { lastFailure: undefined, method: planningMethod, type: 'pending' }
     this.resourceStart = this.declaredRange ? rangeStart : 0
     this.start = context.part?.start ?? context.frag.start
     this.planChunks(chunkSize)
@@ -79,11 +115,22 @@ export class VirtualStreamSegment {
     if (this.outcome.type === 'failed') {
       return 'failed'
     }
-    return this.chunks.some(chunk => chunk.state === 'filling') ? 'filling' : 'empty'
+    if (this.planning.type !== 'planned') {
+      return 'planning'
+    }
+    const filling = this.chunks.some(chunk => chunk.state === 'filling')
+    if (filling && this.rangeMode === 'unverified') {
+      return 'verifying'
+    }
+    return filling ? 'filling' : 'queued'
   }
 
   get loadedBytes(): number {
     return this.chunks.reduce((total, chunk) => total + chunk.loadedBytes, 0)
+  }
+
+  get sequential(): boolean {
+    return this.rangeMode === 'sequential'
   }
 
   updateContext(context: FragmentLoaderContext): void {
@@ -94,6 +141,7 @@ export class VirtualStreamSegment {
 
   startReading(): void {
     this.readerCount += 1
+    this.preferRangePlanning()
     this.resetFailure()
   }
 
@@ -101,38 +149,134 @@ export class VirtualStreamSegment {
     this.readerCount = Math.max(0, this.readerCount - 1)
   }
 
-  planChunks(chunkSize: number): void {
-    // 长度未知时先规划一个 discovery Chunk
-    const ranges =
-      this.length === undefined
-        ? [{ endExclusive: chunkSize, start: 0 }]
-        : splitByteRanges(0, this.length, chunkSize)
-
-    for (const [index, range] of ranges.entries()) {
-      const existing = this.chunks.find(chunk => chunk.start === range.start)
-      if (existing === undefined) {
-        this.chunks.push(
-          new VirtualStreamChunk(
-            `${this.key}\nchunk:${range.start}`,
-            index,
-            range.start,
-            range.endExclusive,
-            true,
-          ),
-        )
-      } else {
-        existing.endExclusive = range.endExclusive
-        existing.index = index
+  preferRangePlanning(): void {
+    if (this.planning.type === 'pending' && this.planning.method === 'head') {
+      this.planning = {
+        lastFailure: this.planning.lastFailure,
+        method: 'range',
+        type: 'pending',
       }
     }
-    this.chunks.sort((left, right) => left.start - right.start)
   }
 
-  fallbackToSequential(): void {
+  claimPlanning(workerId: number, generation: number, startedAt: number): boolean {
+    if (this.planning.type !== 'pending') {
+      return false
+    }
+    this.planning = {
+      generation,
+      method: this.planning.method,
+      startedAt,
+      type: 'probing',
+      workerId,
+    }
+    return true
+  }
+
+  isPlanningCurrent(generation: number): boolean {
+    return this.planning.type === 'probing' && this.planning.generation === generation
+  }
+
+  releasePlanning(generation: number, lastFailure?: string): boolean {
+    if (!this.isPlanningCurrent(generation) || this.planning.type !== 'probing') {
+      return false
+    }
+    this.planning = {
+      lastFailure,
+      method: this.planning.method,
+      type: 'pending',
+    }
+    return true
+  }
+
+  fallbackPlanning(generation: number, lastFailure: string): boolean {
+    if (!this.isPlanningCurrent(generation)) {
+      return false
+    }
+    this.planning = { lastFailure, method: 'range', type: 'pending' }
+    return true
+  }
+
+  completePlanning(
+    length: number,
+    source: SegmentPlanningSource,
+    chunkSize: number,
+    generation?: number,
+  ): boolean {
+    if (
+      !Number.isSafeInteger(length) ||
+      length <= 0 ||
+      (generation !== undefined && !this.isPlanningCurrent(generation))
+    ) {
+      return false
+    }
+    this.length = length
+    this.planning = { source, type: 'planned' }
+    this.planChunks(chunkSize)
+    return true
+  }
+
+  ensureLeadingChunk(chunkSize: number, rangeEnabled: boolean): VirtualStreamChunk {
+    let chunk = this.chunks.find(item => item.start === 0)
+    if (chunk === undefined) {
+      chunk = new VirtualStreamChunk(
+        `${this.key}\nchunk:0`,
+        0,
+        0,
+        rangeEnabled ? chunkSize : undefined,
+        rangeEnabled,
+      )
+      this.chunks.push(chunk)
+    }
+    return chunk
+  }
+
+  verifyRange(): void {
+    this.rangeMode = 'parallel'
+  }
+
+  useSequentialRange(): void {
+    this.rangeMode = 'sequential'
+  }
+
+  planChunks(chunkSize: number): void {
+    if (this.length === undefined) {
+      return
+    }
+
+    this.chunks.sort((left, right) => left.start - right.start)
+    let plannedEnd = 0
+    for (const chunk of this.chunks) {
+      if (chunk.start !== plannedEnd || chunk.endExclusive === undefined) {
+        break
+      }
+      plannedEnd = chunk.endExclusive
+    }
+    const ranges = splitByteRanges(plannedEnd, this.length, chunkSize)
+
+    for (const range of ranges) {
+      this.chunks.push(
+        new VirtualStreamChunk(
+          `${this.key}\nchunk:${range.start}`,
+          this.chunks.length,
+          range.start,
+          range.endExclusive,
+          true,
+        ),
+      )
+    }
+    this.chunks.sort((left, right) => left.start - right.start)
+    for (const [index, chunk] of this.chunks.entries()) {
+      chunk.index = index
+    }
+  }
+
+  fallbackToSequential(lastFailure: string): void {
     this.fallbackAttempted = true
-    this.sequential = true
+    this.rangeMode = 'sequential'
     this.length = undefined
     this.outcome = { type: 'pending' }
+    this.planning = { lastFailure, method: 'sequential', type: 'pending' }
     this.chunks.splice(
       0,
       this.chunks.length,
@@ -214,6 +358,13 @@ export class VirtualStreamSegment {
       return
     }
     this.outcome = { type: 'pending' }
+    if (this.planning.type === 'probing') {
+      this.planning = {
+        lastFailure: 'Segment 失败后重新规划',
+        method: this.planning.method,
+        type: 'pending',
+      }
+    }
     for (const chunk of this.chunks) {
       chunk.resetFailure()
     }

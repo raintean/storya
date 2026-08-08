@@ -18,7 +18,7 @@ storya-transport
 ```
 
 - `storya-transport` 提供统一的 `HttpTransport` 接口和三种网络实现。
-- `storya-hls-loader` 的 `ParallelSegmentLoader` 持有一个 `HttpTransport`, 内部 `ChunkFillWork` 通过它完成单次 Range Chunk attempt。默认使用 Fetch, example 可以选择 HTTP Proxy 或 WebSocket relay。HLS 语义始终留在 `storya-hls-loader` 中。
+- `storya-hls-loader` 的 `ParallelSegmentLoader` 持有一个 `HttpTransport`; `SegmentPlanningWork` 通过它执行 HEAD, `SegmentFetchWork` 通过它执行 GET。默认使用 Fetch, example 可以选择 HTTP Proxy 或 WebSocket relay。HLS 语义始终留在 `storya-hls-loader` 中。
 - `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。
 - `storya-edge-worker` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
 - WebSocket relay 的控制消息由 `storya-protocol` 中的 Protobuf schema 描述，媒体 body 使用原始二进制 frame。
@@ -36,7 +36,7 @@ interface HttpTransport {
 }
 ```
 
-Fetch、Proxy 和 WebSocket Transport 都返回流式 response。Transport 不暴露加载器调度策略；超时、抢占和停滞补救由 Loader 通过标准 `Request.signal` 与 `ReadableStream.cancel()` 表达。
+Fetch、Proxy 和 WebSocket Transport 都返回流式 response。Transport 不暴露加载器调度策略；窗口失效、超时和停滞补救由 Loader 通过标准 `Request.signal` 与 `ReadableStream.cancel()` 表达。
 
 ## HTTP Proxy Transport
 
@@ -90,9 +90,9 @@ Worker 以 128 KiB 为目标读取上游 body。每次为 frame header 和 body 
 
 WebSocket Transport 收到 `RESPONSE_HEAD` 后立即返回 `HttpTransportResponse`，后续 `RESPONSE_BODY` 逐帧进入 `ReadableStream`，`RESPONSE_END` 关闭流。
 
-Fetch、Proxy 和 WebSocket 对 HLS Loader 统一表现为流式 Transport。`ChunkFillWork` 使用 `ReadableStreamDefaultReader` 逐段读取 body, 实时更新 Chunk 已接收字节。它通过 Request AbortSignal 和 body cancel 表达窗口取消、正式读取抢占、响应头超时、响应流量空闲超时与完整请求超时。
+Fetch、Proxy 和 WebSocket 对 HLS Loader 统一表现为流式 Transport。HEAD 与 GET 共用 `SegmentLoadWorker` 固定并发池。`SegmentFetchWork` 使用 `ReadableStreamDefaultReader` 逐段读取 GET body, 实时更新 Chunk 已接收字节。两种 Work 都通过 Request AbortSignal 表达窗口取消和请求超时; response head 已返回的 GET 还会使用 body cancel。调度优先级只影响空闲 Worker 的下一次领取, 不取消已经发出的有效请求。
 
-连续无数据或请求超时由 `ChunkFillWork` 结束当前 attempt 并把 Chunk 恢复为可调度状态, 后续重新领取属于 `ChunkFillWorker` 的调度, 两者都不属于 `FetchHttpTransport`。Transport 仍然只负责把 Fetch response 原样暴露为统一流接口。基于历史吞吐判断“持续有数据但明显过慢”的补救尚未迁移。
+连续无数据或请求超时由 `SegmentFetchWork` 结束当前 attempt 并把 Chunk 恢复为可调度状态, 后续重新领取属于 `SegmentLoadWorker` 的调度, 两者都不属于 `FetchHttpTransport`。Transport 仍然只负责把 Fetch response 原样暴露为统一流接口。基于历史吞吐判断“持续有数据但明显过慢”的补救尚未迁移。
 
 ## 响应上限
 
@@ -108,7 +108,7 @@ HEAD 的 body 必须为空。当前生产 Chunk 默认为 2 MiB，因此正常�
 
 ## 取消与超时
 
-`ChunkFillWork` 决定何时结束或补救当前 attempt, 不把“慢连接”概念传给 Transport。Work 中止 attempt 时触发 `Request.signal`; response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`, body 连续 5 秒没有数据时视为停滞, 同一 Chunk 默认补救 2 次。
+`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。Chunk 仍有 rescue 次数时, GET body 连续 5 秒没有数据会触发补救; 次数耗尽或 `maxRescueAttempts = 0` 时不安装这项额外慢速检测。
 
 WebSocket Transport 把这两种标准取消入口映射为当前 sequence 的 `CANCEL`。Worker 先清空活动事务，再取消 pending BYOB read 并 Abort 上游 Fetch，随后回复 `CANCELED`。客户端只有收到 `CANCELED` 后才把连接恢复为 idle；确认超时会关闭连接，避免未收敛事务被错误复用。取消确认超时由调用方通过 `cancelTimeoutMs` 配置。
 

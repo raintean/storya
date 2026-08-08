@@ -1,6 +1,6 @@
 import Hls from 'hls.js'
 import type { Level, MediaFragment } from 'hls.js'
-import { DEFAULT_WINDOW_SIZE, ParallelSegmentLoader } from './parallel-segment-loader'
+import { ParallelSegmentLoader } from './parallel-segment-loader'
 
 const NativeStreamController = Hls.DefaultConfig.streamController
 
@@ -67,7 +67,7 @@ export class ParallelStreamController extends NativeStreamController {
     const selected =
       currentIndex === -1
         ? [fragment]
-        : fragments.slice(currentIndex, currentIndex + DEFAULT_WINDOW_SIZE)
+        : fragments.slice(currentIndex, currentIndex + loader.windowSize)
     const window = selected.filter(candidate => !candidate.gap && Boolean(candidate.url))
     const streamId = `${fragment.type}:${fragment.level}`
 

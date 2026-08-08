@@ -16,7 +16,7 @@ class TestParallelStreamController extends ParallelStreamController {
 const originalFetch = globalThis.fetch
 globalThis.fetch = async () => new Response(new Uint8Array([1]).buffer, { status: 200 })
 
-const loader = new ParallelSegmentLoader({ maxConcurrency: 2 })
+const loader = new ParallelSegmentLoader({ maxConcurrency: 2, windowSize: 3 })
 const hls = new Hls({
   autoStartLoad: false,
   fLoader: loader.fLoader,
@@ -30,10 +30,10 @@ const level = { details: { fragments, partList: null } } as unknown as Level
 
 try {
   controller.updateWindowForTest(fragments[0] as MediaFragment, level)
-  assertWindow(loader, [0, 1, 2, 3, 4, 5])
+  assertWindow(loader, [0, 1, 2])
 
   controller.updateWindowForTest(fragments[1] as MediaFragment, level)
-  assertWindow(loader, [1, 2, 3, 4, 5, 6])
+  assertWindow(loader, [1, 2, 3])
 
   controller.setBitrateTestForTest(true)
   controller.updateWindowForTest(fragments[2] as MediaFragment, level)

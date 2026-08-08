@@ -1,10 +1,21 @@
 import { type ParallelSegmentLoaderState } from './parallel-segment-loader-state'
 import type { VirtualStream } from './virtual-stream'
 import type { VirtualStreamChunk } from './virtual-stream-chunk'
-import type { VirtualStreamSegment } from './virtual-stream-segment'
+import type {
+  SegmentPlanningMethod,
+  SegmentPlanningSource,
+  SegmentRangeMode,
+  VirtualStreamSegment,
+} from './virtual-stream-segment'
 
 export type DiagnosticWorkerState = 'idle' | 'loading' | 'stopped'
-export type DiagnosticSegmentState = 'empty' | 'failed' | 'filling' | 'ready'
+export type DiagnosticSegmentState =
+  | 'failed'
+  | 'filling'
+  | 'planning'
+  | 'queued'
+  | 'ready'
+  | 'verifying'
 export type DiagnosticChunkState = 'empty' | 'failed' | 'filling' | 'ready'
 
 export interface ParallelSegmentLoaderDiagnostics {
@@ -29,7 +40,11 @@ export interface SegmentDiagnostics {
   httpStatus: number
   key: string
   loadedBytes: number
+  planningMethod: SegmentPlanningMethod | undefined
+  planningSource: SegmentPlanningSource | undefined
+  planningState: 'pending' | 'planned' | 'probing'
   readerCount: number
+  rangeMode: SegmentRangeMode
   sequential: boolean
   start: number
   state: DiagnosticSegmentState
@@ -45,6 +60,7 @@ export interface ChunkDiagnostics {
   generation: number | undefined
   key: string
   loadedBytes: number
+  rescueAttempts: number
   start: number
   state: DiagnosticChunkState
 }
@@ -52,12 +68,14 @@ export interface ChunkDiagnostics {
 export interface WorkerDiagnostics {
   chunkKey: string | undefined
   id: number
+  method: 'GET' | 'HEAD' | undefined
   requestEnd: number | undefined
   requestStart: number | undefined
   segmentKey: string | undefined
   startedAt: number | undefined
   state: DiagnosticWorkerState
   streamId: string | undefined
+  task: 'chunk' | 'planning' | undefined
 }
 
 export function createParallelSegmentLoaderDiagnostics(
@@ -112,7 +130,11 @@ function createSegmentDiagnostics(
             : 0,
     key: segment.key,
     loadedBytes: segment.loadedBytes,
+    planningMethod: segment.planning.type === 'planned' ? undefined : segment.planning.method,
+    planningSource: segment.planning.type === 'planned' ? segment.planning.source : undefined,
+    planningState: segment.planning.type,
     readerCount: segment.readerCount,
+    rangeMode: segment.rangeMode,
     sequential: segment.sequential,
     start: segment.start,
     state: segment.state,
@@ -140,6 +162,7 @@ function createChunkDiagnostics(chunk: VirtualStreamChunk): ChunkDiagnostics {
     generation: chunk.phase.type === 'filling' ? chunk.phase.generation : undefined,
     key: chunk.key,
     loadedBytes: chunk.loadedBytes,
+    rescueAttempts: chunk.rescueAttempts,
     start: chunk.start,
     state: chunk.state,
   }

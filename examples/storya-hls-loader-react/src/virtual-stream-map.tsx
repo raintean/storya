@@ -12,14 +12,13 @@ interface VirtualStreamMapProps {
   snapshot: ParallelSegmentLoaderDiagnostics
 }
 
-const minimumTimelineSpan = 12
 const playbackInitialPosition = 0.15
 const playbackPanThreshold = 0.35
 const timelinePanStep = 0.2
+const visibleSegmentCount = 7
 
 interface TimelineViewport {
   bounds: TimelineBounds
-  segmentBounds: TimelineBounds
   streamKey: string
 }
 
@@ -139,6 +138,7 @@ function SegmentCell({ bounds, segment }: { bounds: TimelineBounds; segment: Seg
   const end = segment.start + Math.max(segment.duration, 0.01)
   const left = toPercent(segment.start, bounds)
   const width = Math.max(0.8, toPercent(end, bounds) - left)
+  const state = getSegmentStatePresentation(segment)
   const classes = [
     'segment-cell',
     `is-${segment.state}`,
@@ -154,15 +154,21 @@ function SegmentCell({ bounds, segment }: { bounds: TimelineBounds; segment: Seg
       style={{ left: `${left}%`, width: `${width}%` }}
       title={createSegmentTitle(segment)}
     >
-      <span className="segment-name">{formatSegmentKey(segment.key)}</span>
+      <div className="segment-heading">
+        <span className="segment-name">{formatSegmentKey(segment.key)}</span>
+        <b>{getSegmentRoleLabel(segment)}</b>
+      </div>
+      <div className="segment-state">
+        <strong>{state.primary}</strong>
+        <span>{state.detail}</span>
+      </div>
       <div className="chunk-track">
         {segment.chunks.length > 0 ? (
           segment.chunks.map(chunk => <ChunkCell chunk={chunk} key={chunk.key} segment={segment} />)
         ) : (
-          <i className="chunk-placeholder" />
+          <i className={`chunk-placeholder is-${segment.state}`} />
         )}
       </div>
-      <span className="segment-state">{getSegmentStateLabel(segment)}</span>
     </div>
   )
 }
@@ -190,29 +196,21 @@ interface TimelineBounds {
   start: number
 }
 
-function findSegmentBounds(streams: VirtualStreamDiagnostics[]): TimelineBounds {
-  const segments = streams.flatMap(stream => stream.segments)
-  const first = Math.min(...segments.map(segment => segment.start))
-  const last = Math.max(...segments.map(segment => segment.start + segment.duration))
-  return { end: last, start: first }
-}
-
 function updateTimelineViewport(
   current: TimelineViewport | null,
   streams: VirtualStreamDiagnostics[],
   streamKey: string,
   playbackTime: number,
 ): TimelineViewport {
-  const segmentBounds = findSegmentBounds(streams)
-  if (
-    current === null ||
-    current.streamKey !== streamKey ||
-    current.segmentBounds.start !== segmentBounds.start ||
-    current.segmentBounds.end !== segmentBounds.end
-  ) {
+  if (current === null || current.streamKey !== streamKey) {
+    const durations = streams
+      .flatMap(stream => stream.segments)
+      .filter(segment => segment.windowIndex !== null && segment.duration > 0)
+      .map(segment => segment.duration)
+      .sort((left, right) => left - right)
+    const segmentDuration = durations[Math.floor(durations.length / 2)] ?? 2
     return {
-      bounds: createTimelineViewport(segmentBounds, playbackTime),
-      segmentBounds,
+      bounds: positionTimelineAtPlayback(segmentDuration * visibleSegmentCount, playbackTime),
       streamKey,
     }
   }
@@ -238,20 +236,6 @@ function updateTimelineViewport(
       start: current.bounds.start + shift,
     },
   }
-}
-
-function createTimelineViewport(
-  segmentBounds: TimelineBounds,
-  playbackTime: number,
-): TimelineBounds {
-  const segmentSpan = segmentBounds.end - segmentBounds.start
-  const contentAhead = Math.max(0, segmentBounds.end - playbackTime)
-  const span = Math.max(
-    minimumTimelineSpan,
-    segmentSpan,
-    contentAhead / (1 - playbackInitialPosition),
-  )
-  return positionTimelineAtPlayback(span, playbackTime)
 }
 
 function positionTimelineAtPlayback(span: number, playbackTime: number): TimelineBounds {
@@ -314,29 +298,57 @@ function getStreamTypeLabel(streamId: string): string {
   return 'VIRTUAL STREAM'
 }
 
-function getSegmentStateLabel(segment: SegmentDiagnostics): string {
-  let label: string
-  if (segment.readerCount > 0) {
-    label = segment.state === 'failed' ? 'READER · FAILED' : 'HLS READER'
-  } else if (segment.state === 'ready') {
-    label = 'CACHED'
-  } else if (segment.state === 'filling') {
-    label = segment.windowIndex !== null ? 'PREFETCH' : 'LOADING'
-  } else if (segment.state === 'failed') {
-    label = 'FAILED'
-  } else {
-    label = segment.windowIndex !== null ? 'NEEDED' : 'EMPTY'
+interface SegmentStatePresentation {
+  detail: string
+  primary: string
+}
+
+function getSegmentStatePresentation(segment: SegmentDiagnostics): SegmentStatePresentation {
+  if (segment.state === 'planning') {
+    const method = segment.planningMethod?.toUpperCase() ?? 'PLAN'
+    return {
+      detail: segment.planningState === 'probing' ? 'LOADING' : 'QUEUED',
+      primary: method,
+    }
   }
-  return `${label} · ${segment.httpStatus || '—'}${segment.sequential ? ' SEQ' : ''}`
+  if (segment.state === 'verifying') {
+    return { detail: 'VERIFYING', primary: 'RANGE' }
+  }
+  if (segment.state === 'ready') {
+    return {
+      detail: segment.sequential ? 'SEQUENTIAL' : `${String(segment.chunks.length)} CHUNKS`,
+      primary: 'CACHED',
+    }
+  }
+  if (segment.state === 'failed') {
+    return { detail: 'LOAD ERROR', primary: 'FAILED' }
+  }
+  const ready = segment.chunks.filter(chunk => chunk.state === 'ready').length
+  const filling = segment.chunks.filter(chunk => chunk.state === 'filling').length
+  return segment.state === 'filling'
+    ? {
+        detail: `${String(ready + filling)}/${String(segment.chunks.length)}`,
+        primary: 'FILLING',
+      }
+    : { detail: `${String(segment.chunks.length)} CHUNKS`, primary: 'PLANNED' }
+}
+
+function getSegmentRoleLabel(segment: SegmentDiagnostics): string {
+  if (segment.readerCount > 0) {
+    return 'READER'
+  }
+  return segment.windowIndex === null ? 'INACTIVE' : 'PREFETCH'
 }
 
 function createSegmentTitle(segment: SegmentDiagnostics): string {
+  const state = getSegmentStatePresentation(segment)
   return [
     `Segment ${segment.key}`,
     `${segment.start.toFixed(2)}s – ${(segment.start + segment.duration).toFixed(2)}s`,
-    getSegmentStateLabel(segment),
+    `${state.primary} · ${state.detail}`,
+    `role ${getSegmentRoleLabel(segment)} · plan ${segment.planningState}/${segment.planningSource ?? segment.planningMethod ?? '—'}`,
     `readers ${segment.readerCount} · window ${segment.windowIndex ?? 'no'}`,
-    `HTTP ${segment.httpStatus || '—'} · ${segment.sequential ? 'sequential' : 'range chunks'}`,
+    `HTTP ${segment.httpStatus || '—'} · range ${segment.rangeMode}`,
     `${formatBytes(segment.loadedBytes)} / ${formatBytes(segment.totalBytes)}`,
   ].join('\n')
 }
@@ -346,7 +358,7 @@ function createChunkTitle(chunk: ChunkDiagnostics): string {
     `Chunk ${chunk.key} · ${chunk.state}`,
     `${formatBytes(chunk.start)} – ${formatBytes(chunk.endExclusive)}`,
     `received ${formatBytes(chunk.loadedBytes)}`,
-    `generation ${chunk.generation ?? '—'} · attempt ${chunk.attempt}`,
+    `generation ${chunk.generation ?? '—'} · attempt ${chunk.attempt} · rescue ${chunk.rescueAttempts}`,
     chunk.failure ?? 'no failure',
   ].join('\n')
 }
@@ -361,7 +373,7 @@ function getChunkStyleState(chunk: ChunkDiagnostics): string {
     return 'complete'
   }
   if (chunk.state === 'filling') {
-    return chunk.attempt > 1 ? 'retrying' : 'loading'
+    return chunk.rescueAttempts > 0 ? 'rescuing' : 'loading'
   }
   return chunk.state === 'empty' ? 'queued' : 'failed'
 }
