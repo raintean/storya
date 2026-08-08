@@ -5,6 +5,7 @@ import {
   DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CONCURRENCY,
   DEFAULT_WINDOW_SIZE,
+  ParallelAudioStreamController,
   ParallelSegmentLoader,
   ParallelStreamController,
 } from 'storya-hls-loader'
@@ -297,6 +298,7 @@ export function App() {
           ...(parallelLoader === null
             ? {}
             : {
+                audioStreamController: ParallelAudioStreamController,
                 fLoader: parallelLoader.fLoader,
                 streamController: ParallelStreamController,
               }),

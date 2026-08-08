@@ -1,6 +1,6 @@
 # HLS 并行加载器设计
 
-本文描述 `storya-hls-loader` 当前采用的 HLS Segment/Chunk 并行加载设计。实现基于 hls.js `1.7.0-rc.3`, 对外提供 `ParallelStreamController` 和 `ParallelSegmentLoader` 两个运行时类。
+本文描述 `storya-hls-loader` 当前采用的 HLS Segment/Chunk 并行加载设计。实现基于 hls.js `1.7.0-rc.3`, 对外提供 main/audio 并行 Controller 和 `ParallelSegmentLoader`。
 
 ## 设计目标
 
@@ -21,7 +21,7 @@
 - 让多个 Segment 同时进入 hls.js 的解析和 append 流程。
 - 根据播放器当前时间直接创建、推进或取消窗口。
 - LL-HLS Part 的向前预加载窗口。Part 的正式 fLoader 请求仍然可以进入共享模型并按 Chunk 加载。
-- alternate audio 和 subtitle 的向前预加载窗口。数据模型支持多 Stream, 当前只有 main Controller 规划窗口。
+- subtitle 的向前预加载窗口。字幕正式 fLoader 请求仍然可以进入共享模型并按 Chunk 加载。
 - 根据历史吞吐识别“持续收到数据但明显过慢”的连接。当前只处理响应头超时、连续无数据超时和完整请求超时。
 - 将逻辑 Worker 迁移为浏览器 Web Worker。
 
@@ -60,9 +60,9 @@ VirtualStreamChunk
 
 ### 主动参与者直接协作
 
-系统有三个长期参与者和两种按请求创建的执行对象:
+系统有三类长期参与者和两种按请求创建的执行对象:
 
-- `ParallelStreamController` 把 hls.js 的 Fragment 选择转换为 `window`。
+- `ParallelStreamController` 和 `ParallelAudioStreamController` 分别把 main/audio Fragment 选择转换为独立 `window`。
 - `StoryaFragmentLoader` 把一次 hls.js fLoader 调用转换为 `readerCount` 生命周期, 并观察 Segment outcome。
 - `SegmentLoadWorker` 观察状态, 领取 HEAD 或 GET 任务, 创建对应 Work, 状态变化时取消已经失效的 Work。
 - `SegmentPlanningWork` 负责一次 HEAD 长度探测。
@@ -88,6 +88,10 @@ hls.js
   |
   +-- ParallelStreamController
   |     +-- update(state => replace window)
+  |     +-- super.loadFragment(current)
+  |
+  +-- ParallelAudioStreamController
+  |     +-- update(state => replace audio window)
   |     +-- super.loadFragment(current)
   |
   +-- StoryaFragmentLoader
@@ -128,7 +132,7 @@ ParallelSegmentLoader
 
 Loader 不提供 `replaceWindow()`、`startReading()`、`inspectSegment()`、`takeNextChunk()` 或 `waitForChange()` 等角色专用代理方法。Controller、FragmentLoader、Worker 和 Work 在事务中直接调用数据模型的方法。
 
-`ParallelSegmentLoader.fLoader` 通过内部 WeakMap 与 Loader 实例关联。`ParallelStreamController` 从 `HlsConfig.fLoader` 找回同一个 Loader, 从而保证窗口和正式读取一定操作同一份状态。一个 Loader 只能绑定一个 Hls 实例。
+`ParallelSegmentLoader.fLoader` 通过内部 WeakMap 与 Loader 实例关联。两个并行 Controller 都从 `HlsConfig.fLoader` 找回同一个 Loader, 从而保证 main/audio 窗口和正式读取一定操作同一份状态。一个 Loader 只能绑定一个 Hls 实例。
 
 ## 同步事务与全局观察
 
@@ -188,7 +192,7 @@ audio:<identity>
 subtitle:<identity>
 ```
 
-当前实现实际由 main `ParallelStreamController` 创建 `main:<level>` 窗口。audio、subtitle、init Segment 和 Part 可以由正式 fLoader 创建没有窗口、但具有 reader 的 Segment。
+当前由 `ParallelStreamController` 创建 `main:<level>` 窗口, `ParallelAudioStreamController` 创建 `audio:<identity>` 窗口。subtitle、init Segment 和 Part 可以由正式 fLoader 创建没有窗口、但具有 reader 的 Segment。
 
 `VirtualStream.window` 是有序 SegmentKey 数组。数组顺序同时表达:
 
@@ -230,24 +234,25 @@ URL 和 byte range 属于 identity。相同媒体序号但资源位置不同的�
 - s1 没有 reader 时立即驱离。
 - s1 仍有 reader 时保留到最后一个 reader 结束。
 
-窗口重叠不触发重建, 播放经过窗口首个 Segment也不代表整个窗口失效。
+窗口重叠不触发重建, 播放经过窗口首个 Segment 也不代表整个窗口失效。
 
-## ParallelStreamController
+## ParallelStreamController 与 ParallelAudioStreamController
 
-`ParallelStreamController` 继承 hls.js 默认 main `StreamController`, 只覆写两个调度入口:
+两个 Controller 分别继承 hls.js 默认 main `StreamController` 和 `AudioStreamController`, 都只覆写两个调度入口:
 
 - `loadFragment()` 在调用原生实现前更新窗口。
 - `stopLoad()` 清除当前 Controller 持有的窗口, 再调用原生实现。
 
 普通 VOD/传统 HLS 流程中, 窗口包含当前 Fragment 和它后面的 Fragment。窗口长度由 `ParallelSegmentLoaderOptions.windowSize` 配置, 默认为 6, 因而默认包含当前 Fragment 和后续最多 5 个 Fragment。gap 或没有 URL 的 Fragment 不进入窗口。窗口顺序来自 Level details 中的 Fragment 顺序。
 
-以下情况清空当前 main 窗口并交回 hls.js 原生行为:
+以下情况清空对应窗口并交回 hls.js 原生行为:
 
-- 启动 bandwidth test。
-- Level details 尚不存在。
+- Level/track details 尚不存在。
 - low-latency mode 下存在 Part 列表。
 
-Level/rendition 切换时, Controller 在同一次事务中清空旧 Stream 窗口并建立新 Stream 窗口。旧 Stream 中仍有正式 reader 的 Segment继续存活。
+main Controller 启动 bandwidth test 时也会清空 main 窗口。Audio Controller 没有这条 main 专用分支。
+
+Level、rendition 或 audio track 切换时, 对应 Controller 在同一次事务中清空旧 Stream 窗口并建立新 Stream 窗口。旧 Stream 中仍有正式 reader 的 Segment 继续存活。
 
 Controller 不创建预加载专用 fLoader, 不发送请求, 不读取 Segment outcome, 也不根据播放时间驱离 Segment。
 
@@ -627,9 +632,9 @@ Worker 的 filling attempt 不构成独立存活依据。每次共享状态事�
 
 ## 生命周期
 
-### ParallelStreamController
+### ParallelStreamController 与 ParallelAudioStreamController
 
-Controller 由 hls.js 创建和销毁。一个 Hls session 中可能多次 start、stop、seek 和 level switch。`stopLoad()` 只清理该 Controller 当前维护的窗口, 不销毁 Loader、Worker 或 Transport。
+Controller 由 hls.js 创建和销毁。一个 Hls session 中可能多次 start、stop、seek、level switch 和 audio track switch。每个 Controller 的 `stopLoad()` 只清理自己维护的窗口, 不影响另一条轨道, 也不销毁 Loader、Worker 或 Transport。
 
 ### StoryaFragmentLoader
 
@@ -652,6 +657,7 @@ Loader 由应用创建和销毁, 一个实例只服务一个 Hls session。destr
 ```ts
 const loader = new ParallelSegmentLoader()
 const hls = new Hls({
+  audioStreamController: ParallelAudioStreamController,
   fLoader: loader.fLoader,
   progressive: false,
   streamController: ParallelStreamController,
@@ -667,7 +673,11 @@ loader.destroy()
 ## 公开接口
 
 ```ts
-import { ParallelSegmentLoader, ParallelStreamController } from 'storya-hls-loader'
+import {
+  ParallelAudioStreamController,
+  ParallelSegmentLoader,
+  ParallelStreamController,
+} from 'storya-hls-loader'
 
 const loader = new ParallelSegmentLoader({
   chunkSize: 2 * 1024 * 1024,
@@ -676,6 +686,7 @@ const loader = new ParallelSegmentLoader({
 })
 
 const hls = new Hls({
+  audioStreamController: ParallelAudioStreamController,
   fLoader: loader.fLoader,
   progressive: false,
   streamController: ParallelStreamController,
@@ -684,13 +695,13 @@ const hls = new Hls({
 const diagnostics = loader.getDiagnostics()
 ```
 
-公开运行时类只有 `ParallelSegmentLoader` 和 `ParallelStreamController`。包同时导出默认配置常量、Loader options 和只读诊断 TypeScript 类型。`ParallelSegmentLoaderOptions` 支持 `chunkSize`、`maxConcurrency`、`windowSize`、`idleTimeoutMs`、`maxRescueAttempts` 和 `transport`。
+公开运行时类为 `ParallelSegmentLoader`、`ParallelStreamController` 和 `ParallelAudioStreamController`。包同时导出默认配置常量、Loader options 和只读诊断 TypeScript 类型。`ParallelSegmentLoaderOptions` 支持 `chunkSize`、`maxConcurrency`、`windowSize`、`idleTimeoutMs`、`maxRescueAttempts` 和 `transport`。
 
 ## 当前实现范围
 
 已经实现:
 
-- main Segment 向前窗口。
+- main 和 alternate audio Segment 向前窗口。
 - 多 Segment 和 Segment 内多 Chunk 并发。
 - reader、windowIndex 和 Chunk index 调度优先级; 已发出的有效请求不因优先级变化被抢占。
 - m3u8 已知 byte range、HEAD 长度发现、首个 Range GET 规划和 sequential fallback。
@@ -706,13 +717,14 @@ const diagnostics = loader.getDiagnostics()
 尚未实现:
 
 - LL-HLS Part 向前窗口。
-- alternate audio/subtitle 向前窗口。
+- subtitle 向前窗口。
 - 窗口外后向缓存或基于内存预算的 LRU。
 - 基于历史吞吐的慢连接识别。
 - 真正 Web Worker 化。
 
 ## 修改历史
 
+- 2026-08-08: 增加 `ParallelAudioStreamController`, 为 alternate audio 维护独立预加载窗口; 音频 reader 结束后由 window 保持 Segment 和 VirtualStream 存活, 音轨切换和 stopLoad 时清理对应窗口。
 - 2026-08-08: 未知长度 Segment 改为“窗口首段首个 Range GET、后续 Segment HEAD”的规划流程; HEAD 与 GET 共用固定 Worker 池, 后续数据受前序 Range 模式门禁; 删除根据短 body 推断 EOF 的行为。
 - 2026-08-08: Segment 诊断拆分用途、planning phase、rangeMode、outcome 和组合生命周期状态; Worker/Work 重命名为 `SegmentLoadWorker`、`SegmentPlanningWork` 和 `SegmentFetchWork`。
 - 2026-08-08: 调度优先级改为只影响空闲 Worker 的下一次领取; 已发出的有效请求不再因新出现的 Reader Chunk 被抢占, 只在窗口失效、失败、销毁或 slow rescue 时取消。
