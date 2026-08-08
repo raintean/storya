@@ -24,6 +24,7 @@ export function createStoryaFragmentLoader(
 
     private callbacks: LoaderCallbacks<FragmentLoaderContext> | undefined
     private initialRetry = 0
+    private loadStartedAt = 0
     private networkDetails: Response | null = null
     private progressive = false
     private reading = false
@@ -47,6 +48,8 @@ export function createStoryaFragmentLoader(
       this.context = context
       this.callbacks = callbacks
       this.initialRetry = this.stats.retry
+      this.loadStartedAt = performance.now()
+      this.stats.loading.start = this.loadStartedAt
       this.progressive = callbacks.onProgress !== undefined && Number.isFinite(config.highWaterMark)
 
       loader.update(state => {
@@ -203,18 +206,39 @@ export function createStoryaFragmentLoader(
     private updateStats(segment: VirtualStreamSegment): void {
       const completedAt = segment.outcome.type === 'pending' ? 0 : segment.outcome.completedAt
       const loaded = segment.loadedBytes
-      const start = segment.startedAt ?? 0
+      const segmentStartedAt = segment.startedAt ?? 0
       const end = completedAt || performance.now()
 
       this.stats.loaded = loaded
       this.stats.retry = this.initialRetry + segment.retryCount
       this.stats.total = segment.length ?? 0
       this.stats.chunkCount = segment.chunks.filter(chunk => chunk.state === 'ready').length
-      this.stats.loading.start = start
-      this.stats.loading.first = segment.firstByteAt ?? 0
+      const elapsed = end - segmentStartedAt
+      const bandwidthEstimate = loader.bandwidthEstimate
+      if (segment.outcome.type === 'ready' && segmentStartedAt > 0 && loaded > 0) {
+        // hls.js 会用 loading.start 到 parsing.end 采样带宽, 因此必须排除预加载后的缓存驻留时间
+        const deliveredAt = performance.now()
+        const actualTransferDuration = Math.max(elapsed, 1)
+        const transferDuration =
+          bandwidthEstimate > 0 ? (loaded * 8 * 1000) / bandwidthEstimate : actualTransferDuration
+        const timeToFirstByte =
+          segment.firstByteAt === undefined
+            ? 0
+            : Math.max(0, segment.firstByteAt - segmentStartedAt)
+        this.stats.loading.end = deliveredAt
+        this.stats.loading.first = deliveredAt - transferDuration
+        this.stats.loading.start = this.stats.loading.first - timeToFirstByte
+        this.stats.bwEstimate =
+          bandwidthEstimate > 0 ? bandwidthEstimate : (loaded * 8 * 1000) / actualTransferDuration
+        return
+      }
+
+      this.stats.loading.start = this.loadStartedAt
+      this.stats.loading.first =
+        segment.firstByteAt === undefined ? 0 : Math.max(this.loadStartedAt, segment.firstByteAt)
       this.stats.loading.end = completedAt
-      const elapsed = end - start
-      this.stats.bwEstimate = start > 0 && elapsed > 0 ? (loaded * 8 * 1000) / elapsed : 0
+      this.stats.bwEstimate =
+        segmentStartedAt > 0 && elapsed > 0 ? (loaded * 8 * 1000) / elapsed : 0
     }
   }
 }

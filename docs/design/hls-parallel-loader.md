@@ -12,6 +12,7 @@
 - 使用一份可直接检查的共享数据模型协调 Controller、fLoader 和 Worker, 不建立细粒度命令或回调网络。
 - 所有共享状态修改保持同步和原子, 异步 Transport 结果不能覆盖已经失效的新状态。
 - 保留 Transport 注入能力, 支持 Fetch、HTTP Proxy 和 HTTP-over-WebSocket。
+- 将多个并行 GET 的实际传输投影成 hls.js ABR 可消费的单 Fragment 等效时序。
 
 ## 非目标
 
@@ -128,6 +129,7 @@ ParallelSegmentLoader
 - 提供同步事务入口 `update()`。
 - 提供粗粒度全局订阅 `subscribe()`。
 - 生成只读诊断快照。
+- 根据最近的 GET Work 统计全局聚合传输带宽。
 - 销毁 Worker、Transport 和全部共享状态。
 
 Loader 不提供 `replaceWindow()`、`startReading()`、`inspectSegment()`、`takeNextChunk()` 或 `waitForChange()` 等角色专用代理方法。Controller、FragmentLoader、Worker 和 Work 在事务中直接调用数据模型的方法。
@@ -311,18 +313,41 @@ success、failure、timeout、abort 和 destroy 都通过同一个 settle 边界
 
 ### LoaderStats
 
-每个 FragmentLoader 持有 hls.js 要求的 `LoaderStats` 对象, 但统计来源直接投影自 Segment/Chunk:
+每个 FragmentLoader 持有 hls.js 要求的 `LoaderStats` 对象。Segment/Chunk 仍提供字节数、Chunk 数和重试数, 但完成后的加载时序必须适配并行预加载模型:
 
-- `loading.start`: Segment 首个 Chunk claim 时间。
-- `loading.first`: 所有完成 attempt 中最早的 response head 时间。
-- `loading.end`: ready 或 failed outcome 的完成时间。
+- Segment 内部网络计时从首个媒体 GET Chunk claim 开始; HEAD 规划和等待前缀门禁的时间不计入。
 - `loaded`: 所有 Chunk 当前唯一有效字节数。
 - `total`: 已知 Segment 长度。
 - `chunkCount`: ready Chunk 数量。
 - `retry`: hls.js 初始 retry 加 Worker rescue 次数。
-- `bwEstimate`: 唯一字节数除以整体墙钟时间。
+- `bwEstimate`: Loader 当前的聚合传输带宽; hls.js 采样后会用自身 EWMA 结果覆盖该字段。
 
-预加载已经发生时, stats 描述该 Segment 的真实网络加载过程, 而不是 fLoader 从缓存读取所花的几乎为零的时间。
+当 Segment 仍在加载或失败时, `loading.start` 是当前 fLoader `load()` 的调用时间, `loading.first` 不早于该时间, `loading.end` 是失败时间或 0。这些 stats 表达当前正式 reader 的实际等待, 供 hls.js 的超时和紧急降档逻辑使用。它与 Segment 内部的预加载网络时序是两个视角。
+
+当 Segment ready 并交付给 hls.js 时, FragmentLoader 不能直接上报预加载的绝对开始时间。否则 Segment 在缓存中等待播放的时间会被 hls.js 误认为下载时间, 持续压低 ABR 带宽估计。FragmentLoader 因此在交付时构造一条等效单 Fragment 时序:
+
+```text
+等效传输时长 = Segment 字节数 / Loader 聚合带宽
+loading.end      = 当前交付时间
+loading.first    = loading.end - 等效传输时长
+loading.start    = loading.first - 原始 TTFB
+```
+
+这条时序是专门供 hls.js ABR 采样的适配值, 不再表示某个 Segment 实际发起所有并行 Chunk 请求的墙钟时间。它保留 TTFB 语义, 排除缓存驻留时间, 并让 hls.js 在 `FRAG_BUFFERED` 时根据聚合链路能力而不是单个并行 Chunk 的带宽份额进行 EWMA 采样。
+
+### 聚合传输带宽
+
+Loader 保留最近 64 个实际收到媒体数据的 GET Work 样本。每个样本记录实际接收字节数、GET claim 时间和 body 读取结束时间。HEAD 不进入带宽样本。
+
+聚合带宽计算为:
+
+```text
+聚合带宽 = 样本实际接收总字节数 / 所有 GET 活跃时间区间的并集长度
+```
+
+并行 GET 的重叠时间只计一次, 但各请求接收的字节都计入总量; 两组请求之间没有 GET 活动的空闲间隙不计入分母。这使结果表达整个 Loader 在并行传输时实际获得的链路吞吐, 而不是某个 Chunk 的个别速率。
+
+Work 因 slow rescue、timeout 或取消而中止时, 已经接收的字节仍消耗了真实链路带宽, 所以进入聚合样本; 这些字节不会计入 Segment `loaded` 的唯一有效字节数。完整 GET body 之后为 CORS `Content-Range` 降级而追加的 HEAD 不计入 GET 传输时间。
 
 ## SegmentLoadWorker
 
@@ -623,6 +648,7 @@ Worker 的 filling attempt 不构成独立存活依据。每次共享状态事�
 
 - timestamp、revision、destroyed。
 - active request 数量和最大并发。
+- Loader 最近 GET Work 的聚合传输带宽。
 - 每个 Worker 的 idle/loading/stopped、当前 HEAD/GET、任务类型、Stream/Segment/Chunk、Range 和 startedAt。
 - 每条 VirtualStream 的 window。
 - Segment 的 start、duration、windowIndex、readerCount、生命周期 state、planning phase/method/source、rangeMode、HTTP status 和字节数。
@@ -712,6 +738,7 @@ const diagnostics = loader.getDiagnostics()
 - ETag/Last-Modified 一致性检查。
 - canonical Segment 缓存、窗口重叠保留和确定性驱离。
 - Fetch、HTTP Proxy 和 WebSocket Transport 注入。
+- 基于并行 GET 活跃区间的 Loader 聚合带宽估计, 以及排除缓存驻留时间的 hls.js LoaderStats 适配。
 - Stream/Segment/Chunk/Worker 诊断。
 
 尚未实现:
@@ -724,6 +751,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-08: 带宽估计改为统计最近并行 GET Work 的总字节数与活跃时间并集; HEAD、前缀等待和缓存驻留时间不再压低 hls.js ABR 采样, 诊断界面同时显示 Loader 聚合带宽和 hls.js EWMA 带宽。
 - 2026-08-08: 增加 `ParallelAudioStreamController`, 为 alternate audio 维护独立预加载窗口; 音频 reader 结束后由 window 保持 Segment 和 VirtualStream 存活, 音轨切换和 stopLoad 时清理对应窗口。
 - 2026-08-08: 未知长度 Segment 改为“窗口首段首个 Range GET、后续 Segment HEAD”的规划流程; HEAD 与 GET 共用固定 Worker 池, 后续数据受前序 Range 模式门禁; 删除根据短 body 推断 EOF 的行为。
 - 2026-08-08: Segment 诊断拆分用途、planning phase、rangeMode、outcome 和组合生命周期状态; Worker/Work 重命名为 `SegmentLoadWorker`、`SegmentPlanningWork` 和 `SegmentFetchWork`。

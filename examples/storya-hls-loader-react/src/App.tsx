@@ -114,6 +114,7 @@ const initialFrontier: HlsFrontier = {
 
 const emptyDiagnostics: ParallelSegmentLoaderDiagnostics = {
   activeRequests: 0,
+  bandwidthEstimate: 0,
   destroyed: false,
   maxConcurrency: DEFAULT_MAX_CONCURRENCY,
   revision: 0,
@@ -622,7 +623,7 @@ export function App() {
           accent="blue"
           label="READY CHUNKS"
           value={formatBytes(readyChunkBytes)}
-          note={`hls estimate ${formatBandwidth(metrics.bandwidth)}`}
+          note={`loader ${formatBandwidth(diagnostics.bandwidthEstimate)} · hls ${formatBandwidth(metrics.bandwidth)}`}
         />
       </section>
 

@@ -20,6 +20,7 @@ export type DiagnosticChunkState = 'empty' | 'failed' | 'filling' | 'ready'
 
 export interface ParallelSegmentLoaderDiagnostics {
   activeRequests: number
+  bandwidthEstimate: number
   destroyed: boolean
   maxConcurrency: number
   revision: number
@@ -81,10 +82,12 @@ export interface WorkerDiagnostics {
 export function createParallelSegmentLoaderDiagnostics(
   state: ParallelSegmentLoaderState,
   maxConcurrency: number,
+  bandwidthEstimate: number,
   workers: WorkerDiagnostics[],
 ): ParallelSegmentLoaderDiagnostics {
   return {
     activeRequests: workers.filter(worker => worker.state === 'loading').length,
+    bandwidthEstimate,
     destroyed: state.destroyed,
     maxConcurrency,
     revision: state.revision,

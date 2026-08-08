@@ -186,6 +186,24 @@ globalThis.fetch = async input => {
 }
 
 const config = Hls.DefaultConfig as HlsConfig
+const estimatorOwner = new ParallelSegmentLoader({ maxConcurrency: 1 })
+try {
+  estimatorOwner.recordTransfer(100, 0, 100)
+  estimatorOwner.recordTransfer(100, 0, 100)
+  if (estimatorOwner.bandwidthEstimate !== 16_000) {
+    throw new Error('并行 GET 应按重叠时间区间计算聚合带宽')
+  }
+  estimatorOwner.recordTransfer(100, 200, 300)
+  if (
+    Math.abs(estimatorOwner.bandwidthEstimate - 12_000) > 0.001 ||
+    Math.abs(estimatorOwner.getDiagnostics().bandwidthEstimate - 12_000) > 0.001
+  ) {
+    throw new Error('不连续 GET 应排除请求之间的空闲时间')
+  }
+} finally {
+  estimatorOwner.destroy()
+}
+
 const owner = new ParallelSegmentLoader({ chunkSize: 4, maxConcurrency: 3 })
 const firstFragment = createFragment(1)
 const firstContext = createContext(firstFragment)
@@ -197,6 +215,9 @@ try {
   replaceWindow(owner, [firstFragment], config)
   const first = startLoad(owner, firstContext, config)
   const second = startLoad(owner, firstContext, config)
+  if (first.loader.stats.loading.start <= 0 || second.loader.stats.loading.start <= 0) {
+    throw new Error('fLoader 必须从 load() 调用开始记录正式读取等待时间')
+  }
   const firstResult = first.promise.then(
     () => 'success',
     () => 'aborted',
@@ -215,6 +236,11 @@ try {
     throw new Error('同一个 Segment 的后续 Chunk 应当并行加载')
   }
 
+  const completedAt = owner.state.locateSegment(firstContext)?.outcome
+  if (completedAt?.type !== 'ready') {
+    throw new Error('首个 Segment 应当已经完成')
+  }
+  await new Promise(resolve => globalThis.setTimeout(resolve, 80))
   const cached = startLoad(owner, firstContext, config)
   assertPayload(await cached.promise, resources.get(firstContext.url))
   if (fetchCount(firstContext.url) !== 3) {
@@ -222,6 +248,13 @@ try {
   }
   if (cached.loader.getCacheAge?.() !== 3) {
     throw new Error('fLoader 应当暴露缓存响应的 Age header')
+  }
+  if (
+    cached.loader.stats.loading.start <= completedAt.completedAt ||
+    cached.loader.stats.loading.end <= completedAt.completedAt ||
+    cached.loader.stats.bwEstimate !== owner.bandwidthEstimate
+  ) {
+    throw new Error('缓存 Segment 的网络时间应重新锚定到 fLoader 交付时刻')
   }
 
   const readySegment = owner.getDiagnostics().streams[0]?.segments[0]
@@ -393,6 +426,12 @@ try {
       requestMethods.get(followingFragment.url)?.join(',') !== 'HEAD'
     ) {
       throw new Error('后续 Segment 的 HEAD 可以提前完成, 但不能越过前序 Segment 发起 GET')
+    }
+    const followingModel = [...orderedPlanningOwner.state.streams.values()]
+      .flatMap(stream => [...stream.segments.values()])
+      .find(segment => segment.context.url === followingFragment.url)
+    if (followingModel?.startedAt !== undefined) {
+      throw new Error('HEAD 和等待前序 Segment 的时间不能启动媒体下载计时')
     }
 
     await waitForCondition(() =>

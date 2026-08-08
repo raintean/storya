@@ -14,6 +14,13 @@ export const DEFAULT_WINDOW_SIZE = 6
 
 const defaultIdleTimeoutMs = 5_000
 const defaultMaxRescueAttempts = 1
+const maxTransferSamples = 64
+
+interface TransferSample {
+  bytes: number
+  completedAt: number
+  startedAt: number
+}
 
 export interface ParallelSegmentLoaderOptions {
   chunkSize?: number
@@ -35,10 +42,12 @@ export class ParallelSegmentLoader {
   readonly state: ParallelSegmentLoaderState
   readonly windowSize: number
 
+  private bandwidthEstimateValue = 0
   private config: HlsConfig | undefined
   private readonly listeners = new Set<() => void>()
   private notificationScheduled = false
   private readonly transport: HttpTransport
+  private readonly transferSamples: TransferSample[] = []
   private updating = false
   private readonly workers: SegmentLoadWorker[]
 
@@ -83,6 +92,10 @@ export class ParallelSegmentLoader {
     return this.config
   }
 
+  get bandwidthEstimate(): number {
+    return this.bandwidthEstimateValue
+  }
+
   configure(config: HlsConfig): void {
     if (this.state.destroyed) {
       throw new Error('ParallelSegmentLoader 已经销毁')
@@ -125,8 +138,27 @@ export class ParallelSegmentLoader {
     return createParallelSegmentLoaderDiagnostics(
       this.state,
       this.maxConcurrency,
+      this.bandwidthEstimateValue,
       this.workers.map(worker => worker.getDiagnostics()),
     )
+  }
+
+  recordTransfer(bytes: number, startedAt: number, completedAt: number): void {
+    if (
+      !Number.isSafeInteger(bytes) ||
+      bytes <= 0 ||
+      !Number.isFinite(startedAt) ||
+      !Number.isFinite(completedAt) ||
+      completedAt <= startedAt
+    ) {
+      return
+    }
+
+    this.transferSamples.push({ bytes, completedAt, startedAt })
+    if (this.transferSamples.length > maxTransferSamples) {
+      this.transferSamples.splice(0, this.transferSamples.length - maxTransferSamples)
+    }
+    this.bandwidthEstimateValue = estimateBandwidth(this.transferSamples)
   }
 
   destroy(): void {
@@ -181,4 +213,36 @@ function requireNonNegativeInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${name} 必须是非负整数`)
   }
+}
+
+function estimateBandwidth(samples: readonly TransferSample[]): number {
+  // 并行 GET 的字节全部计入, 但重叠的活跃时间只计算一次
+  const sorted = [...samples].sort(
+    (left, right) => left.startedAt - right.startedAt || left.completedAt - right.completedAt,
+  )
+  let activeStartedAt: number | undefined
+  let activeCompletedAt = 0
+  let activeDuration = 0
+  let bytes = 0
+
+  for (const sample of sorted) {
+    bytes += sample.bytes
+    if (activeStartedAt === undefined) {
+      activeStartedAt = sample.startedAt
+      activeCompletedAt = sample.completedAt
+      continue
+    }
+    if (sample.startedAt > activeCompletedAt) {
+      activeDuration += activeCompletedAt - activeStartedAt
+      activeStartedAt = sample.startedAt
+      activeCompletedAt = sample.completedAt
+      continue
+    }
+    activeCompletedAt = Math.max(activeCompletedAt, sample.completedAt)
+  }
+
+  if (activeStartedAt !== undefined) {
+    activeDuration += activeCompletedAt - activeStartedAt
+  }
+  return activeDuration > 0 ? (bytes * 8 * 1000) / activeDuration : 0
 }

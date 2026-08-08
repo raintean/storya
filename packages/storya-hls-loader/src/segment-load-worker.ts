@@ -120,7 +120,6 @@ export class SegmentLoadWorker {
       }
 
       const generation = state.allocateGeneration()
-      segment.startedAt ??= startedAt
       if (candidate.type === 'head') {
         if (!segment.claimPlanning(this.id, generation, startedAt)) {
           return undefined
@@ -152,6 +151,7 @@ export class SegmentLoadWorker {
         }
         return undefined
       }
+      segment.startedAt ??= startedAt
       const requestStart = chunk.rangeEnabled
         ? segment.resourceStart + chunk.start
         : segment.resourceStart

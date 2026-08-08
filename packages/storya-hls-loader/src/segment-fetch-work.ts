@@ -45,10 +45,12 @@ export class SegmentFetchWork {
   private readonly loader: ParallelSegmentLoader
   private readonly planning: boolean
   private readonly rangeEnabled: boolean
+  private receivedBytes = 0
   private readonly resourceLength: number | undefined
   private readonly slowRescueEnabled: boolean
   private started = false
   private readonly transport: HttpTransport
+  private transferCompletedAt: number | undefined
 
   constructor(options: SegmentFetchWorkOptions) {
     this.chunkKey = options.chunkKey
@@ -77,6 +79,12 @@ export class SegmentFetchWork {
       this.completeChunk(result)
     } catch (cause) {
       this.finishFailedAttempt(cause)
+    } finally {
+      this.loader.recordTransfer(
+        this.receivedBytes,
+        this.startedAt,
+        this.transferCompletedAt ?? performance.now(),
+      )
     }
   }
 
@@ -181,7 +189,6 @@ export class SegmentFetchWork {
 
   private async readResponseBody(response: HttpTransportResponse): Promise<Uint8Array> {
     const parts: Uint8Array[] = []
-    let receivedBytes = 0
     let idleTimer: ReturnType<typeof globalThis.setTimeout> | undefined
     const resetIdleTimer = () => {
       if (!this.slowRescueEnabled) {
@@ -207,8 +214,8 @@ export class SegmentFetchWork {
       }
       const owned = data.slice()
       parts.push(owned)
-      receivedBytes += owned.byteLength
-      this.updateChunkProgress(receivedBytes)
+      this.receivedBytes += owned.byteLength
+      this.updateChunkProgress(this.receivedBytes)
       resetIdleTimer()
     }
 
@@ -243,8 +250,9 @@ export class SegmentFetchWork {
         globalThis.clearTimeout(idleTimer)
       }
     }
+    this.transferCompletedAt = performance.now()
 
-    const data = new Uint8Array(receivedBytes)
+    const data = new Uint8Array(this.receivedBytes)
     let offset = 0
     for (const part of parts) {
       data.set(part, offset)
