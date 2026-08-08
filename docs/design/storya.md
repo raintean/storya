@@ -26,7 +26,7 @@ Storya 当前包含三类运行端:
 - `storya-edge-worker` 是部署在 Cloudflare Workers 的边缘能力单元。当前实现 `/health` 和 `/transport`，通过流式 HTTP-over-WebSocket 协议透明转发 GET/HEAD；未来媒体能力可以作为独立模块加入。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
 - `storya-protocol` 是 Rust 和 TypeScript 共用的协议包。当前包含健康检查和 HTTP relay 控制消息的 Protobuf，以及 relay frame header codec；健康检查类型尚未接入 `storya-api` 的 HTTP 路由。
-- `storya-hls-loader` 是基于 hls.js fLoader 的并行加载包。它采用媒体类型无关的 VirtualStream、VirtualStreamSegment 和 VirtualStreamChunk 表达轨道、读取与缓存, 由多个独立 StreamFiller 在可配置的前向预填充窗口中自主领取和抢占 Chunk, 不负责媒体解码、解密或 transmux。
+- `storya-hls-loader` 是基于 hls.js 自定义 StreamController 和 fLoader 的并行加载包。`ParallelStreamController` 规划有序 Segment 窗口, `ParallelSegmentLoader` 持有多 VirtualStream 状态, 通过内部 Worker 和 `storya-transport` 完成 Segment 内 Range Chunk 与跨 Segment 并发, 并让预加载与 hls.js 正式读取共享数据; 默认网络实现为 Fetch。
 - `storya-transport` 提供通用 HTTP Transport 接口、原生 Fetch、多 Origin HTTP Proxy 和基于连接池的串行复用 WebSocket 实现。
 
 目标业务关系是:
@@ -95,7 +95,7 @@ services ----+
 - 不因为多个项目暂时存在相似代码就提前建立 `storya-ui`、`storya-sdk` 或其他公共包。
 - `storya-player` 保持框架无关，具体页面状态和产品交互留在对应应用。
 - `storya-protocol` 只描述跨边界数据，不承载业务流程或服务实现。
-- `storya-hls-loader` 依赖 `storya-transport`，但 Transport 不依赖 HLS 或媒体类型。
+- `storya-hls-loader` 依赖 `storya-transport`, Transport 不反向依赖 HLS 或媒体类型。
 
 当前已经存在 `storya-web -> storya-player`、`storya-hls-loader -> storya-transport -> storya-protocol` 和 `storya-edge-worker -> storya-protocol`。其他图中关系是已经采用但尚待实现的方向。
 
@@ -167,7 +167,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 - Rust 和 pnpm workspace 骨架。
 - Web、Admin、中心 API 和 Edge Worker 的最小可运行项目。
 - 框架无关播放器 Web Component。
-- HLS VirtualStreamRegistry 状态中心、Segment Reader、Chunk Writer、独立 StreamFiller、跨 Segment 预填充、Segment 内 Range 并行、请求抢占和慢速补救。
+- HLS 自定义主 StreamController、VirtualStream 有序窗口、共享 fLoader、统一 HTTP Transport、Range Chunk 并行、正式读取抢占、Segment 驱离和诊断快照。
 - 通用 Fetch/WebSocket HTTP Transport、串行复用连接池和流式 Edge Worker relay。
 - 多 Origin HTTP Proxy Transport 和无状态 Rust HTTP proxy。
 - Protobuf/Buf 跨语言生成链路。
@@ -183,7 +183,8 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 ## 修改历史
 
-- 2026-08-07: 完成 HLS 并行加载器架构重构, 采用媒体类型无关的 VirtualStream 层级和多个独立 StreamFiller, 删除中心 Scheduler 和 Session 需求协调。
+- 2026-08-08: 完成新 HLS 并行加载模型, 由 Controller 维护有序窗口, Loader 统一持有多 VirtualStream、Chunk Worker、fLoader、Transport、驱离和诊断。
+- 2026-08-07: 删除 HLS VirtualStream 与 StreamFiller 架构, 将并行加载器重建为 `ParallelStreamController` 和提供 fLoader 兼容的 `ParallelSegmentLoader`。
 - 2026-08-07: WebSocket relay 恢复 Protobuf 控制帧、128 KiB 流式 body 和 CANCEL，同时保留单连接串行 Keep-Alive 及现有连接池策略。
 - 2026-08-07: WebSocket relay 改为单 Request/Response 整包协议，删除流式分帧、取消、心跳和最大连接寿命；增加 TypeScript 手写二进制 codec 的 Protocol 例外。
 - 2026-08-06: 增加基于 cross 的 `x86_64-unknown-linux-musl` Rust workspace release 构建入口。

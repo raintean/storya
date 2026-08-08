@@ -18,7 +18,7 @@ storya-transport
 ```
 
 - `storya-transport` 提供统一的 `HttpTransport` 接口和三种网络实现。
-- `storya-hls-loader` 的独立 StreamFiller 负责 Range 规划、Chunk 领取、抢占、重试和流式 Transport 的慢速补救。
+- `storya-hls-loader` 的 `ParallelSegmentLoader` 持有一个 `HttpTransport`, 内部 Worker 通过它完成 Range Chunk 加载。默认使用 Fetch, example 可以选择 HTTP Proxy 或 WebSocket relay。HLS 语义始终留在 Loader 中。
 - `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。
 - `storya-edge-worker` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
 - WebSocket relay 的控制消息由 `storya-protocol` 中的 Protobuf schema 描述，媒体 body 使用原始二进制 frame。
@@ -90,7 +90,7 @@ Worker 以 128 KiB 为目标读取上游 body。每次为 frame header 和 body 
 
 WebSocket Transport 收到 `RESPONSE_HEAD` 后立即返回 `HttpTransportResponse`，后续 `RESPONSE_BODY` 逐帧进入 `ReadableStream`，`RESPONSE_END` 关闭流。
 
-Fetch、Proxy 和 WebSocket 对 Loader 统一表现为流式 Transport。Loader 对三者都启用首字节超时、响应流量空闲超时、完整加载超时和请求进行中的吞吐判断。稳定 Range Transport 被补救时从原 Chunk 起点重新请求，并丢弃已经收到的前缀，避免 CDN cache key 或 relay 请求边界发生变化。
+Fetch、Proxy 和 WebSocket 对 Loader 统一表现为流式 Transport。当前 `ParallelSegmentLoader` 使用 `arrayBuffer()` 完成一个 Chunk, 通过 Request AbortSignal 表达窗口取消、正式读取抢占和完整请求超时。首字节超时、响应流量空闲超时与慢速补救尚未迁移到新 Loader。
 
 ## 响应上限
 
@@ -156,10 +156,11 @@ Edge Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/re
 
 ## 实现状态
 
-Fetch、Proxy、WebSocket Transport、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL、串行复用连接池和统一 Loader 慢速补救均已实现。
+Fetch、Proxy、WebSocket Transport、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。新 `ParallelSegmentLoader` 已接入统一 Transport; 慢速补救尚未迁移。
 
 ## 修改历史
 
+- 2026-08-08: 新 `ParallelSegmentLoader` 接回统一 `HttpTransport`, 默认 Fetch, example 恢复 Fetch、HTTP Proxy 和 WebSocket relay 选择; 慢速补救明确为尚未迁移。
 - 2026-08-07: WebSocket relay 恢复流式 response 和 CANCEL；控制消息使用 Protobuf，body 使用 128 KiB 原始 frame；删除 `responseMode`，Loader 对所有 Transport 统一启用首字节、流量空闲和慢速补救。继续保留单连接串行 Keep-Alive、现有连接池策略，不恢复心跳和最大连接寿命。
 - 2026-08-07: Edge Worker 切换为 Paid 运行限制，CPU time 上限设为 300 秒、subrequest 上限设为 10,000，并关闭 `workers.dev` 与 Preview URL，仅保留 Dashboard 管理的 Custom Domain。
 - 2026-08-07: wire protocol 升级为 version 2；Response 删除 status text、正常响应的空 error message 和未重定向 URL，response header 改为固定 ID 白名单，Request header 长度字段同步收紧。

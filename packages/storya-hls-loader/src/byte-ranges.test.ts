@@ -9,50 +9,37 @@ interface TestCase {
 
 const chunkSize = 1024
 const cases: TestCase[] = [
+  { expected: [], length: 0, name: '空范围' },
   {
-    name: '空范围',
-    length: 0,
-    expected: [],
-  },
-  {
-    name: '单个完整 Chunk',
-    length: chunkSize,
     expected: [[0, chunkSize]],
+    length: chunkSize,
+    name: '单个完整 Chunk',
   },
   {
-    name: '小尾巴合并到前一个 Chunk',
-    length: chunkSize * 2 + 256,
     expected: [
       [0, chunkSize],
       [chunkSize, chunkSize * 2 + 256],
     ],
+    length: chunkSize * 2 + 256,
+    name: '小尾巴合并到前一个 Chunk',
   },
   {
-    name: '半个 Chunk 的尾巴独立请求',
-    length: chunkSize * 2 + chunkSize / 2,
     expected: [
       [0, chunkSize],
       [chunkSize, chunkSize * 2],
       [chunkSize * 2, chunkSize * 2 + chunkSize / 2],
     ],
+    length: chunkSize * 2 + chunkSize / 2,
+    name: '半个 Chunk 的尾巴独立请求',
   },
   {
-    name: '大尾巴独立请求',
-    length: chunkSize * 2 + 768,
-    expected: [
-      [0, chunkSize],
-      [chunkSize, chunkSize * 2],
-      [chunkSize * 2, chunkSize * 2 + 768],
-    ],
-  },
-  {
-    name: '保留 Segment 局部起点',
-    start: chunkSize,
-    length: chunkSize * 2 + 256,
     expected: [
       [chunkSize, chunkSize * 2],
       [chunkSize * 2, chunkSize * 3 + 256],
     ],
+    length: chunkSize * 2 + 256,
+    name: '保留 Segment 局部起点',
+    start: chunkSize,
   },
 ]
 

@@ -12,7 +12,7 @@ Storya 是一个由 Rust 和 TypeScript 构建的视频解决方案 monorepo。�
 - `services/storya-http-proxy`: Rust 无状态 HTTP proxy，通过 Cloudflare CDN 提供多域名 GET/HEAD 直通。
 - `services/storya-edge-worker`: 基于 Cloudflare Workers 的边缘能力部署单元，当前提供通用 HTTP relay。
 - `packages/storya-player`: 框架无关的 Web Component 播放器。
-- `packages/storya-hls-loader`: 基于虚拟流和 hls.js fLoader 的 HLS 并行加载器。
+- `packages/storya-hls-loader`: 基于自定义 hls.js StreamController 和 fLoader 的 HLS 并行加载器。
 - `packages/storya-transport`: 提供 Fetch、HTTP Proxy 和 HTTP-over-WebSocket Transport。
 - `packages/storya-protocol`: 使用 Protobuf 和 Buf 维护的 Rust/TypeScript 共用协议。
 
@@ -123,7 +123,7 @@ Memory 记录特定场景下需要长期保留的经验。遇到描述匹配的�
 设计文档描述当前采用的结构、职责、接口和关键取舍。修改对应范围前先阅读相关设计。
 
 - **Storya 总体设计** (`docs/design/storya.md`) - 仓库结构、组件边界、协议机制、依赖方向和当前实现范围。
-- **HLS 并行加载器设计** (`docs/design/hls-parallel-loader.md`) - VirtualStream 状态模型、Segment Reader、Chunk Writer、独立 Filler 和 fLoader 边界。
+- **HLS 并行加载器设计** (`docs/design/hls-parallel-loader.md`) - `ParallelStreamController`、fLoader 兼容的 `ParallelSegmentLoader`、VirtualStream 窗口、Chunk 调度和驱离边界。
 - **HTTP Transport 设计** (`docs/design/http-transport.md`) - 通用 HTTP Transport、WebSocket 连接池、线协议和 Edge Worker relay。
 
 ## 文档维护

@@ -2,13 +2,14 @@ import Hls from 'hls.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
-  createHlsParallelLoader,
   DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CONCURRENCY,
-  DEFAULT_PREFETCH_AHEAD_SEGMENTS,
+  DEFAULT_WINDOW_SIZE,
+  ParallelSegmentLoader,
+  ParallelStreamController,
 } from 'storya-hls-loader'
-import type { HlsLoaderDiagnosticsSnapshot, HlsLoaderSegmentEvent } from 'storya-hls-loader'
-import { ProxyHttpTransport, WebSocketHttpTransport } from 'storya-transport'
+import type { ParallelSegmentLoaderDiagnostics } from 'storya-hls-loader'
+import { FetchHttpTransport, ProxyHttpTransport, WebSocketHttpTransport } from 'storya-transport'
 
 import { VirtualStreamMap } from './virtual-stream-map'
 
@@ -45,14 +46,6 @@ interface LogEntryDetail {
 interface LogEntryOptions {
   details?: LogEntryDetail[]
   tag?: string
-}
-
-interface LoaderEventCounts {
-  cancelled: number
-  failed: number
-  preempted: number
-  ready: number
-  rescued: number
 }
 
 interface QualityLevel {
@@ -94,28 +87,20 @@ const initialFrontier: HlsFrontier = {
   loadingTime: 0,
 }
 
-const initialLoaderEventCounts: LoaderEventCounts = {
-  cancelled: 0,
-  failed: 0,
-  preempted: 0,
-  ready: 0,
-  rescued: 0,
-}
-
-const emptyDiagnostics: HlsLoaderDiagnosticsSnapshot = {
+const emptyDiagnostics: ParallelSegmentLoaderDiagnostics = {
   activeRequests: 0,
-  estimatedThroughputBytesPerSecond: 0,
-  fillers: [],
+  destroyed: false,
   maxConcurrency: DEFAULT_MAX_CONCURRENCY,
-  registryRevision: 0,
+  revision: 0,
   streams: [],
   timestamp: 0,
+  workers: [],
 }
 
 export function App() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
-  const parallelLoaderRef = useRef<ReturnType<typeof createHlsParallelLoader> | null>(null)
+  const parallelLoaderRef = useRef<ParallelSegmentLoader | null>(null)
   const logIdRef = useRef(0)
   const playbackLevelIndexRef = useRef(-1)
   const [loaderMode, setLoaderMode] = useState<LoaderMode>('parallel')
@@ -133,7 +118,6 @@ export function App() {
   const [frontier, setFrontier] = useState(initialFrontier)
   const [diagnostics, setDiagnostics] = useState(emptyDiagnostics)
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [loaderEventCounts, setLoaderEventCounts] = useState(initialLoaderEventCounts)
   const [error, setError] = useState<string | null>(null)
 
   const appendLog = useCallback(
@@ -199,7 +183,6 @@ export function App() {
       video.removeAttribute('src')
       video.load()
       setLogs([])
-      setLoaderEventCounts(initialLoaderEventCounts)
       setQualityLevels([])
       setSelectedLevel(-2)
       setPlaybackLevel(null)
@@ -242,7 +225,7 @@ export function App() {
             ? undefined
             : relayEndpoint === undefined
               ? proxyOrigins === undefined
-                ? undefined
+                ? new FetchHttpTransport()
                 : new ProxyHttpTransport(proxyOrigins)
               : new WebSocketHttpTransport(relayEndpoint, {
                   cancelTimeoutMs: websocketCancelTimeoutMs,
@@ -257,62 +240,7 @@ export function App() {
 
         const parallelLoader =
           loaderMode === 'parallel'
-            ? createHlsParallelLoader({
-                getPlaybackRate: () => video.playbackRate,
-                getPlaybackTime: () => video.currentTime,
-                onEvent: event => {
-                  if (event.type === 'segment-state') {
-                    countSegmentEvent(event, setLoaderEventCounts)
-                    appendSegmentStateLog(event, appendLog)
-                    return
-                  }
-
-                  const rescued = event.reason === 'slow-connection'
-                  setLoaderEventCounts(current => ({
-                    ...current,
-                    preempted: current.preempted + (rescued ? 0 : 1),
-                    rescued: current.rescued + (rescued ? 1 : 0),
-                  }))
-                  appendLog(
-                    rescued ? '慢速请求已中止并重新调度' : '低优先级请求已暂停并让出通道',
-                    rescued ? 'rescued' : 'preempted',
-                    {
-                      details: [
-                        {
-                          label: 'Segment',
-                          value: `${formatSegmentKey(event.segmentKey)} · ${event.segmentStart.toFixed(2)}s`,
-                        },
-                        {
-                          label: '请求范围',
-                          value: formatRange(event.requestStart, event.requestEnd),
-                        },
-                        {
-                          label: '本次加载',
-                          value: `${formatBytes(event.loadedBytes)} · Chunk ${formatBytes(event.chunkLoadedBytes)}`,
-                        },
-                        { label: '剩余数据', value: formatBytes(event.remainingBytes) },
-                        {
-                          label: '当前速率',
-                          value: formatThroughput(event.throughputBytesPerSecond),
-                        },
-                        ...(event.baselineThroughputBytesPerSecond === undefined
-                          ? []
-                          : [
-                              {
-                                label: '参考速率',
-                                value: formatThroughput(event.baselineThroughputBytesPerSecond),
-                              },
-                            ]),
-                        {
-                          label: '请求状态',
-                          value: `${event.elapsedMs.toFixed(0)} ms · Attempt ${event.attempt}`,
-                        },
-                      ],
-                      tag: rescued ? '慢速补救' : '请求抢占',
-                    },
-                  )
-                },
-                prefetchAheadSegments: DEFAULT_PREFETCH_AHEAD_SEGMENTS,
+            ? new ParallelSegmentLoader({
                 ...(transport === undefined ? {} : { transport }),
               })
             : null
@@ -323,9 +251,13 @@ export function App() {
           preferManagedMediaSource: true,
           preserveManualLevelOnError: true,
           progressive: false,
-          ...(parallelLoader === null ? {} : { fLoader: parallelLoader.fragmentLoader }),
+          ...(parallelLoader === null
+            ? {}
+            : {
+                fLoader: parallelLoader.fLoader,
+                streamController: ParallelStreamController,
+              }),
         })
-        parallelLoader?.attach(hls)
         hlsRef.current = hls
 
         hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
@@ -541,12 +473,20 @@ export function App() {
   const segments = diagnostics.streams.flatMap(stream => stream.segments)
   const cachedSegments = segments.filter(segment => segment.state === 'ready')
   const cachedBytes = cachedSegments.reduce(
-    (total, segment) => total + Math.max(segment.loadedBytes, segment.totalBytes),
+    (total, segment) => total + Math.max(segment.loadedBytes, segment.totalBytes ?? 0),
     0,
   )
   const neededSegments = segments.filter(
-    segment => segment.prefetch && segment.state !== 'ready',
+    segment => segment.windowIndex !== null && segment.state !== 'ready',
   ).length
+  const readyChunkBytes = segments
+    .flatMap(segment => segment.chunks)
+    .filter(chunk => chunk.state === 'ready')
+    .reduce((total, chunk) => total + chunk.loadedBytes, 0)
+  const chunks = segments.flatMap(segment => segment.chunks)
+  const readyChunks = chunks.filter(chunk => chunk.state === 'ready').length
+  const fillingChunks = chunks.filter(chunk => chunk.state === 'filling').length
+  const failedChunks = chunks.filter(chunk => chunk.state === 'failed').length
 
   return (
     <main className="app-shell">
@@ -624,8 +564,8 @@ export function App() {
         />
         <MetricCard
           accent="blue"
-          label="THROUGHPUT"
-          value={formatThroughput(diagnostics.estimatedThroughputBytesPerSecond)}
+          label="READY CHUNKS"
+          value={formatBytes(readyChunkBytes)}
           note={`hls estimate ${formatBandwidth(metrics.bandwidth)}`}
         />
       </section>
@@ -633,7 +573,7 @@ export function App() {
       <section className="workspace-grid">
         <div className="main-column">
           <section className="panel stream-panel">
-            <PanelHeading index="01" eyebrow="REGISTRY" title="虚拟流状态">
+            <PanelHeading index="01" eyebrow="LOADER STATE" title="VirtualStream 状态">
               <div className="stream-legend">
                 <span data-state="cached">缓存</span>
                 <span data-state="loading">填充</span>
@@ -714,6 +654,13 @@ export function App() {
                 <option value="proxy">HTTP Proxy</option>
                 <option value="websocket">WebSocket Relay</option>
               </select>
+              <p className="transport-note">
+                {transportMode === 'proxy'
+                  ? 'Proxy 的物理请求为可缓存 200, Loader 会从响应头恢复逻辑 206.'
+                  : transportMode === 'websocket'
+                    ? '媒体请求通过 WebSocket relay, Segment 中显示上游逻辑状态.'
+                    : 'Fetch 遇到 CORS 隐藏 Content-Range 时会用一个 HEAD 200 读取长度, 不重复下载完整 Segment.'}
+              </p>
               {loaderMode === 'parallel' && transportMode === 'websocket' ? (
                 <div className="transport-endpoint">
                   <label htmlFor="worker-url">WORKER URL</label>
@@ -765,11 +712,11 @@ export function App() {
                 </div>
                 <div>
                   <dt>PREFETCH AHEAD</dt>
-                  <dd>{DEFAULT_PREFETCH_AHEAD_SEGMENTS} segments</dd>
+                  <dd>{DEFAULT_WINDOW_SIZE - 1} segments</dd>
                 </div>
                 <div>
                   <dt>REGISTRY REVISION</dt>
-                  <dd>{diagnostics.registryRevision}</dd>
+                  <dd>{diagnostics.revision}</dd>
                 </div>
                 <div>
                   <dt>PLAYBACK LEVEL</dt>
@@ -783,17 +730,16 @@ export function App() {
             <div className="event-heading">
               <PanelHeading index="LOG" eyebrow="TELEMETRY" title="加载事件" />
               <div className="event-summary">
-                <span data-tone="success">完成 {loaderEventCounts.ready}</span>
-                <span data-tone="preempted">取消 {loaderEventCounts.cancelled}</span>
-                <span data-tone="error">失败 {loaderEventCounts.failed}</span>
-                <span data-tone="preempted">抢占 {loaderEventCounts.preempted}</span>
-                <span data-tone="rescued">补救 {loaderEventCounts.rescued}</span>
+                <span data-tone="success">Segment {cachedSegments.length}</span>
+                <span data-tone="success">Chunk {readyChunks}</span>
+                <span data-tone="preempted">填充 {fillingChunks}</span>
+                <span data-tone="error">失败 {failedChunks}</span>
+                <span data-tone="rescued">请求 {diagnostics.activeRequests}</span>
                 <button
                   type="button"
                   disabled={logs.length === 0}
                   onClick={() => {
                     setLogs([])
-                    setLoaderEventCounts(initialLoaderEventCounts)
                   }}
                 >
                   CLEAR
@@ -911,46 +857,6 @@ function EventLog({ logs }: { logs: LogEntry[] }) {
   )
 }
 
-function countSegmentEvent(
-  event: HlsLoaderSegmentEvent,
-  setCounts: React.Dispatch<React.SetStateAction<LoaderEventCounts>>,
-) {
-  if (event.action === 'reader-created') {
-    return
-  }
-  setCounts(current => ({
-    ...current,
-    cancelled: current.cancelled + (event.action === 'reader-cancelled' ? 1 : 0),
-    failed: current.failed + (event.action === 'reader-failed' ? 1 : 0),
-    ready: current.ready + (event.action === 'reader-ready' ? 1 : 0),
-  }))
-}
-
-function appendSegmentStateLog(
-  event: HlsLoaderSegmentEvent,
-  appendLog: (message: string, tone?: LogTone, options?: LogEntryOptions) => void,
-) {
-  const definitions: Partial<
-    Record<HlsLoaderSegmentEvent['action'], [message: string, tag: string, tone: LogTone]>
-  > = {
-    'reader-cancelled': ['hls.js 已取消 Segment Reader', '读取取消', 'preempted'],
-    'reader-created': ['hls.js 已提交 Segment Reader', '读取需求', 'default'],
-    'reader-failed': ['Segment Reader 读取失败', '读取失败', 'error'],
-    'reader-ready': ['Segment Reader 已取得完整数据', '读取完成', 'success'],
-  }
-  const definition = definitions[event.action]
-  if (definition === undefined) {
-    return
-  }
-  appendLog(`${definition[0]} ${String(event.segmentSn)}`, definition[2], {
-    details: [
-      { label: '虚拟流', value: event.streamId },
-      { label: '时间位置', value: `${event.segmentStart.toFixed(2)}s` },
-    ],
-    tag: definition[1],
-  })
-}
-
 function formatLevelLabel(
   level: { averageBitrate: number; height?: number },
   index: number,
@@ -983,10 +889,6 @@ function formatBandwidth(value: number): string {
   return value > 0 ? `${(value / 1_000_000).toFixed(2)} Mbps` : 'WAITING'
 }
 
-function formatThroughput(bytesPerSecond: number): string {
-  return formatBandwidth(bytesPerSecond * 8)
-}
-
 function formatBytes(value: number | undefined): string {
   if (value === undefined) {
     return 'UNKNOWN'
@@ -998,10 +900,6 @@ function formatBytes(value: number | undefined): string {
     return `${(value / 1024).toFixed(1)} KiB`
   }
   return `${(value / (1024 * 1024)).toFixed(2)} MiB`
-}
-
-function formatRange(start: number, endExclusive: number | undefined): string {
-  return `${formatBytes(start)} – ${endExclusive === undefined ? 'EOF' : formatBytes(endExclusive)}`
 }
 
 function formatTransportMode(mode: TransportMode | null): string {
@@ -1021,13 +919,8 @@ function formatLoaderMode(mode: LoaderMode | null): string {
   return mode === 'parallel' ? 'Parallel Range' : 'hls.js Native'
 }
 
-function hasActiveReader(stream: HlsLoaderDiagnosticsSnapshot['streams'][number]): boolean {
+function hasActiveReader(stream: ParallelSegmentLoaderDiagnostics['streams'][number]): boolean {
   return stream.segments.some(segment => segment.readerCount > 0)
-}
-
-function formatSegmentKey(key: string): string {
-  const sequence = /(?:^|\|)sn:([^|]+)/u.exec(key)?.[1]
-  return sequence === undefined ? key : `S${sequence}`
 }
 
 function parseProxyOrigins(value: string): string[] {

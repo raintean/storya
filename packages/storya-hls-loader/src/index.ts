@@ -1,25 +1,18 @@
 export {
-  createHlsParallelLoader,
   DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CONCURRENCY,
-  DEFAULT_PREFETCH_AHEAD_SEGMENTS,
-} from './hls-parallel-loader'
-export type { HlsParallelLoader, HlsParallelLoaderOptions } from './hls-parallel-loader'
+  DEFAULT_WINDOW_SIZE,
+  ParallelSegmentLoader,
+} from './parallel-segment-loader'
+export type { ParallelSegmentLoaderOptions } from './parallel-segment-loader'
+export { ParallelStreamController } from './parallel-stream-controller'
 export type {
-  HlsLoaderDiagnosticChunk,
-  HlsLoaderDiagnosticChunkState,
-  HlsLoaderDiagnosticFrontier,
-  HlsLoaderDiagnosticSegment,
-  HlsLoaderDiagnosticSegmentState,
-  HlsLoaderDiagnosticsSnapshot,
-  HlsLoaderDiagnosticStream,
+  ChunkDiagnostics,
+  DiagnosticChunkState,
+  DiagnosticSegmentState,
+  DiagnosticWorkerState,
+  ParallelSegmentLoaderDiagnostics,
+  SegmentDiagnostics,
+  VirtualStreamDiagnostics,
+  WorkerDiagnostics,
 } from './diagnostics'
-export type {
-  HlsLoaderAbortEvent,
-  HlsLoaderAbortReason,
-  HlsLoaderEvent,
-  HlsLoaderEventHandler,
-  HlsLoaderSegmentAction,
-  HlsLoaderSegmentEvent,
-} from './events'
-export type { StreamFillerStateName, StreamFillerStateSnapshot } from './stream-filler'

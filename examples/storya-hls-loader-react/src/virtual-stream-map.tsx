@@ -1,16 +1,15 @@
 import { useRef } from 'react'
 import type {
-  HlsLoaderDiagnosticChunk,
-  HlsLoaderDiagnosticFrontier,
-  HlsLoaderDiagnosticSegment,
-  HlsLoaderDiagnosticsSnapshot,
-  HlsLoaderDiagnosticStream,
+  ChunkDiagnostics,
+  ParallelSegmentLoaderDiagnostics,
+  SegmentDiagnostics,
+  VirtualStreamDiagnostics,
 } from 'storya-hls-loader'
 
 interface VirtualStreamMapProps {
   levelLabels: Map<number, string>
   playbackTime: number
-  snapshot: HlsLoaderDiagnosticsSnapshot
+  snapshot: ParallelSegmentLoaderDiagnostics
 }
 
 const minimumTimelineSpan = 12
@@ -99,7 +98,7 @@ export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: Virtua
   )
 }
 
-function compareStreams(left: HlsLoaderDiagnosticStream, right: HlsLoaderDiagnosticStream): number {
+function compareStreams(left: VirtualStreamDiagnostics, right: VirtualStreamDiagnostics): number {
   return left.id.localeCompare(right.id)
 }
 
@@ -110,14 +109,13 @@ function StreamRow({
 }: {
   bounds: TimelineBounds
   label: string
-  stream: HlsLoaderDiagnosticStream
+  stream: VirtualStreamDiagnostics
 }) {
   const cached = stream.segments.filter(segment => segment.state === 'ready').length
   const pending = stream.segments.filter(
-    segment => segment.prefetch && segment.state !== 'ready',
+    segment => segment.windowIndex !== null && segment.state !== 'ready',
   ).length
   const readerCount = stream.segments.reduce((total, segment) => total + segment.readerCount, 0)
-  const frontier = stream.frontier
   return (
     <div className={`stream-row ${readerCount > 0 ? 'has-readers' : ''}`}>
       <div className="stream-label">
@@ -126,44 +124,26 @@ function StreamRow({
         <span>
           reader {readerCount} · cache {cached} · need {pending}
         </span>
-        {frontier === undefined ? null : (
-          <span>
-            frontier g{frontier.generation} · {getFrontierLabel(frontier)}
-          </span>
-        )}
+        <span>window {stream.window.length} · revision driven</span>
       </div>
       <div className="segment-track">
         {stream.segments.map(segment => (
-          <SegmentCell
-            bounds={bounds}
-            frontier={stream.frontier?.segmentKey === segment.key}
-            key={segment.key}
-            segment={segment}
-          />
+          <SegmentCell bounds={bounds} key={segment.key} segment={segment} />
         ))}
       </div>
     </div>
   )
 }
 
-function SegmentCell({
-  bounds,
-  frontier,
-  segment,
-}: {
-  bounds: TimelineBounds
-  frontier: boolean
-  segment: HlsLoaderDiagnosticSegment
-}) {
+function SegmentCell({ bounds, segment }: { bounds: TimelineBounds; segment: SegmentDiagnostics }) {
   const end = segment.start + Math.max(segment.duration, 0.01)
   const left = toPercent(segment.start, bounds)
   const width = Math.max(0.8, toPercent(end, bounds) - left)
   const classes = [
     'segment-cell',
     `is-${segment.state}`,
-    segment.prefetch ? 'is-prefetch' : '',
+    segment.windowIndex !== null ? 'is-prefetch' : '',
     segment.readerCount > 0 ? 'has-readers' : '',
-    frontier ? 'is-frontier' : '',
   ]
     .filter(Boolean)
     .join(' ')
@@ -187,24 +167,18 @@ function SegmentCell({
   )
 }
 
-function ChunkCell({
-  chunk,
-  segment,
-}: {
-  chunk: HlsLoaderDiagnosticChunk
-  segment: HlsLoaderDiagnosticSegment
-}) {
+function ChunkCell({ chunk, segment }: { chunk: ChunkDiagnostics; segment: SegmentDiagnostics }) {
   const total = Math.max(
-    segment.totalBytes,
-    ...segment.chunks.map(item => item.endOffset ?? item.startOffset + item.receivedBytes),
+    segment.totalBytes ?? 0,
+    ...segment.chunks.map(item => item.endExclusive ?? item.start + item.loadedBytes),
     1,
   )
-  const end = chunk.endOffset ?? total
-  const left = (chunk.startOffset / total) * 100
-  const width = Math.max(3, ((end - chunk.startOffset) / total) * 100)
+  const end = chunk.endExclusive ?? total
+  const left = (chunk.start / total) * 100
+  const width = Math.max(3, ((end - chunk.start) / total) * 100)
   return (
     <i
-      className={`chunk is-${chunk.state} ${chunk.preemptions > 0 ? 'was-preempted' : ''}`}
+      className={`chunk is-${getChunkStyleState(chunk)}`}
       style={{ left: `${left}%`, width: `${width}%` }}
       title={createChunkTitle(chunk)}
     />
@@ -216,7 +190,7 @@ interface TimelineBounds {
   start: number
 }
 
-function findSegmentBounds(streams: HlsLoaderDiagnosticStream[]): TimelineBounds {
+function findSegmentBounds(streams: VirtualStreamDiagnostics[]): TimelineBounds {
   const segments = streams.flatMap(stream => stream.segments)
   const first = Math.min(...segments.map(segment => segment.start))
   const last = Math.max(...segments.map(segment => segment.start + segment.duration))
@@ -225,7 +199,7 @@ function findSegmentBounds(streams: HlsLoaderDiagnosticStream[]): TimelineBounds
 
 function updateTimelineViewport(
   current: TimelineViewport | null,
-  streams: HlsLoaderDiagnosticStream[],
+  streams: VirtualStreamDiagnostics[],
   streamKey: string,
   playbackTime: number,
 ): TimelineViewport {
@@ -309,7 +283,7 @@ function findMarkerEdge(value: number, bounds: TimelineBounds): 'after' | 'befor
 }
 
 function getStreamLabel(
-  stream: HlsLoaderDiagnosticStream,
+  stream: VirtualStreamDiagnostics,
   levelLabels: Map<number, string>,
 ): string {
   const [kind, identity] = stream.id.split(':')
@@ -340,52 +314,56 @@ function getStreamTypeLabel(streamId: string): string {
   return 'VIRTUAL STREAM'
 }
 
-function getFrontierLabel(frontier: HlsLoaderDiagnosticFrontier): string {
-  if (frontier.barrier) {
-    return 'BARRIER'
-  }
-  return frontier.confirmed ? 'CONFIRMED' : 'PROVISIONAL'
-}
-
-function getSegmentStateLabel(segment: HlsLoaderDiagnosticSegment): string {
+function getSegmentStateLabel(segment: SegmentDiagnostics): string {
+  let label: string
   if (segment.readerCount > 0) {
-    return segment.state === 'failed' ? 'READER · FAILED' : 'HLS READER'
+    label = segment.state === 'failed' ? 'READER · FAILED' : 'HLS READER'
+  } else if (segment.state === 'ready') {
+    label = 'CACHED'
+  } else if (segment.state === 'filling') {
+    label = segment.windowIndex !== null ? 'PREFETCH' : 'LOADING'
+  } else if (segment.state === 'failed') {
+    label = 'FAILED'
+  } else {
+    label = segment.windowIndex !== null ? 'NEEDED' : 'EMPTY'
   }
-  if (segment.state === 'ready') {
-    return 'CACHED'
-  }
-  if (segment.state === 'filling') {
-    return segment.prefetch ? 'PREFETCH' : 'LOADING'
-  }
-  if (segment.state === 'failed') {
-    return 'FAILED'
-  }
-  return segment.prefetch ? 'NEEDED' : 'EMPTY'
+  return `${label} · ${segment.httpStatus || '—'}${segment.sequential ? ' SEQ' : ''}`
 }
 
-function createSegmentTitle(segment: HlsLoaderDiagnosticSegment): string {
+function createSegmentTitle(segment: SegmentDiagnostics): string {
   return [
     `Segment ${segment.key}`,
     `${segment.start.toFixed(2)}s – ${(segment.start + segment.duration).toFixed(2)}s`,
     getSegmentStateLabel(segment),
-    `readers ${segment.readerCount} · prefetch ${segment.prefetch ? 'yes' : 'no'}`,
+    `readers ${segment.readerCount} · window ${segment.windowIndex ?? 'no'}`,
+    `HTTP ${segment.httpStatus || '—'} · ${segment.sequential ? 'sequential' : 'range chunks'}`,
     `${formatBytes(segment.loadedBytes)} / ${formatBytes(segment.totalBytes)}`,
   ].join('\n')
 }
 
-function createChunkTitle(chunk: HlsLoaderDiagnosticChunk): string {
+function createChunkTitle(chunk: ChunkDiagnostics): string {
   return [
     `Chunk ${chunk.key} · ${chunk.state}`,
-    `${formatBytes(chunk.startOffset)} – ${formatBytes(chunk.endOffset)}`,
-    `received ${formatBytes(chunk.receivedBytes)}`,
-    `filler ${chunk.fillerId ?? '—'} · writer ${chunk.writerId ?? '—'}`,
-    `slow ${chunk.slowRetries} · preempted ${chunk.preemptions} · retry ${chunk.networkRetries}`,
+    `${formatBytes(chunk.start)} – ${formatBytes(chunk.endExclusive)}`,
+    `received ${formatBytes(chunk.loadedBytes)}`,
+    `fill ${chunk.fillId ?? '—'} · attempt ${chunk.attempt}`,
+    chunk.failure ?? 'no failure',
   ].join('\n')
 }
 
 function formatSegmentKey(key: string): string {
-  const sequence = /(?:^|\|)sn:([^|]+)/u.exec(key)?.[1]
+  const sequence = key.split('\n')[2]
   return sequence === undefined ? key : `S${sequence}`
+}
+
+function getChunkStyleState(chunk: ChunkDiagnostics): string {
+  if (chunk.state === 'ready') {
+    return 'complete'
+  }
+  if (chunk.state === 'filling') {
+    return 'loading'
+  }
+  return chunk.state === 'empty' ? 'queued' : 'failed'
 }
 
 function formatTime(value: number): string {

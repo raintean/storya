@@ -2,41 +2,55 @@ import type {
   FragmentLoaderConstructor,
   FragmentLoaderContext,
   HlsConfig,
-  Loader,
+  Loader as HlsLoader,
   LoaderCallbacks,
   LoaderConfiguration,
   LoaderStats,
 } from 'hls.js'
-import type { HttpTransportResponse } from 'storya-transport'
-import { VirtualStreamReadFailure, VirtualStreamSegmentReader } from './virtual-stream'
-import type { VirtualStreamSegmentResult } from './virtual-stream'
-import { copyVirtualStreamStatistics, createLoaderStats } from './stats'
+import { copyLoaderStats, createLoaderStats } from './stats'
 
-export interface FragmentLoaderSession {
-  configure(config: HlsConfig): void
-  read(
-    context: FragmentLoaderContext,
-    config: LoaderConfiguration,
-    stats: LoaderStats,
-  ): VirtualStreamSegmentReader
+export interface SegmentLoadFailure {
+  code: number
+  message: string
+  response: Response | null
 }
 
-export function createVirtualFragmentLoader(
-  session: FragmentLoaderSession,
-): FragmentLoaderConstructor {
-  return class StoryaVirtualFragmentLoader implements Loader<FragmentLoaderContext> {
+export type SegmentObservation =
+  | { state: 'pending'; stats: LoaderStats }
+  | { failure: SegmentLoadFailure; state: 'failed'; stats: LoaderStats }
+  | {
+      code: number
+      data: ArrayBuffer
+      response: Response
+      state: 'ready'
+      stats: LoaderStats
+      url: string
+    }
+
+export interface FragmentLoaderOwner {
+  readonly revision: number
+
+  configure(config: HlsConfig): void
+  inspectSegment(context: FragmentLoaderContext): SegmentObservation
+  startReading(context: FragmentLoaderContext): void
+  stopReading(context: FragmentLoaderContext): void
+  waitForChange(afterRevision: number, signal: AbortSignal): Promise<void>
+}
+
+export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): FragmentLoaderConstructor {
+  return class StoryaFragmentLoader implements HlsLoader<FragmentLoaderContext> {
     context: FragmentLoaderContext | null = null
     stats: LoaderStats = createLoaderStats()
 
     private callbacks: LoaderCallbacks<FragmentLoaderContext> | undefined
-    private loadTimer: number | undefined
-    private networkDetails: HttpTransportResponse | null = null
-    private progressive = false
-    private reader: VirtualStreamSegmentReader | undefined
+    private readonly changeController = new AbortController()
+    private networkDetails: Response | null = null
+    private reading = false
     private settled = false
+    private timeoutTimer: ReturnType<typeof globalThis.setTimeout> | undefined
 
     constructor(config: HlsConfig) {
-      session.configure(config)
+      owner.configure(config)
     }
 
     load(
@@ -44,44 +58,43 @@ export function createVirtualFragmentLoader(
       config: LoaderConfiguration,
       callbacks: LoaderCallbacks<FragmentLoaderContext>,
     ): void {
-      if (this.reader !== undefined) {
-        throw new Error('fLoader 的实例只能加载一次')
+      if (this.context !== null) {
+        throw new Error('fLoader 实例只能加载一个 Segment')
       }
+
       this.context = context
       this.callbacks = callbacks
-      this.progressive = callbacks.onProgress !== undefined && Number.isFinite(config.highWaterMark)
-      const reader = session.read(context, config, this.stats)
-      this.reader = reader
+      this.reading = true
+      owner.startReading(context)
+
       const maxLoadTimeMs = config.loadPolicy.maxLoadTimeMs
       if (Number.isFinite(maxLoadTimeMs) && maxLoadTimeMs > 0) {
-        this.loadTimer = globalThis.setTimeout(() => this.timeout(), maxLoadTimeMs)
+        this.timeoutTimer = globalThis.setTimeout(() => this.timeout(), maxLoadTimeMs)
       }
-      void reader.result.then(
-        result => this.succeed(result),
-        cause => this.fail(cause),
-      )
+      void this.observe(config)
     }
 
     abort(): void {
-      if (this.settled || this.reader === undefined || this.context === null) {
+      if (this.settled || this.context === null) {
         return
       }
+
+      const context = this.context
       this.settled = true
-      this.clearLoadTimer()
+      this.clearTimeout()
+      this.changeController.abort()
+      this.stopReading()
       this.stats.aborted = true
       this.stats.loading.end = performance.now()
-      this.reader.cancel()
-      this.callbacks?.onAbort?.(this.stats, this.context, this.networkDetails)
+      this.callbacks?.onAbort?.(this.stats, context, this.networkDetails)
     }
 
     destroy(): void {
-      if (!this.settled) {
-        this.reader?.cancel()
-      }
-      this.clearLoadTimer()
       this.settled = true
+      this.clearTimeout()
+      this.changeController.abort()
+      this.stopReading()
       this.callbacks = undefined
-      this.reader = undefined
       this.context = null
     }
 
@@ -94,61 +107,76 @@ export function createVirtualFragmentLoader(
       return this.networkDetails?.headers.get(name) ?? null
     }
 
-    private succeed(result: VirtualStreamSegmentResult): void {
+    private async observe(config: LoaderConfiguration): Promise<void> {
+      while (!this.settled && this.context !== null) {
+        const revision = owner.revision
+        const observation = owner.inspectSegment(this.context)
+        copyLoaderStats(this.stats, observation.stats)
+
+        if (observation.state === 'ready') {
+          this.succeed(observation, config)
+          return
+        }
+        if (observation.state === 'failed') {
+          this.fail(observation.failure)
+          return
+        }
+
+        try {
+          await owner.waitForChange(revision, this.changeController.signal)
+        } catch {
+          return
+        }
+      }
+    }
+
+    private succeed(
+      result: Extract<SegmentObservation, { state: 'ready' }>,
+      config: LoaderConfiguration,
+    ): void {
       if (this.settled || this.context === null) {
         return
       }
-      this.settled = true
-      this.clearLoadTimer()
-      this.networkDetails = result.networkDetails
-      copyVirtualStreamStatistics(this.stats, result.statistics)
+
+      const context = this.context
       const callbacks = this.callbacks
       const data = result.data.slice(0)
+      const progressive =
+        callbacks?.onProgress !== undefined && Number.isFinite(config.highWaterMark)
+
+      this.settled = true
+      this.clearTimeout()
+      this.networkDetails = result.response
+      this.stopReading()
       if (callbacks?.onProgress !== undefined) {
-        callbacks.onProgress(this.stats, this.context, data, result.networkDetails)
+        callbacks.onProgress(this.stats, context, data, result.response)
       }
       callbacks?.onSuccess(
-        this.progressive
-          ? { code: result.code, data: new ArrayBuffer(0), url: result.url }
-          : { code: result.code, data, url: result.url },
+        {
+          code: result.code,
+          data: progressive ? new ArrayBuffer(0) : data,
+          url: result.url,
+        },
         this.stats,
-        this.context,
-        result.networkDetails,
+        context,
+        result.response,
       )
     }
 
-    private fail(cause: unknown): void {
+    private fail(failure: SegmentLoadFailure): void {
       if (this.settled || this.context === null) {
         return
       }
+
+      const context = this.context
       this.settled = true
-      this.clearLoadTimer()
-
-      if (cause instanceof VirtualStreamReadFailure) {
-        this.networkDetails = cause.networkDetails
-        if (cause.kind === 'timeout') {
-          this.callbacks?.onTimeout(this.stats, this.context, cause.networkDetails)
-          return
-        }
-        if (cause.kind === 'aborted') {
-          this.stats.aborted = true
-          this.callbacks?.onAbort?.(this.stats, this.context, cause.networkDetails)
-          return
-        }
-        this.callbacks?.onError(
-          { code: cause.code, text: cause.message },
-          this.context,
-          cause.networkDetails,
-          this.stats,
-        )
-        return
-      }
-
-      const error = cause instanceof Error ? cause : new Error('未知 Segment 加载错误')
+      this.clearTimeout()
+      this.networkDetails = failure.response
+      this.stopReading()
       this.callbacks?.onError(
-        { code: 0, text: error.message },
-        this.context,
-        this.networkDetails,
+        { code: failure.code, text: failure.message },
+        context,
+        failure.response,
         this.stats,
       )
     }
@@ -157,18 +185,30 @@ export function createVirtualFragmentLoader(
       if (this.settled || this.context === null) {
         return
       }
+
+      const context = this.context
       this.settled = true
-      this.loadTimer = undefined
+      this.timeoutTimer = undefined
+      this.changeController.abort()
+      this.stopReading()
       this.stats.loading.end = performance.now()
-      this.reader?.cancel()
-      this.callbacks?.onTimeout(this.stats, this.context, this.networkDetails)
+      this.callbacks?.onTimeout(this.stats, context, this.networkDetails)
     }
 
-    private clearLoadTimer(): void {
-      if (this.loadTimer !== undefined) {
-        globalThis.clearTimeout(this.loadTimer)
-        this.loadTimer = undefined
+    private clearTimeout(): void {
+      if (this.timeoutTimer === undefined) {
+        return
       }
+      globalThis.clearTimeout(this.timeoutTimer)
+      this.timeoutTimer = undefined
+    }
+
+    private stopReading(): void {
+      if (!this.reading || this.context === null) {
+        return
+      }
+      this.reading = false
+      owner.stopReading(this.context)
     }
   }
 }

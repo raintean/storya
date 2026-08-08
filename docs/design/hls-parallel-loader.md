@@ -1,481 +1,369 @@
 # HLS 并行加载器设计
 
-本文描述 `storya-hls-loader` 当前采用的设计。加载器只负责把 hls.js 的读取映射到虚拟流, 并通过多个独立填充器并行获取原始媒体字节。它不负责解码、解密、transmux、ABR 或向 SourceBuffer 追加媒体。
+本文描述 `storya-hls-loader` 当前采用的 HLS Segment/Chunk 并行加载设计。实现基于 hls.js `1.7.0-rc.3`, 公开接口只包含 `ParallelStreamController` 和 `ParallelSegmentLoader`。
 
 ## 设计目标
 
-- 一条实际轨道对应一条独立 VirtualStream, 多条 VirtualStream 可以同时被读取和填充。
-- 虚拟流核心不理解音频、视频、清晰度、字幕等媒体类型。
-- hls.js fLoader 只提交或取消 Segment 读取, 并在数据 ready 后消费结果。
-- Segment 的存在表达轨道 topology, Chunk 的存在表达当前填充或缓存意图。
-- 多个 StreamFiller 是长期运行且彼此独立的 worker, 自己观察、领取、抢占和补救。
-- 实际媒体字节长期存放在 VirtualStreamChunk 中, 可以跨 filler 和网络 attempt 保留。
-- 所有 filler 共享一份 HttpTransport, Transport 不理解虚拟流和调度语义。
-- 状态变化只增加可观察 revision, 不由状态拥有者直接调用下游组件。
-- 诊断是可删除的只读投影, 不反向影响核心状态。
+- 保留 hls.js 原生的选片、ABR、解密、transmux、错误恢复和 SourceBuffer append 流程。
+- 由 Controller 明确规划当前及后续 Segment 的激活窗口。
+- 同时加载多个 Segment, 并在每个 Segment 内使用 Range Chunk 并行加载。
+- hls.js 正式读取和后台窗口填充共享同一份 Segment/Chunk 状态和数据。
+- 窗口推进只取消真正离开窗口且没有正式读取者的 Segment, 不使重叠部分失效。
+- 所有共享状态修改保持同步、原子和可诊断, 不跨越 `await`。
+- 不建立独立 Registry、Filler、Scheduler、Reader 或 Writer 领域组件。
+
+## 非目标
+
+当前设计不负责:
+
+- 改写 hls.js 的顺序解析和 append 状态机。
+- 让多个 Segment 同时进入 transmux 或 SourceBuffer。
+- LL-HLS Part 的向前预加载窗口。Part 的正式 fLoader 请求仍然可以按 Chunk 加载。
+- alternate audio 和 subtitle 的向前预加载窗口。数据模型支持多轨道, 当前只有 main Controller 维护窗口。
+- 慢速连接识别、吞吐补救和网络重试策略。相关能力在基础 Chunk 调度稳定后再加入。
 
 ## 总体结构
 
 ```text
-                         playlist topology
-                                |
-                                v
-hls.js fLoader -------> VirtualStreamRegistry <------- StreamFiller 1
- SegmentReader           +-- VirtualStream     <------- StreamFiller 2
-                         |   +-- Segment        <------- StreamFiller 3
-                         |       +-- Reader[]             |
-                         |       +-- Chunk[]              |
-                         |           +-- Writer?          v
-                         |                         shared HttpTransport
-                         |
-                         +-- revision / snapshot
+hls.js
+  |
+  +-- ParallelStreamController
+  |      |
+  |      +-- replaceWindow(main stream, [s1..s6])
+  |      +-- super.loadFragment(s1)
+  |
+  +-- fLoader.load(s1)
+         |
+         +-- readerCount + 1
+         +-- 观察全局 revision
+         +-- Segment ready 后返回 ArrayBuffer
+
+ParallelSegmentLoader
+  |
+  +-- streams: Map<StreamId, VirtualStream>
+  +-- revision + listeners
+  +-- logical workers
+  +-- HttpTransport
+  +-- fLoader 构造器
+  +-- getDiagnostics()
 ```
 
-`HlsParallelLoaderSession` 是 composition root, 只负责创建和销毁 VirtualStreamRegistry、fLoader adapter、固定数量的 StreamFiller 和共享 HttpTransport。它不参与需求判断、优先级、任务分配、抢占或补救。
-
-系统不包含 StreamFillerRegistry、中心 Scheduler 或共享任务队列。全局并发上限由长期运行的 StreamFiller 数量自然保证。
-
-## 核心不变量
-
-1. 一条实际轨道在一个加载会话内只有一个 VirtualStream。
-2. VirtualStream 不保存 `kind`、`selected` 或 `active` 等媒体选择状态。
-3. 一次 fLoader `load()` 对应一个 VirtualStreamSegmentReader。
-4. Reader 只能取消自己, 多个 Reader 可以共享一个 Segment。
-5. 一个 VirtualStreamChunk 同时最多存在一个 VirtualStreamChunkWriter。
-6. Chunk 中已经接受的数据不属于 Writer, Writer 释放后数据继续存在。
-7. 只有当前有效且 content version 一致的 Writer 才能修改 Chunk。
-8. Filler 不接收 Session 或 Registry 发出的执行命令, 只观察状态并自行收敛。
-9. Transport 只执行 HTTP request, 不理解 Reader、Segment、Chunk、Writer、优先级或补救。
-10. 调用诊断接口不得修改状态、增加 revision 或影响 Filler 决策。
-
-## VirtualStreamRegistry
-
-VirtualStreamRegistry 是虚拟流领域状态的根。它保存多个 VirtualStream, 负责把 hls.js adapter 提供的稳定轨道身份和资源描述映射到对应 Stream 与 Segment。
-
-Registry 提供三类能力:
-
-```ts
-interface VirtualStreamRegistry {
-  readonly revision: number
-
-  updateStream(
-    streamId: VirtualStreamId,
-    descriptors: readonly VirtualStreamSegmentDescriptor[],
-  ): void
-
-  mergeStream(sourceId: VirtualStreamId, targetId: VirtualStreamId): void
-
-  createSegmentReader(request: VirtualStreamReadRequest): VirtualStreamSegmentReader
-
-  tryAcquireChunkWriter(
-    request: VirtualStreamChunkWriteRequest,
-  ): VirtualStreamChunkWriter | undefined
-
-  trySwitchChunkWriter(
-    currentWriter: VirtualStreamChunkWriter,
-    target: VirtualStreamChunkWriteRequest,
-  ): VirtualStreamChunkWriter | undefined
-
-  snapshot(): VirtualStreamRegistrySnapshot
-
-  waitForChange(afterRevision: number, signal?: AbortSignal): Promise<number>
-}
-```
-
-- Command: 创建 Reader、更新 topology、执行跨 Chunk 的原子 Writer 切换。
-- Query: 返回不包含媒体 body 的只读 snapshot。
-- Observe: 等待 revision 变化后重新读取最新 snapshot。
-
-Registry、Stream、Segment 和 Chunk 共享同一个 change clock。内部发生有意义的状态变化时只增加 revision 并唤醒观察者, 不直接调用 fLoader 或 StreamFiller。
-
-通知只表达“状态已经变化”。观察者可以跳过中间 revision, 因为当前事实始终可以从最新 snapshot 恢复。
-
-### 稳定轨道身份
-
-hls.js adapter 必须为每条实际轨道提供稳定 VirtualStreamId。VirtualStreamId 不得直接使用 Segment URL、playlist URL、CDN pathway 或重定向后的 URL, 因为这些地址可能在同一轨道生命周期内变化。
-
-playlist topology 事件可能晚于首次 fLoader `load()` 到达。adapter 可以先建立 provisional 映射, topology 完整后必须把它归并到同一个 canonical VirtualStream, 不能为同一轨道保留两份 Segment、Reader 或 Chunk 状态。
-
-媒体类型只允许作为 adapter 或诊断层的可选 label, 不得参与虚拟流行为和填充优先级。
-
-hls.js adapter 必须先把 `FragmentLoaderContext`、`HlsConfig`、`LoaderConfiguration` 和 `LoaderStats` 转换成通用的 Segment descriptor、Resource request factory、Fill policy 和 statistics callback。VirtualStreamRegistry、VirtualStream、Segment、Chunk、Reader、Writer 和 StreamFiller 均不导入 hls.js 类型。
-
-## VirtualStream
-
-VirtualStream 表示同一条轨道上的有序 Segment 序列:
-
-```ts
-interface VirtualStream {
-  readonly id: VirtualStreamId
-  readonly segmentsByKey: ReadonlyMap<VirtualStreamSegmentKey, VirtualStreamSegment>
-  readonly prefetchSequence: readonly VirtualStreamSegment[]
-  readonly frontier: VirtualStreamFrontier | undefined
-}
-```
-
-- `segmentsByKey` 保存 adapter 可以定位和读取的全部 Segment。
-- `prefetchSequence` 保存参与 frontier 和前向预填充的有序 Segment。
-- `frontier` 表示最近一次有效读取所在的轨道位置。
-
-VirtualStream 不知道自身是音频、视频、字幕还是某个清晰度。音频和视频等多条流可以同时拥有 Reader、frontier、Chunk 和 Writer, 并在同一组 Filler 中并行竞争网络资源。
-
-### 预填充窗口
-
-每次创建 Reader 时, 对应 Stream 更新 frontier generation, 并物化以下窗口中的 Chunk:
+共享数据结构为:
 
 ```text
-当前 frontier Segment + 后续 N 个 Segment
+VirtualStream
+  +-- segments: Map<SegmentKey, VirtualStreamSegment>
+  +-- window: SegmentKey[]
+
+VirtualStreamSegment
+  +-- chunks: VirtualStreamChunk[]
+
+VirtualStreamChunk
 ```
 
-`N` 由公开配置 `prefetchAheadSegments` 指定, 默认值为 6:
+`VirtualStream`、`VirtualStreamSegment` 和 `VirtualStreamChunk` 都是纯数据。它们不保存 callback、Promise resolver、listener、AbortController 或 Worker 对象。
+
+## 公开组件
+
+### ParallelStreamController
+
+`ParallelStreamController` 继承 hls.js 默认 main `StreamController`。它不直接发送请求, 只把 hls.js 已经选择的 Fragment 和 Level 转换成有序窗口, 然后继续调用原生实现。
 
 ```ts
-interface HlsParallelLoaderOptions {
-  prefetchAheadSegments?: number
+protected loadFragment(fragment, level, targetBufferTime) {
+  segmentLoader.replaceWindow(/* current + following fragments */)
+  super.loadFragment(fragment, level, targetBufferTime)
 }
 ```
 
-该配置必须是非负整数:
+窗口默认包含当前 Segment 和后续最多 5 个 Segment, 总数最多 6 个。窗口顺序就是调度优先级。
 
-- `0`: 只填充当前 Segment。
-- `1`: 当前 Segment 加后续 1 个 Segment。
-- `6`: 当前 Segment 加后续 6 个 Segment。
+Controller 不为预加载创建额外 fLoader, 因此不存在“旁路 fLoader”和“原生 fLoader”两套生命周期。Controller 只声明需求, Loader 中每个 Segment 只有一份 task 状态和数据。
 
-配置在会话创建时固定, 不支持运行期间动态修改。
+Controller 在以下情况不建立完整 Segment 预加载窗口:
 
-Reader 在满足前被取消时, 如果它仍拥有最新且未确认的 frontier generation, 对应 provisional 窗口失效并重新计算。Reader 成功后, 其位置成为保留 frontier, 使有界预填充窗口可以继续存在。
+- hls.js 正在执行启动 bandwidth test。
+- low-latency mode 正在使用 Part 列表。
+- Level details 不存在。
 
-Reader 对应的 Segment 最终填充失败时, 其位置仍然保留为 frontier, 但失败 Segment 成为预填充屏障。该 Stream 不继续填充屏障之后的纯预填充 Chunk, 直到 hls.js 创建新的 Reader 并使该 Segment 重试成功、读取位置改变或 content version 更新。
+这些情况下清除已有 main 窗口并完全交给 hls.js 原生流程。正式 fLoader 请求仍由 `ParallelSegmentLoader` 加载。
 
-一条旧 Stream 没有等待 Reader 时, 其 Chunk 只有预填充优先级, 必须让位于任何直接读取。旧窗口不会继续向前扩张, 并在播放位置越过后自然淘汰。因此核心无需知道一次变化是否为清晰度、音轨或字幕切换。
+`stopLoad()` 只清除 Controller 当前维护的窗口, 不销毁 Loader、Worker 或整个 Hls session。
 
-## VirtualStreamSegment
+### ParallelSegmentLoader
 
-VirtualStreamSegment 是 fLoader 可以独立读取的数据单元:
+`ParallelSegmentLoader` 是一个 Hls session 级对象, 同时承担:
 
-```ts
-interface VirtualStreamSegment {
-  readonly key: VirtualStreamSegmentKey
-  readonly stream: VirtualStream
-  readonly position: VirtualStreamPosition
-  readonly resource: VirtualStreamResource
-  readonly readers: ReadonlyMap<ReaderId, VirtualStreamSegmentReaderState>
-  readonly chunks: readonly VirtualStreamChunk[]
-}
+- 多 VirtualStream 状态所有权。
+- Segment 窗口更新和驱离。
+- Chunk 规划、优先级选择和并发控制。
+- 通过 `HttpTransport` 发送 Range 请求。
+- hls.js fLoader 兼容。
+- revision/listener 状态通知。
+- 同步诊断快照。
 
-interface VirtualStreamResource {
-  readonly url: string
-  readonly headers: Readonly<Record<string, string>>
-  readonly rangeStart: number
-  readonly rangeEnd: number | undefined
-  readonly createRequest: (parameters: VirtualStreamRequestParameters) => Promise<Request>
-}
+它不把这些职责拆成独立运行时组件。Worker 是类内部启动的异步函数, Chunk 选择是同步私有方法。
+
+## 多 VirtualStream
+
+每条媒体轨道或 rendition 使用独立 VirtualStream:
+
+```text
+main:<level>
+audio:<identity>
+subtitle:<identity>
 ```
+
+每个 VirtualStream 拥有自己的 `segments` 和有序 `window`。全局 Worker 在所有 VirtualStream 中选择 Chunk。
+
+当前 `ParallelStreamController` 只收到 main `loadFragment()`, 因此只有 main stream 具有向前窗口。audio、subtitle、init Segment 和 Part 通过正式 fLoader 的 `readerCount` 获得直接加载优先级, 但当前不自动向前预加载。
+
+如后续要求 audio/subtitle 预加载, 需要替换 hls.js 对应的 `audioStreamController` 和 `subtitleStreamController`, 共享数据和 Worker 模型无需改变。
+
+## Segment 与 Chunk 状态
 
 Segment 保存:
 
-- 在轨道上的稳定顺序和播放时间位置。
-- URL、逻辑 byte range 和 request headers 等资源描述。
-- 当前等待结果的 Reader。
-- 已经物化的 Chunk。
-- 聚合后的完整数据和真实网络统计。
-- 内容版本、失败和重试信息。
+- 稳定 key、URL、媒体开始时间和时长。
+- 原始 fLoader context 所需的 URL、header 和 byte range。
+- `windowIndex`, 不在窗口时为 `null`。
+- `readerCount`, 表示正式 fLoader 读取数量。
+- 已知 Segment 长度或未知长度。
+- sequential fallback 标记。
+- Chunk 列表、最终 ArrayBuffer、Response metadata、统计和失败状态。
 
-虚拟流核心不区分普通媒体 Fragment、LL-HLS Part、Init Segment 或字幕资源。hls.js adapter 负责把可独立读取的外部资源映射为统一 Segment, 并决定它是否进入有序 `prefetchSequence`。填充器只处理 Segment 的位置和资源描述。
+Chunk 保存:
 
-playlist topology 可以提前创建 Segment 元数据, 但不会为整个 playlist 立即创建 Chunk。只有存在 Reader、进入预填充窗口或保留 partial/ready 数据时, Segment 才持有 Chunk。
+- Segment 内本地 `[start, endExclusive)` 范围。
+- `empty`、`filling`、`ready` 或 `failed` 状态。
+- 当前 `fillId`、attempt 数量和失败描述。
+- 完成前的 Uint8Array 数据。
 
-Segment 的全部目标 Chunk complete 后进入 ready。多个 Reader 共享同一份标准 Segment 数据, 但向 hls.js 交付时必须为每个 Reader 返回独立 ArrayBuffer, 避免一个消费者转移或分离 buffer 后影响其他消费者。
+Chunk 不保存 AbortController。AbortController 始终属于正在执行 Fetch 的 Worker 局部状态。
 
-## VirtualStreamSegmentReader
+## Chunk 规划
 
-VirtualStreamSegmentReader 表示一次 fLoader 对特定 Segment 的读取:
+默认 Chunk 大小为 2 MiB, 与 HTTP Proxy 的 shard 大小一致。默认全局网络并发为 6。
 
 ```ts
-interface VirtualStreamSegmentReader {
-  readonly id: ReaderId
-  readonly segment: VirtualStreamSegment
-  readonly result: Promise<VirtualStreamSegmentResult>
-
-  cancel(): void
-}
+const chunkSize = 2 * 1024 * 1024
+const maxConcurrency = 6
 ```
 
-fLoader adapter 的职责严格限制为:
+### 已知 byte range
+
+如果 fLoader context 已经声明 `rangeStart` 和 `rangeEnd`, Segment 长度立即确定, 按 Segment 本地位置切分:
 
 ```text
-load
-  -> 映射 VirtualStream 和 VirtualStreamSegment
-  -> 创建 VirtualStreamSegmentReader
-  -> 等待 Reader result
-  -> 复制数据并调用 hls.js callback
+resource range: [10 MiB, 15 MiB)
 
-abort / destroy
-  -> 取消自己的 Reader
+chunk 0: local [0, 2 MiB) -> request [10 MiB, 12 MiB)
+chunk 1: local [2 MiB, 4 MiB) -> request [12 MiB, 14 MiB)
+chunk 2: local [4 MiB, 5 MiB) -> request [14 MiB, 15 MiB)
 ```
 
-Reader 状态直接保存在所属 Segment 中, 不建立独立 VirtualStreamDemand 模型。一个 Reader cancel 只移除自己的读取, 不会清除其他 Reader 或直接取消网络 attempt。
+不足半个 Chunk 的尾部合并到前一个 Chunk, 避免极小请求。
 
-Reader 等待超时属于本次 hls.js 读取。超时后 fLoader 报告 `onTimeout` 并取消该 Reader, 但如果 Chunk 仍位于其他 Reader 或预填充窗口中, 当前 Writer 可以继续工作。共享填充任务不得继承最早 Reader 的完整生命周期超时。
+### 未知长度
 
-`FRAG_BUFFERED` 不参与 Reader、frontier、Chunk 数据或预填充生命周期。fLoader 成功交付后 hls.js 已经拥有独立数据副本, 虚拟流缓存由自身窗口规则管理。
-
-## VirtualStreamChunk
-
-VirtualStreamChunk 是最小数据存储和并行填充单元:
-
-```ts
-interface VirtualStreamChunk {
-  readonly key: VirtualStreamChunkKey
-  readonly segment: VirtualStreamSegment
-  readonly startOffset: number
-  readonly endOffset: number | undefined
-  readonly contentVersion: number
-  readonly receivedLength: number
-  readonly contentState: 'empty' | 'partial' | 'complete'
-  readonly writer: VirtualStreamChunkWriterState | undefined
-}
-```
-
-Chunk 保存已经接受的实际媒体字节。Transport Response body 由 Filler 持续写入 Chunk, Writer 释放、网络重试或抢占都不会自动删除已经接受的数据。
-
-内容状态和执行所有权是两个独立维度:
-
-| 内容状态   | Writer | 含义                         |
-| ---------- | ------ | ---------------------------- |
-| `empty`    | 无     | 等待 Filler 领取             |
-| `empty`    | 有     | 已领取但尚未收到数据         |
-| `partial`  | 有     | 正在填充或执行慢速补救       |
-| `partial`  | 无     | 被抢占、等待重试或暂时无需求 |
-| `complete` | 无     | 数据 ready                   |
-
-`complete` 且仍有 Writer 只允许作为完成事务内部的瞬时状态, 不得长期暴露。
-
-对于已知长度资源, Segment 根据配置的 Chunk 大小物化一个或多个 Chunk。对于未知长度资源, 先物化首个 discovery Chunk。首个 Range Response 确定总长度后, Segment 调整首个 Chunk 边界并物化剩余 Chunk。源站忽略 Range 并返回顺序 200 时, 首个 Chunk 接受完整 Response, 不再创建其他并行 Chunk。
-
-Chunk 写入必须连续且不能超出目标边界。资源 validator 或 content version 变化时, 旧 Writer 立即失效, 已有数据按资源一致性规则整体清除。
-
-## VirtualStreamChunkWriter
-
-VirtualStreamChunkWriter 是 Chunk 发放给 StreamFiller 的排他写入能力:
-
-```ts
-interface VirtualStreamChunkWriter {
-  readonly id: WriterId
-  readonly fillerId: number
-  readonly chunk: VirtualStreamChunk
-  readonly contentVersion: number
-
-  getFillPlan(rangeMode?: HttpTransportRangeRequestMode): VirtualStreamChunkFillPlan
-  acceptResponse(metadata: VirtualStreamChunkResponseMetadata): void
-  append(data: Uint8Array): void
-  recordAttempt(metadata: VirtualStreamChunkAttemptMetadata): void
-  complete(): void
-  fail(error: ChunkFillFailure, retryAt?: number): void
-  release(reason: ChunkWriterReleaseReason): void
-}
-```
-
-Filler 通过 Registry 的同步 `tryAcquireChunkWriter()` 领取 Chunk。Registry 根据 Chunk key 定位实际对象, 检查 Writer 是否存在、校验 content version、分配 Writer ID 并更新 revision。这些步骤必须在同一个同步状态转换中完成, 从而在 JavaScript 单线程中提供原子排他语义。Writer 状态仍然存储在对应 Chunk 中, Registry 不维护另一份 Writer 表。
-
-每次 append、complete、fail 或 release 都校验 Writer ID 与 content version。被抢占、已释放或指向旧内容版本的 Writer 不能继续写入, 迟到的 Response body 会被拒绝。
-
-Writer 不是 StreamFiller, 也不负责网络。它只是 Filler 对一个 Chunk 的临时写入凭证。
-
-## StreamFiller
-
-会话创建固定数量的 StreamFiller, 每个 Filler 都是长期运行且相互独立的自主单元:
-
-```ts
-interface StreamFiller {
-  readonly id: number
-
-  start(): void
-  destroy(): void
-}
-```
-
-每个 Filler 自己维护当前 Writer、Transport attempt、AbortController、重试和慢速检测状态, 并持续执行以下循环:
+完整 Segment 通常没有预先声明长度。此时先创建一个 discovery Chunk:
 
 ```text
-读取 VirtualStreamRegistry snapshot
-  -> 计算当前最值得填充的 Chunk
-  -> 尝试取得 Writer
-  -> 执行或继续网络 attempt
-  -> 同时观察 revision 和时间条件
-  -> 继续、补救、抢占、失败或完成
-  -> 重新观察
+Range: bytes=0-2097151
 ```
 
-不存在任何组件调用 `filler.fill()`、`filler.ensure()` 或 `filler.cancel()`。Session 只在启动和销毁时调用 Filler 生命周期方法。
+- 返回 `206` 且 JavaScript 可以读取有效 `Content-Range`: 取得资源总长度, 规划剩余 Chunk。
+- 返回 `200`: Origin 忽略 Range, 将响应作为完整 Segment 并切换到 sequential 模式。
+- 返回 `206` 但 CORS 隐藏 `Content-Range`: 如果 body 短于请求范围, 直接由实际长度确定终点; 否则发送一次无 body 的 HEAD, 从 CORS safelisted `Content-Length` 取得总长度, 保留 discovery 数据并规划剩余 Chunk。
+- HEAD 也无法取得长度: 最后才丢弃 discovery 数据并回退到无 Range 的完整 GET。
+- 已声明 HLS byte range 但 Origin 返回 `200`: 请求失败, 不能把整个资源误当成子范围。
 
-多个 Filler 可以同时处理不同 VirtualStream, 因此独立音频、视频、字幕或多个 rendition 的工作可以自然并行。系统不为任何媒体类型固定保留连接数。
+discovery 请求本身始终贡献 Chunk 0 数据。HEAD 只在 Range 响应是 `206`、总长度不可见且本次恰好填满请求范围时使用, 不读取媒体 body。
 
-### 任务选择
+不同 Range 响应在可用时比较 ETag 或 Last-Modified。资源标识变化时 Segment 失败, 避免拼接不同版本的数据。
 
-Chunk 的存在表达它已经进入填充或缓存生命周期。Filler 从全部 VirtualStream 中选择尚未 complete、当前可重试且没有 Writer 的 Chunk, 使用同一个纯优先级函数排序:
+## Transport
 
-1. 有等待 Reader 的直接读取优先于纯预填充。
-2. 播放截止时间更早的 Chunk 优先。
-3. 同一 Segment 内更靠近完整交付前沿的 Chunk 优先。
-4. 创建顺序和稳定 key 作为最终 tie-break。
+`ParallelSegmentLoader` 持有一个 `HttpTransport`。未提供时创建 `FetchHttpTransport`; 应用也可以传入 `ProxyHttpTransport` 或 `WebSocketHttpTransport`。Loader 只依赖标准 `Request`、response status/header/body 和 AbortSignal, Transport 不理解 Segment、窗口或 Chunk 优先级。
 
-播放截止时间只依赖 Segment 在轨道上的位置、当前播放位置和播放速度, 不依赖媒体类型。多个 Filler 对同一 snapshot 得出相同排序, 但同一 Chunk 只有一个 Filler 能原子取得 Writer, 失败者重新观察即可。
+Proxy 为获得 CDN 缓存语义会把上游 `206` 包装成物理 `200`, `ProxyHttpTransport` 在返回 Loader 前恢复逻辑 status 和 `Content-Range`。因此浏览器 Network 面板可能显示 `200`, 而 Segment 诊断显示逻辑 `206`; 两者描述的是不同层级。
 
-### 抢占
+Loader 拥有传入的 Transport 生命周期, `ParallelSegmentLoader.destroy()` 会调用 `transport.destroy()`。应用不要在 Loader 仍工作时单独销毁 Transport。
 
-Filler 在持有 Writer 和执行网络 attempt 时继续观察 Registry revision。出现更高优先级的未领取 Chunk 后, 所有 Filler 使用相同规则判断当前并发集合是否仍然合理。
+## Worker 调度
 
-只有持有最低优先级且允许抢占任务的 Filler 主动让位。最短运行时间、完成比例和预计剩余时间继续作为保护条件。
-
-为了避免先释放旧 Writer 后未取得新 Writer, Registry 提供跨两个 Chunk 的同步原子切换:
-
-```ts
-registry.trySwitchChunkWriter(currentWriter, targetChunk)
-```
-
-该方法只验证和修改两个 Chunk 上的 Writer 状态, 不决定哪个任务应当运行。调度决策始终由调用它的独立 Filler 做出。
-
-抢占后当前 Transport attempt 被 abort, 原 Chunk 已经接受的 partial 数据保留, 以后可以由任意 Filler 取得新 Writer 并继续填充。
-
-### 慢速补救与网络重试
-
-一个 Writer 可以承载多个 Transport attempt:
+`ParallelSegmentLoader` 构造时立即启动固定数量的逻辑 Worker。逻辑 Worker 是同一 JavaScript realm 中的异步循环, 不是浏览器 Web Worker。
 
 ```text
-VirtualStreamChunkWriter
-  +-- Attempt 1: 慢速或中断, abort
-  +-- Attempt 2: 从已有位置继续
-  +-- complete
+while not destroyed
+  +-- 同步选择并占用最佳 Chunk
+  +-- 没有工作时等待 revision 变化
+  +-- 使用局部 AbortController 执行 Transport request
+  +-- 同步验证 fillId 并提交结果
 ```
 
-慢速补救不释放 Writer, 只替换当前网络 attempt。Filler 根据当前 attempt 吞吐量和 VirtualStreamRegistry 中已有 Chunk 的真实网络统计判断慢速。样本不足、任务仍在保护期或接近完成时不补救。
+Chunk 优先级依次为:
 
-稳定 Range Transport 被补救时保持原请求边界并丢弃已经写入 Chunk 的响应前缀。可恢复 Range Transport 可以从 `startOffset + receivedLength` 继续。
+1. 所属 Segment 的 `readerCount > 0`。
+2. Segment 在 window 中的位置更靠前。
+3. Chunk 在 Segment 内的位置更靠前。
+4. 稳定 key 顺序, 保证比较结果确定。
 
-单次 attempt 的首字节超时、流量空闲超时和网络错误由 Filler 处理。补救与内部重试耗尽后, Writer 把 Chunk 标记为失败并释放。等待该 Segment 的 Reader 收到最终错误, hls.js 后续重试会创建新的 Reader 并重新提高相应 Chunk 的优先级。
+正式读取需求可以抢占最低优先级的纯窗口预加载请求。Worker 收到 revision 变化后重新检查当前 Fill 是否仍存活, 以及是否需要让出网络槽。
 
-## HttpTransport
+## 粗粒度状态通知
 
-一个加载会话中的全部 StreamFiller 共享同一份 HttpTransport:
+Loader 持有实例级全局 revision 和 listeners:
 
 ```ts
-interface HttpTransport {
-  readonly rangeRequestMode?: 'resumable' | 'stable'
-
-  request(request: Request, options?: HttpTransportRequestOptions): Promise<HttpTransportResponse>
-
-  destroy(): void
-}
+revision: number
+listeners: Set<() => void>
 ```
 
-Transport 只负责执行标准 HTTP Request 并返回流式 Response。它可以由 Fetch、HTTP Proxy 或 WebSocket relay 实现, 但不理解:
+listener 不携带 Segment、Chunk 或结果数据, 只表达“共享状态可能变化”。Controller、fLoader 和 Worker 被唤醒后重新读取状态。
 
-- VirtualStream、Segment 或 Chunk。
-- Reader 或 Writer。
-- 播放位置和优先级。
-- 抢占、补救和重试。
-- 预填充和缓存淘汰。
+所有共享状态修改通过同步 transaction 完成:
 
-Filler 通过 Request.signal 和 Response body cancel 终止一次网络 attempt。Transport 负责把标准取消语义映射到底层 Fetch、Proxy 或 WebSocket 事务。
-
-## 数据、失败与淘汰
-
-- Chunk 数据由 Chunk 自己持有, 可以跨 Writer、抢占和 attempt 保留。
-- Segment ready 后保留标准完整数据, 每个 Reader 消费独立副本。
-- Reader cancel 不直接删除已经接受的数据。
-- Writer 的一次 attempt 失败不删除 partial 数据。
-- 资源 validator 或 content version 不一致时清除对应资源的全部旧数据。
-- Segment 离开 frontier 窗口且没有 Reader、Writer 后, 删除其 Chunk 和媒体数据, 但可以继续保留 topology 元数据。
-- 旧 Stream 的窗口不会在没有新 Reader 时继续扩张, 并随播放位置越过而自然淘汰。
-- 会话销毁时取消全部 Reader、Writer、网络 attempt 和观察等待, 然后销毁共享 Transport。
-
-## hls.js Adapter
-
-加载器通过一个会话对象同时提供 fLoader constructor 和 topology 绑定:
-
-```ts
-const parallel = createHlsParallelLoader({
-  getPlaybackRate: () => media.playbackRate,
-  getPlaybackTime: () => media.currentTime,
-  prefetchAheadSegments: 6,
-  transport,
-})
-
-const hls = new Hls({
-  fLoader: parallel.fragmentLoader,
-  progressive: false,
-})
-
-parallel.attach(hls)
-hls.loadSource(source)
-
-parallel.destroy()
+```text
+同步修改 streams/segments/window/chunks
+  -> revision + 1
+  -> 合并安排一次 microtask 通知
 ```
 
-fLoader 方法足以表达 hls.js 的直接读取和取消。`attach()` 监听 playlist topology 与会话生命周期事件, 只用于建立稳定 Stream/Segment 映射, 不产生读取需求、不选择媒体类型, 也不直接控制 Filler。
+同一窗口更新中的 Segment upsert、window 替换和失活 Segment 驱离属于一次 transaction, 观察者不会看到 window 已更新但 Segment 尚未存在的中间状态。
 
-当前继续关闭 hls.js progressive 模式。VirtualStreamChunk 可以流式接受和保存数据, 但 VirtualStreamSegmentReader 只在完整目标 Segment ready 后向 hls.js 交付结果。
+`waitForChange(afterRevision, signal)` 在注册 listener 前同步检查 revision, 防止检查状态和等待之间丢失通知。
 
-传入 Session 的 Transport 在一个会话内由全部 Filler 共享, 并在 Session `destroy()` 时统一销毁。
+## 跨 await 一致性
+
+任何共享状态读改写都不能跨越 `await`。Worker Fill 分为三个阶段:
+
+1. 同步选择 Chunk, 设置 `state = filling` 和唯一 `fillId`。
+2. 使用 Worker 局部变量和 AbortController 执行异步 Transport request。
+3. response 返回后重新按 stream/segment/chunk key 查找状态, 只有 `fillId` 仍匹配才提交。
+
+窗口变化、取消或重新分配会使旧 `fillId` 失效。迟到的 Fetch 结果无法覆盖新状态。
+
+同一 JavaScript realm 的同步代码具有 run-to-completion 语义, 因此不需要 mutex。若未来把 Worker 迁移到真正的 Web Worker, 必须改成单一状态 authority 加消息协议, 不能直接共享本设计中的 Map。
+
+## fLoader 读取
+
+`ParallelSegmentLoader.fLoader` 是 hls.js 要求的可实例化构造器。每个 fLoader 实例只能执行一次 `load()`。
+
+load 时:
+
+```text
+确保 VirtualStream 和 Segment 存在
+readerCount + 1
+revision + 1
+循环检查 Segment state
+未完成则等待全局 revision
+```
+
+ready 后复制最终 ArrayBuffer 再返回 hls.js, 避免 hls.js transfer buffer 破坏 Loader 中的 canonical 数据。
+
+abort、destroy、timeout、success 或 failure 结束时只把 `readerCount - 1`, 不保存任何 Segment 级 callback。hls.js callbacks 只保存在该 fLoader 实例局部。
+
+## Segment 完成
+
+所有 Chunk ready 后按本地偏移组装唯一 canonical ArrayBuffer。组装完成后清除各 Chunk 的 Uint8Array, 只保留范围和状态供诊断, 避免同时长期持有 Chunk 数据和完整 Segment 两份内容。
+
+LoaderStats 聚合所有 Chunk:
+
+- `loading.start`: 首个 Chunk attempt 开始时间。
+- `loading.first`: 首个 response head 时间。
+- `loading.end`: Segment ready 或失败时间。
+- `loaded`: 已完成 Chunk 的唯一字节总数。
+- `total`: 已知 Segment 长度。
+- `chunkCount`: 完成的 Chunk 数。
+- `bwEstimate`: Segment 唯一字节数除以整体墙钟时间。
+
+## Segment 存活与驱离
+
+Segment 的存活条件只有:
+
+```text
+Segment 在 VirtualStream.window 中
+或者
+Segment.readerCount > 0
+```
+
+Worker Fill 不构成独立存活依据。
+
+`ParallelSegmentLoader` 是唯一驱离决策者。Controller 只更新 window, fLoader 只更新 readerCount, Worker 只执行网络取消。
+
+窗口从 `[s1..s6]` 推进到 `[s2..s7]` 时:
+
+- s2-s6 的 Segment、ready 数据和已完成 Chunk 全部保留。
+- 创建 s7。
+- s1 在没有 reader 时驱离; 有 reader 时等读取结束再驱离。
+
+驱离会使所有 fillId 失效、删除 Segment/Chunk 数据并增加 revision。Worker 被全局通知唤醒后中止局部 Fetch。迟到结果因 Segment 不存在或 fillId 不匹配而丢弃。
+
+第一版不保留窗口之外的后向缓存, 因而媒体数据不会随播放时间无限增长。常驻数据上界主要由每条激活轨道的窗口和正式读取中的 Segment 决定。
+
+## 错误行为
+
+- 没有 reader 的预加载 Chunk 失败: Segment 标记失败并停止继续填充, 不无限重试。
+- 后续 fLoader 正式读取失败的预加载 Segment: 清除失败 Chunk 并重新排队缺失部分。
+- 有 reader 时请求失败: fLoader 收到 `onError`, 由 hls.js 原生重试状态机决定是否重新调用。
+- timeout: 每个 fLoader 保持自己的完整加载 timeout; Worker request 同时遵循 hls.js 默认最大加载时间。
+- abort: 只结束当前 fLoader 读取。Segment 仍在 window 中时 Worker 继续填充。
 
 ## 诊断
 
-公开诊断入口放在 Session:
+`ParallelSegmentLoader.getDiagnostics()` 同步返回深拷贝只读快照, 包含:
+
+- timestamp、revision、destroyed。
+- active request 数量和并发上限。
+- 每个 Worker 的 idle/loading/stopped 状态和当前 Range。
+- 每条 VirtualStream 的 window。
+- Segment 的位置、状态、windowIndex、readerCount、逻辑 HTTP status、sequential 标记和字节统计。
+- Chunk 的范围、状态、字节、fillId、attempt 和 failure。
+
+诊断不返回媒体 ArrayBuffer、Response、callback、listener、AbortController 或可变内部对象, 不修改 revision, 也不参与调度。example 通过定时轮询快照绘制时间线。
+
+## 生命周期
+
+`ParallelStreamController` 由 hls.js 创建和销毁。它在一个 Hls 实例内经历多次 start/stop/seek/level switch, `stopLoad()` 只清理窗口。
+
+`ParallelSegmentLoader` 由应用创建和销毁。一个实例只服务一个 Hls session, 构造时启动 Worker, `destroy()` 时取消 request、停止 Worker、销毁 Transport、唤醒 listener 并清空全部状态。销毁后不可复用。
+
+推荐顺序:
 
 ```ts
-interface HlsParallelLoader {
-  getDiagnostics(): HlsParallelLoaderDiagnosticsSnapshot
-}
+const loader = new ParallelSegmentLoader()
+const hls = new Hls({
+  fLoader: loader.fLoader,
+  progressive: false,
+  streamController: ParallelStreamController,
+})
+
+// teardown
+hls.destroy()
+loader.destroy()
 ```
 
-Session 不保存诊断状态。`getDiagnostics()` 在调用时同步读取 VirtualStreamRegistry snapshot、各 Filler 当前运行状态和可选 Transport statistics, 再交给 `diagnostics.ts` 中的纯 projector 生成公开 DTO。
+应用拥有 Hls 和 Loader; Hls 拥有 Controller; Controller 只借用 Loader, 不负责销毁它。
 
-```text
-VirtualStreamRegistry snapshot --+
-                                 +--> diagnostics projector --> public snapshot
-StreamFiller states -------------+
-                                 |
-Transport statistics ------------+
+## 公开接口
+
+```ts
+import { ParallelSegmentLoader, ParallelStreamController } from 'storya-hls-loader'
+
+const loader = new ParallelSegmentLoader()
+const hls = new Hls({
+  fLoader: loader.fLoader,
+  progressive: false,
+  streamController: ParallelStreamController,
+})
+
+const diagnostics = loader.getDiagnostics()
 ```
 
-诊断快照包含:
-
-- Registry revision、Stream、frontier 和窗口。
-- Segment Reader 数量与 ready/failed 状态。
-- Chunk 范围、实际字节数、内容状态、优先级和 Writer 身份。
-- Filler 的 waiting、filling、rescuing、preempting 状态。
-- 当前 attempt 范围、吞吐量、重试、补救和抢占计数。
-- 不同层级的汇总计数和可选 Transport 状态。
-
-诊断快照不得包含媒体 body、Promise、AbortController、Request、Response 或可变核心对象引用。调用诊断不能执行网络、创建订阅、增加 revision 或改变优先级。
-
-实验台继续按固定间隔调用 `getDiagnostics()`。核心加载器不维护诊断历史队列。离散历史事件如果后续仍有明确需求, 通过独立事件出口设计, 不把 UI 埋点散布到 Stream、Segment、Chunk 和 Filler 中。
-
-## 实现状态
-
-本文描述的架构已经完成实现。当前代码包括:
-
-- hls.js fLoader 接入。
-- hls.js adapter 到通用 Segment descriptor、Resource、Fill policy 和 statistics 的单向转换。
-- VirtualStreamRegistry、VirtualStream、VirtualStreamSegment 和 VirtualStreamChunk 状态层级。
-- VirtualStreamSegmentReader 和 VirtualStreamChunkWriter 能力边界。
-- 可配置的跨 Segment 预填充窗口。
-- 2 MiB Range Chunk、未知长度探测和顺序 Response fallback。
-- 6 个独立 StreamFiller、原子 Writer 领取与切换、请求保护、抢占、慢速补救和网络重试。
-- Fetch、HTTP Proxy 和 WebSocket HttpTransport。
-- Session 级只读诊断快照。
-
-重构已经删除以下旧内部模型:
-
-- Session 中的 `activeStreams`、需求状态和 `reconcile()`。
-- `hardDemands` 与 `playbackDemand`。
-- 单个 StreamFiller 的 `ensure()` 与 `cancel()`。
-- 中心 RequestScheduler。
-- 依赖 hls.js Loader callbacks 的 SegmentLoader。
-- VirtualStream 的 `kind`、`active` 和 `anchor`。
+公开运行组件只有两个类。包同时导出默认配置常量、Loader options 和诊断 TypeScript 类型。
 
 ## 修改历史
 
-- 2026-08-07: 完成新架构代码迁移, 删除 Session 中心需求协调、RequestScheduler 和 SegmentLoader, 实现 Registry 状态中心、Reader/Writer 能力边界及多个独立 StreamFiller; hls.js 类型收敛在 adapter, 核心状态与 Filler 只使用通用 descriptor 和 policy。
-- 2026-08-07: 删除上一版会话中心调度设计, 确立以 VirtualStreamRegistry 为状态中心、Reader 消费 Segment、Writer 填充 Chunk、多个独立 Filler 自主观察和抢占的新架构; 预填充窗口改为可配置的当前 Segment 加后续 N 个 Segment, 核心不再理解媒体类型或选择状态。
+- 2026-08-08: 完成新并行模型设计与实现。Controller 只维护有序窗口; Loader 直接持有多 VirtualStream、Segment、Chunk、revision/listeners、逻辑 Worker、fLoader、Transport 和诊断; Chunk 从第一版即为调度单位; 明确同步 transaction、fillId 一致性和窗口/reader 驱离规则; 对 CORS 隐藏 Content-Range 增加保留 discovery Chunk 的 HEAD 长度发现。
+- 2026-08-07: 删除旧 VirtualStreamRegistry、StreamFiller、frontier 和相关诊断, 验证 hls.js 自定义 StreamController 与 fLoader 替换入口。

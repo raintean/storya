@@ -13,7 +13,7 @@ export function splitByteRanges(
     return []
   }
   if (length <= chunkSize) {
-    return [{ start, endExclusive }]
+    return [{ endExclusive, start }]
   }
 
   const fullChunks = Math.floor(length / chunkSize)
@@ -22,15 +22,15 @@ export function splitByteRanges(
   let cursor = start
 
   for (let index = 0; index < fullChunks; index += 1) {
-    const isLastFullChunk = index === fullChunks - 1
-    const mergeTail = isLastFullChunk && tail > 0 && tail < chunkSize / 2
+    const lastFullChunk = index === fullChunks - 1
+    const mergeTail = lastFullChunk && tail > 0 && tail < chunkSize / 2
     const rangeEnd = mergeTail ? endExclusive : cursor + chunkSize
-    ranges.push({ start: cursor, endExclusive: rangeEnd })
+    ranges.push({ endExclusive: rangeEnd, start: cursor })
     cursor = rangeEnd
   }
 
   if (cursor < endExclusive) {
-    ranges.push({ start: cursor, endExclusive })
+    ranges.push({ endExclusive, start: cursor })
   }
   return ranges
 }
