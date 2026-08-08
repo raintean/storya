@@ -24,7 +24,6 @@ import type {
 } from './diagnostics'
 import {
   createStoryaFragmentLoader,
-  type FragmentLoaderOwner,
   type SegmentLoadFailure,
   type SegmentObservation,
 } from './fragment-loader'
@@ -101,7 +100,7 @@ const contentRangePattern = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i
 const defaultIdleTimeoutMs = 5_000
 const defaultMaxRescueAttempts = 2
 
-export class ParallelSegmentLoader implements FragmentLoaderOwner {
+export class ParallelSegmentLoader {
   private static readonly owners = new WeakMap<FragmentLoaderConstructor, ParallelSegmentLoader>()
 
   readonly fLoader: FragmentLoaderConstructor

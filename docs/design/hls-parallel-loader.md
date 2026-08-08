@@ -267,6 +267,8 @@ body 流每返回一段数据, `ChunkFillWorker` 通过 host adapter 同步更�
 
 `ParallelSegmentLoader.fLoader` 是 hls.js 要求的可实例化构造器。每个 fLoader 实例只能执行一次 `load()`。
 
+内部 `StoryaFragmentLoader` 直接持有所属 `ParallelSegmentLoader`, 不额外定义 Owner、Reader 或其他能力接口。它只保存本次 hls.js 调用的 callback、timeout 和读取生命周期, Segment 状态仍由 Loader 的同步方法统一维护。
+
 load 时:
 
 ```text
@@ -384,5 +386,5 @@ const diagnostics = loader.getDiagnostics()
 
 - 2026-08-08: 把异步填充循环、Transport 请求、流式读取和 attempt 超时从 Loader 拆到内部 `ChunkFillWorker`; Worker 使用 host adapter 调用 Loader 的同步原子操作, 不直接访问共享 Map, 公开 API 不变。
 - 2026-08-08: Worker 改为流式读取 Transport body, 实时记录 Chunk 已接收字节; 增加响应头、连续无数据和完整请求三层超时, 停滞 attempt 默认就地补救 2 次。
-- 2026-08-08: 完成新并行模型设计与实现。Controller 只维护有序窗口; Loader 直接持有多 VirtualStream、Segment、Chunk、revision/listeners、逻辑 Worker、fLoader、Transport 和诊断; Chunk 从第一版即为调度单位; 明确同步 transaction、fillId 一致性和窗口/reader 驱离规则; 对 CORS 隐藏 Content-Range 增加保留 discovery Chunk 的 HEAD 长度发现。
+- 2026-08-08: 完成新并行模型设计与实现。Controller 只维护有序窗口; Loader 直接持有多 VirtualStream、Segment、Chunk、revision/listeners、逻辑 Worker、fLoader、Transport 和诊断; StoryaFragmentLoader 直接依赖所属 Loader, 不增加 Owner 能力接口; Chunk 从第一版即为调度单位; 明确同步 transaction、fillId 一致性和窗口/reader 驱离规则; 对 CORS 隐藏 Content-Range 增加保留 discovery Chunk 的 HEAD 长度发现。
 - 2026-08-07: 删除旧 VirtualStreamRegistry、StreamFiller、frontier 和相关诊断, 验证 hls.js 自定义 StreamController 与 fLoader 替换入口。

@@ -7,6 +7,7 @@ import type {
   LoaderConfiguration,
   LoaderStats,
 } from 'hls.js'
+import type { ParallelSegmentLoader } from './parallel-segment-loader'
 import { copyLoaderStats, createLoaderStats } from './stats'
 
 export interface SegmentLoadFailure {
@@ -27,17 +28,9 @@ export type SegmentObservation =
       url: string
     }
 
-export interface FragmentLoaderOwner {
-  readonly revision: number
-
-  configure(config: HlsConfig): void
-  inspectSegment(context: FragmentLoaderContext): SegmentObservation
-  startReading(context: FragmentLoaderContext): void
-  stopReading(context: FragmentLoaderContext): void
-  waitForChange(afterRevision: number, signal: AbortSignal): Promise<void>
-}
-
-export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): FragmentLoaderConstructor {
+export function createStoryaFragmentLoader(
+  loader: ParallelSegmentLoader,
+): FragmentLoaderConstructor {
   return class StoryaFragmentLoader implements HlsLoader<FragmentLoaderContext> {
     context: FragmentLoaderContext | null = null
     stats: LoaderStats = createLoaderStats()
@@ -50,7 +43,7 @@ export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): Fragment
     private timeoutTimer: ReturnType<typeof globalThis.setTimeout> | undefined
 
     constructor(config: HlsConfig) {
-      owner.configure(config)
+      loader.configure(config)
     }
 
     load(
@@ -65,7 +58,7 @@ export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): Fragment
       this.context = context
       this.callbacks = callbacks
       this.reading = true
-      owner.startReading(context)
+      loader.startReading(context)
 
       const maxLoadTimeMs = config.loadPolicy.maxLoadTimeMs
       if (Number.isFinite(maxLoadTimeMs) && maxLoadTimeMs > 0) {
@@ -109,8 +102,8 @@ export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): Fragment
 
     private async observe(config: LoaderConfiguration): Promise<void> {
       while (!this.settled && this.context !== null) {
-        const revision = owner.revision
-        const observation = owner.inspectSegment(this.context)
+        const revision = loader.revision
+        const observation = loader.inspectSegment(this.context)
         copyLoaderStats(this.stats, observation.stats)
 
         if (observation.state === 'ready') {
@@ -123,7 +116,7 @@ export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): Fragment
         }
 
         try {
-          await owner.waitForChange(revision, this.changeController.signal)
+          await loader.waitForChange(revision, this.changeController.signal)
         } catch {
           return
         }
@@ -208,7 +201,7 @@ export function createStoryaFragmentLoader(owner: FragmentLoaderOwner): Fragment
         return
       }
       this.reading = false
-      owner.stopReading(this.context)
+      loader.stopReading(this.context)
     }
   }
 }
