@@ -346,7 +346,7 @@ function createChunkTitle(chunk: ChunkDiagnostics): string {
     `Chunk ${chunk.key} · ${chunk.state}`,
     `${formatBytes(chunk.start)} – ${formatBytes(chunk.endExclusive)}`,
     `received ${formatBytes(chunk.loadedBytes)}`,
-    `fill ${chunk.fillId ?? '—'} · attempt ${chunk.attempt}`,
+    `generation ${chunk.generation ?? '—'} · attempt ${chunk.attempt}`,
     chunk.failure ?? 'no failure',
   ].join('\n')
 }

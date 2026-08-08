@@ -1,10 +1,6 @@
 import Hls from 'hls.js'
 import type { Level, MediaFragment } from 'hls.js'
-import {
-  createWindowDescriptor,
-  DEFAULT_WINDOW_SIZE,
-  ParallelSegmentLoader,
-} from './parallel-segment-loader'
+import { DEFAULT_WINDOW_SIZE, ParallelSegmentLoader } from './parallel-segment-loader'
 
 const NativeStreamController = Hls.DefaultConfig.streamController
 
@@ -12,7 +8,17 @@ export class ParallelStreamController extends NativeStreamController {
   private activeStreamId: string | undefined
 
   public override stopLoad(): void {
-    this.getSegmentLoader()?.clearWindow(this.activeStreamId)
+    const loader = this.requireSegmentLoader()
+    if (this.activeStreamId !== undefined) {
+      const activeStreamId = this.activeStreamId
+      loader.update(state => {
+        const stream = state.streams.get(activeStreamId)
+        if (stream !== undefined) {
+          stream.window = []
+        }
+        return undefined
+      })
+    }
     this.activeStreamId = undefined
     super.stopLoad()
   }
@@ -27,12 +33,8 @@ export class ParallelStreamController extends NativeStreamController {
   }
 
   protected updateSegmentWindow(fragment: MediaFragment, level: Level): void {
-    const loader = this.getSegmentLoader()
-    if (loader === undefined) {
-      throw new Error(
-        'ParallelStreamController 必须与同一个 ParallelSegmentLoader.fLoader 配合使用',
-      )
-    }
+    const loader = this.requireSegmentLoader()
+    loader.configure(this.config)
 
     const details = level.details
     if (
@@ -40,7 +42,16 @@ export class ParallelStreamController extends NativeStreamController {
       details === undefined ||
       (this.config.lowLatencyMode && (details.partList?.length ?? 0) > 0)
     ) {
-      loader.clearWindow(this.activeStreamId)
+      if (this.activeStreamId !== undefined) {
+        const activeStreamId = this.activeStreamId
+        loader.update(state => {
+          const stream = state.streams.get(activeStreamId)
+          if (stream !== undefined) {
+            stream.window = []
+          }
+          return undefined
+        })
+      }
       this.activeStreamId = undefined
       return
     }
@@ -57,16 +68,29 @@ export class ParallelStreamController extends NativeStreamController {
       currentIndex === -1
         ? [fragment]
         : fragments.slice(currentIndex, currentIndex + DEFAULT_WINDOW_SIZE)
-    const descriptors = selected
-      .filter(candidate => !candidate.gap && Boolean(candidate.url))
-      .map(candidate => createWindowDescriptor(candidate))
+    const window = selected.filter(candidate => !candidate.gap && Boolean(candidate.url))
     const streamId = `${fragment.type}:${fragment.level}`
 
-    loader.replaceWindow(streamId, descriptors, this.config, this.activeStreamId)
+    loader.update(state => {
+      if (this.activeStreamId !== undefined && this.activeStreamId !== streamId) {
+        const previous = state.streams.get(this.activeStreamId)
+        if (previous !== undefined) {
+          previous.window = []
+        }
+      }
+      state.ensureStream(streamId).replaceWindow(window, loader.chunkSize)
+      return undefined
+    })
     this.activeStreamId = streamId
   }
 
-  private getSegmentLoader(): ParallelSegmentLoader | undefined {
-    return ParallelSegmentLoader.fromFragmentLoader(this.config.fLoader)
+  private requireSegmentLoader(): ParallelSegmentLoader {
+    const loader = ParallelSegmentLoader.fromFragmentLoader(this.config.fLoader)
+    if (loader === undefined) {
+      throw new Error(
+        'ParallelStreamController 必须与同一个 ParallelSegmentLoader.fLoader 配合使用',
+      )
+    }
+    return loader
   }
 }

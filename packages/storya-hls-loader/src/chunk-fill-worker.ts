@@ -1,421 +1,257 @@
-import type { FragmentLoaderContext, HlsConfig } from 'hls.js'
-import type { HttpTransport, HttpTransportResponse } from 'storya-transport'
+import type { HttpTransport } from 'storya-transport'
 import type { WorkerDiagnostics } from './diagnostics'
+import type { ParallelSegmentLoader } from './parallel-segment-loader'
+import { ChunkFillWork, type ChunkFillWorkOptions } from './chunk-fill-work'
+import type { VirtualStreamChunk } from './virtual-stream-chunk'
+import type { VirtualStreamSegment } from './virtual-stream-segment'
 
-export interface ChunkFillWork {
-  chunkKey: string
-  context: FragmentLoaderContext
-  fillId: number
-  rangeEnabled: boolean
-  requestEnd: number | undefined
-  requestStart: number
-  resourceLength: number | undefined
-  segmentKey: string
-  streamId: string
-}
-
-export interface ChunkFillResult {
-  data: Uint8Array
-  firstByteAt: number
-  response: Response
-  url: string
-}
-
-export interface ChunkFillWorkerHost {
-  completeChunk(work: ChunkFillWork, result: ChunkFillResult): void
-  failChunk(work: ChunkFillWork, cause: unknown): void
-  getConfig(): HlsConfig | undefined
-  getRevision(): number
-  isFillCurrent(work: ChunkFillWork): boolean
-  releaseChunk(work: ChunkFillWork, preempted: boolean): void
-  rescueChunk(work: ChunkFillWork, reason: string): void
-  shouldPreempt(workerId: number): boolean
-  subscribe(listener: () => void): () => void
-  takeNextChunk(): ChunkFillWork | undefined
-  updateChunkProgress(work: ChunkFillWork, loadedBytes: number): void
-  waitForChange(afterRevision: number, signal: AbortSignal): Promise<void>
+interface ChunkCandidate {
+  chunk: VirtualStreamChunk
+  segment: VirtualStreamSegment
+  windowIndex: number
 }
 
 interface ChunkFillWorkerOptions {
-  host: ChunkFillWorkerHost
   id: number
-  idleTimeoutMs: number
+  loader: ParallelSegmentLoader
   transport: HttpTransport
 }
 
 export class ChunkFillWorker {
   readonly id: number
 
-  private active: ChunkFillWork | undefined
-  private readonly controller = new AbortController()
-  private done: Promise<void> | undefined
-  private readonly host: ChunkFillWorkerHost
-  private readonly idleTimeoutMs: number
-  private requestController: AbortController | undefined
-  private startedAt: number | undefined
+  private activeWork: ChunkFillWork | undefined
+  private destroyed = false
+  private readonly loader: ParallelSegmentLoader
+  private scheduled = false
   private state: 'idle' | 'loading' | 'stopped' = 'idle'
   private readonly transport: HttpTransport
+  private unsubscribe: (() => void) | undefined
 
   constructor(options: ChunkFillWorkerOptions) {
-    this.host = options.host
     this.id = options.id
-    this.idleTimeoutMs = options.idleTimeoutMs
+    this.loader = options.loader
     this.transport = options.transport
   }
 
-  get activeWork(): ChunkFillWork | undefined {
-    return this.active
-  }
-
-  get loading(): boolean {
-    return this.state === 'loading'
-  }
-
   start(): void {
-    if (this.done !== undefined || this.controller.signal.aborted) {
+    if (this.unsubscribe !== undefined || this.destroyed) {
       return
     }
-    this.done = this.run()
-    void this.done.catch(() => undefined)
+    this.unsubscribe = this.loader.subscribe(() => this.handleChange())
+    this.schedule()
   }
 
   destroy(): void {
-    if (this.controller.signal.aborted) {
+    if (this.destroyed) {
       return
     }
-    this.controller.abort()
-    this.requestController?.abort()
+    this.destroyed = true
+    this.unsubscribe?.()
+    this.unsubscribe = undefined
+    this.activeWork?.cancel(new DOMException('ChunkFillWorker 已销毁', 'AbortError'))
     this.state = 'stopped'
   }
 
   getDiagnostics(): WorkerDiagnostics {
     return {
-      chunkKey: this.active?.chunkKey,
+      chunkKey: this.activeWork?.chunkKey,
       id: this.id,
-      requestEnd: this.active?.requestEnd,
-      requestStart: this.active?.requestStart,
-      segmentKey: this.active?.segmentKey,
-      startedAt: this.startedAt,
+      requestEnd: this.activeWork?.requestEnd,
+      requestStart: this.activeWork?.requestStart,
+      segmentKey: this.activeWork?.segmentKey,
+      startedAt: this.activeWork?.startedAt,
       state: this.state,
-      streamId: this.active?.streamId,
+      streamId: this.activeWork?.streamId,
     }
   }
 
-  private async run(): Promise<void> {
-    while (!this.controller.signal.aborted) {
-      const revision = this.host.getRevision()
-      const work = this.host.takeNextChunk()
+  private schedule(): void {
+    if (this.destroyed || this.scheduled || this.activeWork !== undefined) {
+      return
+    }
+    this.scheduled = true
+    queueMicrotask(() => {
+      this.scheduled = false
+      if (this.destroyed || this.activeWork !== undefined) {
+        return
+      }
+
+      const work = this.takeNextWork()
       if (work === undefined) {
         this.state = 'idle'
-        try {
-          await this.host.waitForChange(revision, this.controller.signal)
-        } catch {
-          break
-        }
-        continue
+        return
       }
 
-      this.active = work
-      this.startedAt = performance.now()
+      this.activeWork = work
       this.state = 'loading'
-      await this.fillChunk(work)
-      this.active = undefined
-      this.requestController = undefined
-      this.startedAt = undefined
-    }
-    this.state = 'stopped'
-  }
-
-  private async fillChunk(work: ChunkFillWork): Promise<void> {
-    const requestController = new AbortController()
-    this.requestController = requestController
-    let preempted = false
-    const onWorkerAbort = () => requestController.abort(this.controller.signal.reason)
-    const onChange = () => {
-      if (!this.host.isFillCurrent(work)) {
-        requestController.abort()
-        return
-      }
-      if (this.host.shouldPreempt(this.id)) {
-        preempted = true
-        requestController.abort()
-      }
-    }
-    this.controller.signal.addEventListener('abort', onWorkerAbort, { once: true })
-    const unsubscribe = this.host.subscribe(onChange)
-
-    try {
-      const result = await this.fetchChunk(work, requestController)
-      this.host.completeChunk(work, result)
-    } catch (cause) {
-      if (requestController.signal.aborted) {
-        if (isTimeoutAbort(requestController.signal.reason)) {
-          this.host.rescueChunk(work, requestController.signal.reason.message)
-        } else {
-          this.host.releaseChunk(work, preempted)
-        }
-      } else {
-        this.host.failChunk(work, cause)
-      }
-    } finally {
-      this.controller.signal.removeEventListener('abort', onWorkerAbort)
-      unsubscribe()
-    }
-  }
-
-  private async fetchChunk(
-    work: ChunkFillWork,
-    controller: AbortController,
-  ): Promise<ChunkFillResult> {
-    const config = this.host.getConfig()
-    if (config === undefined) {
-      throw new Error('ParallelSegmentLoader 尚未取得 hls.js 配置')
-    }
-    const headers = new Headers(work.context.headers)
-    if (work.rangeEnabled && work.requestEnd !== undefined) {
-      headers.set('range', `bytes=${work.requestStart}-${work.requestEnd - 1}`)
-    } else {
-      headers.delete('range')
-    }
-    const requestContext: FragmentLoaderContext = {
-      ...work.context,
-      headers: Object.fromEntries(headers.entries()),
-      rangeEnd: work.rangeEnabled ? (work.requestEnd ?? 0) : 0,
-      rangeStart: work.rangeEnabled ? work.requestStart : 0,
-    }
-    const init: RequestInit = {
-      credentials: 'same-origin',
-      headers,
-      method: 'GET',
-      mode: 'cors',
-      signal: controller.signal,
-    }
-    const request =
-      (await config.fetchSetup?.(requestContext, init)) ?? new Request(work.context.url, init)
-    if (!this.host.isFillCurrent(work)) {
-      throw new DOMException('Chunk Fill 已经失效', 'AbortError')
-    }
-
-    const loadPolicy = config.fragLoadPolicy.default
-    const loadTimer =
-      Number.isFinite(loadPolicy.maxLoadTimeMs) && loadPolicy.maxLoadTimeMs > 0
-        ? globalThis.setTimeout(() => {
-            if (!controller.signal.aborted) {
-              controller.abort(new DOMException('Chunk 请求超过最大加载时间', 'TimeoutError'))
-            }
-          }, loadPolicy.maxLoadTimeMs)
-        : undefined
-    let firstByteTimer =
-      Number.isFinite(loadPolicy.maxTimeToFirstByteMs) && loadPolicy.maxTimeToFirstByteMs > 0
-        ? globalThis.setTimeout(() => {
-            if (!controller.signal.aborted) {
-              controller.abort(new DOMException('Chunk 等待响应头超时', 'TimeoutError'))
-            }
-          }, loadPolicy.maxTimeToFirstByteMs)
-        : undefined
-    try {
-      const transportResponse = await this.transport.request(request)
-      if (firstByteTimer !== undefined) {
-        globalThis.clearTimeout(firstByteTimer)
-        firstByteTimer = undefined
-      }
-      const firstByteAt = performance.now()
-      if (!transportResponse.ok) {
-        const response = createNetworkDetails(transportResponse)
-        throw new ChunkRequestFailure(
-          `HTTP ${transportResponse.status} ${transportResponse.statusText}`.trim(),
-          transportResponse.status,
-          response,
-        )
-      }
-      const data = await this.readResponseBody(work, transportResponse, controller)
-      const response = await this.createReadableRangeResponse(
-        work,
-        request,
-        transportResponse,
-        data.byteLength,
-        controller.signal,
-      )
-      return { data, firstByteAt, response, url: transportResponse.url }
-    } catch (cause) {
-      if (cause instanceof ChunkRequestFailure || controller.signal.aborted) {
-        throw cause
-      }
-      throw new ChunkRequestFailure(cause instanceof Error ? cause.message : 'Transport 请求失败')
-    } finally {
-      if (loadTimer !== undefined) {
-        globalThis.clearTimeout(loadTimer)
-      }
-      if (firstByteTimer !== undefined) {
-        globalThis.clearTimeout(firstByteTimer)
-      }
-    }
-  }
-
-  private async readResponseBody(
-    work: ChunkFillWork,
-    response: HttpTransportResponse,
-    controller: AbortController,
-  ): Promise<Uint8Array> {
-    const parts: Uint8Array[] = []
-    let receivedBytes = 0
-    let idleTimer: ReturnType<typeof globalThis.setTimeout> | undefined
-    const resetIdleTimer = () => {
-      if (idleTimer !== undefined) {
-        globalThis.clearTimeout(idleTimer)
-      }
-      idleTimer = globalThis.setTimeout(() => {
-        if (!controller.signal.aborted) {
-          controller.abort(
-            new DOMException(`Chunk 连续 ${this.idleTimeoutMs}ms 没有收到数据`, 'TimeoutError'),
-          )
-        }
-      }, this.idleTimeoutMs)
-    }
-    const accept = (data: Uint8Array) => {
-      if (data.byteLength === 0 || controller.signal.aborted) {
-        return
-      }
-      const owned = data.slice()
-      parts.push(owned)
-      receivedBytes += owned.byteLength
-      this.host.updateChunkProgress(work, receivedBytes)
-      resetIdleTimer()
-    }
-
-    resetIdleTimer()
-    try {
-      if (response.body === null) {
-        accept(new Uint8Array(await response.arrayBuffer()))
-      } else {
-        const reader = response.body.getReader()
-        const abort = () => {
-          void reader.cancel(controller.signal.reason).catch(() => undefined)
-        }
-        controller.signal.addEventListener('abort', abort, { once: true })
-        try {
-          while (true) {
-            const result = await reader.read()
-            if (controller.signal.aborted) {
-              throw controller.signal.reason
-            }
-            if (result.done) {
-              break
-            }
-            accept(result.value)
+      void work
+        .run()
+        .catch(() => undefined)
+        .finally(() => {
+          this.activeWork = undefined
+          if (!this.destroyed) {
+            this.state = 'idle'
+            this.schedule()
           }
-        } finally {
-          controller.signal.removeEventListener('abort', abort)
-          reader.releaseLock()
-        }
-      }
-    } finally {
-      if (idleTimer !== undefined) {
-        globalThis.clearTimeout(idleTimer)
-      }
-    }
-
-    const data = new Uint8Array(receivedBytes)
-    let offset = 0
-    for (const part of parts) {
-      data.set(part, offset)
-      offset += part.byteLength
-    }
-    return data
-  }
-
-  private async createReadableRangeResponse(
-    work: ChunkFillWork,
-    request: Request,
-    response: HttpTransportResponse,
-    receivedBytes: number,
-    signal: AbortSignal,
-  ): Promise<Response> {
-    if (
-      response.status !== 206 ||
-      response.headers.has('content-range') ||
-      !work.rangeEnabled ||
-      work.requestEnd === undefined
-    ) {
-      return createNetworkDetails(response)
-    }
-
-    const requestedBytes = work.requestEnd - work.requestStart
-    let resourceLength: number | undefined
-    if (receivedBytes < requestedBytes) {
-      resourceLength = work.requestStart + receivedBytes
-    } else if (work.resourceLength !== undefined) {
-      resourceLength = work.resourceLength
-    } else {
-      resourceLength = await this.discoverResourceLength(request, signal)
-    }
-    if (resourceLength === undefined || receivedBytes <= 0) {
-      return createNetworkDetails(response)
-    }
-
-    const endInclusive = work.requestStart + receivedBytes - 1
-    if (resourceLength <= endInclusive) {
-      resourceLength = endInclusive + 1
-    }
-    const headers = new Headers(response.headers)
-    headers.set('content-range', `bytes ${work.requestStart}-${endInclusive}/${resourceLength}`)
-    return new Response(null, {
-      headers,
-      status: response.status,
-      statusText: response.statusText,
+        })
     })
   }
 
-  private async discoverResourceLength(
-    request: Request,
-    signal: AbortSignal,
-  ): Promise<number | undefined> {
-    const headers = new Headers(request.headers)
-    headers.delete('range')
-    const headRequest = new Request(request.url, {
-      cache: request.cache,
-      credentials: request.credentials,
-      headers,
-      method: 'HEAD',
-      mode: request.mode,
-      redirect: request.redirect,
-      signal,
-    })
-    try {
-      const response = await this.transport.request(headRequest)
-      const contentLength = Number.parseInt(response.headers.get('content-length') ?? '', 10)
-      return response.ok && Number.isSafeInteger(contentLength) && contentLength > 0
-        ? contentLength
-        : undefined
-    } catch (cause) {
-      if (signal.aborted) {
-        throw cause
-      }
+  private takeNextWork(): ChunkFillWork | undefined {
+    const candidate = this.selectBestChunk()
+    if (candidate === undefined) {
       return undefined
     }
+
+    const startedAt = performance.now()
+    let options: ChunkFillWorkOptions | undefined
+    this.loader.update(state => {
+      const segment = state.streams
+        .get(candidate.segment.streamId)
+        ?.segments.get(candidate.segment.key)
+      const chunk = segment?.chunks.find(item => item.key === candidate.chunk.key)
+      if (segment === undefined || chunk === undefined || segment.outcome.type !== 'pending') {
+        return undefined
+      }
+
+      const generation = state.allocateGeneration()
+      if (!chunk.claim(this.id, generation, startedAt)) {
+        return undefined
+      }
+      segment.startedAt ??= startedAt
+      const requestStart = chunk.rangeEnabled
+        ? segment.resourceStart + chunk.start
+        : segment.resourceStart
+      const requestEnd = chunk.rangeEnabled
+        ? chunk.endExclusive === undefined
+          ? undefined
+          : segment.resourceStart + chunk.endExclusive
+        : undefined
+      options = {
+        chunkKey: chunk.key,
+        context: segment.context,
+        generation,
+        loader: this.loader,
+        rangeEnabled: chunk.rangeEnabled,
+        requestEnd,
+        requestStart,
+        resourceLength:
+          segment.length === undefined ? undefined : segment.resourceStart + segment.length,
+        segmentKey: segment.key,
+        startedAt,
+        streamId: segment.streamId,
+        transport: this.transport,
+      }
+      return undefined
+    })
+    return options === undefined ? undefined : new ChunkFillWork(options)
+  }
+
+  private selectBestChunk(): ChunkCandidate | undefined {
+    let best: ChunkCandidate | undefined
+    for (const stream of this.loader.state.streams.values()) {
+      for (const segment of stream.segments.values()) {
+        if (segment.outcome.type !== 'pending') {
+          continue
+        }
+        const index = stream.window.indexOf(segment.key)
+        if (index === -1 && segment.readerCount === 0) {
+          continue
+        }
+        const windowIndex = index === -1 ? Number.MAX_SAFE_INTEGER : index
+        for (const chunk of segment.chunks) {
+          if (chunk.phase.type !== 'empty') {
+            continue
+          }
+          const candidate = { chunk, segment, windowIndex }
+          if (best === undefined || compareChunkCandidates(candidate, best) < 0) {
+            best = candidate
+          }
+        }
+      }
+    }
+    return best
+  }
+
+  private handleChange(): void {
+    if (this.destroyed) {
+      return
+    }
+    if (this.activeWork === undefined) {
+      this.schedule()
+      return
+    }
+    if (!this.activeWork.isCurrent() || this.shouldPreempt(this.activeWork)) {
+      this.activeWork.cancel(new DOMException('Chunk Fill 已失效', 'AbortError'))
+    }
+  }
+
+  private shouldPreempt(work: ChunkFillWork): boolean {
+    const urgent = this.selectBestChunk()
+    if (urgent === undefined || urgent.segment.readerCount === 0) {
+      return false
+    }
+
+    const active = this.locateActiveWork(work)
+    if (active === undefined || active.segment.readerCount > 0) {
+      return false
+    }
+    const activeStream = this.loader.state.streams.get(active.segment.streamId)
+    const activeIndex = activeStream?.window.indexOf(active.segment.key) ?? -1
+    const activeCandidate: ChunkCandidate = {
+      chunk: active.chunk,
+      segment: active.segment,
+      windowIndex: activeIndex === -1 ? Number.MAX_SAFE_INTEGER : activeIndex,
+    }
+
+    let victim: ChunkCandidate | undefined
+    for (const stream of this.loader.state.streams.values()) {
+      for (const segment of stream.segments.values()) {
+        if (segment.readerCount > 0) {
+          continue
+        }
+        const index = stream.window.indexOf(segment.key)
+        const windowIndex = index === -1 ? Number.MAX_SAFE_INTEGER : index
+        for (const chunk of segment.chunks) {
+          if (chunk.phase.type !== 'filling') {
+            continue
+          }
+          const candidate = { chunk, segment, windowIndex }
+          if (victim === undefined || compareChunkCandidates(candidate, victim) > 0) {
+            victim = candidate
+          }
+        }
+      }
+    }
+
+    return (
+      victim?.chunk.phase.type === 'filling' &&
+      victim.chunk.phase.workerId === this.id &&
+      compareChunkCandidates(urgent, activeCandidate) < 0
+    )
+  }
+
+  private locateActiveWork(
+    work: ChunkFillWork,
+  ): { chunk: VirtualStreamChunk; segment: VirtualStreamSegment } | undefined {
+    const segment = this.loader.state.streams.get(work.streamId)?.segments.get(work.segmentKey)
+    const chunk = segment?.chunks.find(item => item.key === work.chunkKey)
+    return segment !== undefined && chunk?.isCurrent(work.generation)
+      ? { chunk, segment }
+      : undefined
   }
 }
 
-export class ChunkRequestFailure extends Error {
-  readonly code: number
-  readonly response: Response | null
-
-  constructor(message: string, code = 0, response: Response | null = null) {
-    super(message)
-    this.name = 'ChunkRequestFailure'
-    this.code = code
-    this.response = response
+function compareChunkCandidates(left: ChunkCandidate, right: ChunkCandidate): number {
+  const leftDirect = left.segment.readerCount > 0
+  const rightDirect = right.segment.readerCount > 0
+  if (leftDirect !== rightDirect) {
+    return leftDirect ? -1 : 1
   }
-}
-
-function isTimeoutAbort(reason: unknown): boolean {
-  return reason instanceof DOMException && reason.name === 'TimeoutError'
-}
-
-function createNetworkDetails(response: HttpTransportResponse): Response {
-  return new Response(null, {
-    headers: response.headers,
-    status: response.status,
-    statusText: response.statusText,
-  })
+  return (
+    left.windowIndex - right.windowIndex ||
+    left.chunk.index - right.chunk.index ||
+    left.chunk.key.localeCompare(right.chunk.key)
+  )
 }

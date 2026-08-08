@@ -7,7 +7,7 @@ import type {
   LoaderConfiguration,
   LoaderResponse,
 } from 'hls.js'
-import { createWindowDescriptor, ParallelSegmentLoader } from './parallel-segment-loader.ts'
+import { ParallelSegmentLoader } from './parallel-segment-loader.ts'
 
 const originalFetch = globalThis.fetch
 const resources = new Map([
@@ -92,7 +92,7 @@ const firstFragment = createFragment(1)
 const firstContext = createContext(firstFragment)
 
 try {
-  owner.replaceWindow('main:0', [createWindowDescriptor(firstFragment)], config)
+  replaceWindow(owner, [firstFragment], config)
   const first = startLoad(owner, firstContext, config)
   const second = startLoad(owner, firstContext, config)
   const firstResult = first.promise.then(
@@ -131,11 +131,7 @@ try {
   cached.loader.destroy()
 
   const secondFragment = createFragment(2)
-  owner.replaceWindow(
-    'main:0',
-    [createWindowDescriptor(firstFragment), createWindowDescriptor(secondFragment)],
-    config,
-  )
+  replaceWindow(owner, [firstFragment, secondFragment], config)
   const overlapping = owner
     .getDiagnostics()
     .streams.flatMap(stream => stream.segments)
@@ -144,7 +140,7 @@ try {
     throw new Error('窗口更新必须保留重叠 Segment 的 ready 数据和 Chunk 状态')
   }
 
-  owner.replaceWindow('main:0', [createWindowDescriptor(secondFragment)], config)
+  replaceWindow(owner, [secondFragment], config)
   if (
     owner
       .getDiagnostics()
@@ -212,7 +208,7 @@ try {
   try {
     const rescueFragment = createFragment(6)
     const rescueContext = createContext(rescueFragment)
-    rescueOwner.replaceWindow('main:0', [createWindowDescriptor(rescueFragment)], config)
+    replaceWindow(rescueOwner, [rescueFragment], config)
     const rescued = startLoad(rescueOwner, rescueContext, config)
     await waitForCondition(() => {
       const segment = rescueOwner.getDiagnostics().streams[0]?.segments[0]
@@ -284,6 +280,18 @@ function createContext(fragment: Fragment): FragmentLoaderContext {
     type: 'media-fragment' as FragmentLoaderContext['type'],
     url: fragment.url,
   }
+}
+
+function replaceWindow(
+  owner: ParallelSegmentLoader,
+  fragments: readonly Fragment[],
+  config: HlsConfig,
+): void {
+  owner.configure(config)
+  owner.update(state => {
+    state.ensureStream('main:0').replaceWindow(fragments, owner.chunkSize)
+    return undefined
+  })
 }
 
 function createLoaderConfiguration(): LoaderConfiguration {

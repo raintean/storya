@@ -8,25 +8,12 @@ import type {
   LoaderStats,
 } from 'hls.js'
 import type { ParallelSegmentLoader } from './parallel-segment-loader'
-import { copyLoaderStats, createLoaderStats } from './stats'
-
-export interface SegmentLoadFailure {
-  code: number
-  message: string
-  response: Response | null
-}
-
-export type SegmentObservation =
-  | { state: 'pending'; stats: LoaderStats }
-  | { failure: SegmentLoadFailure; state: 'failed'; stats: LoaderStats }
-  | {
-      code: number
-      data: ArrayBuffer
-      response: Response
-      state: 'ready'
-      stats: LoaderStats
-      url: string
-    }
+import { createLoaderStats } from './stats'
+import type {
+  SegmentLoadFailure,
+  VirtualStreamSegment,
+  VirtualStreamSegmentOutcome,
+} from './virtual-stream-segment'
 
 export function createStoryaFragmentLoader(
   loader: ParallelSegmentLoader,
@@ -36,11 +23,13 @@ export function createStoryaFragmentLoader(
     stats: LoaderStats = createLoaderStats()
 
     private callbacks: LoaderCallbacks<FragmentLoaderContext> | undefined
-    private readonly changeController = new AbortController()
+    private initialRetry = 0
     private networkDetails: Response | null = null
+    private progressive = false
     private reading = false
     private settled = false
     private timeoutTimer: ReturnType<typeof globalThis.setTimeout> | undefined
+    private unsubscribe: (() => void) | undefined
 
     constructor(config: HlsConfig) {
       loader.configure(config)
@@ -57,14 +46,22 @@ export function createStoryaFragmentLoader(
 
       this.context = context
       this.callbacks = callbacks
+      this.initialRetry = this.stats.retry
+      this.progressive = callbacks.onProgress !== undefined && Number.isFinite(config.highWaterMark)
+
+      loader.update(state => {
+        const streamId = `${context.frag.type}:${context.frag.level}`
+        state.ensureStream(streamId).ensureSegment(context, loader.chunkSize).startReading()
+        return undefined
+      })
       this.reading = true
-      loader.startReading(context)
+      this.unsubscribe = loader.subscribe(() => this.checkSegment())
 
       const maxLoadTimeMs = config.loadPolicy.maxLoadTimeMs
       if (Number.isFinite(maxLoadTimeMs) && maxLoadTimeMs > 0) {
         this.timeoutTimer = globalThis.setTimeout(() => this.timeout(), maxLoadTimeMs)
       }
-      void this.observe(config)
+      this.checkSegment()
     }
 
     abort(): void {
@@ -73,20 +70,17 @@ export function createStoryaFragmentLoader(
       }
 
       const context = this.context
-      this.settled = true
-      this.clearTimeout()
-      this.changeController.abort()
-      this.stopReading()
+      const callbacks = this.callbacks
       this.stats.aborted = true
       this.stats.loading.end = performance.now()
-      this.callbacks?.onAbort?.(this.stats, context, this.networkDetails)
+      this.settle()
+      callbacks?.onAbort?.(this.stats, context, this.networkDetails)
     }
 
     destroy(): void {
-      this.settled = true
-      this.clearTimeout()
-      this.changeController.abort()
-      this.stopReading()
+      if (!this.settled) {
+        this.settle()
+      }
       this.callbacks = undefined
       this.context = null
     }
@@ -100,33 +94,34 @@ export function createStoryaFragmentLoader(
       return this.networkDetails?.headers.get(name) ?? null
     }
 
-    private async observe(config: LoaderConfiguration): Promise<void> {
-      while (!this.settled && this.context !== null) {
-        const revision = loader.revision
-        const observation = loader.inspectSegment(this.context)
-        copyLoaderStats(this.stats, observation.stats)
+    private checkSegment(): void {
+      if (this.settled || this.context === null) {
+        return
+      }
+      if (loader.state.destroyed) {
+        this.fail({
+          code: 0,
+          message: 'ParallelSegmentLoader 已经销毁',
+          response: null,
+        })
+        return
+      }
 
-        if (observation.state === 'ready') {
-          this.succeed(observation, config)
-          return
-        }
-        if (observation.state === 'failed') {
-          this.fail(observation.failure)
-          return
-        }
+      const segment = loader.state.locateSegment(this.context)
+      if (segment === undefined) {
+        this.fail({ code: 0, message: '读取的 Segment 不存在', response: null })
+        return
+      }
 
-        try {
-          await loader.waitForChange(revision, this.changeController.signal)
-        } catch {
-          return
-        }
+      this.updateStats(segment)
+      if (segment.outcome.type === 'ready') {
+        this.succeed(segment.outcome)
+      } else if (segment.outcome.type === 'failed') {
+        this.fail(segment.outcome.failure)
       }
     }
 
-    private succeed(
-      result: Extract<SegmentObservation, { state: 'ready' }>,
-      config: LoaderConfiguration,
-    ): void {
+    private succeed(result: Extract<VirtualStreamSegmentOutcome, { type: 'ready' }>): void {
       if (this.settled || this.context === null) {
         return
       }
@@ -134,20 +129,16 @@ export function createStoryaFragmentLoader(
       const context = this.context
       const callbacks = this.callbacks
       const data = result.data.slice(0)
-      const progressive =
-        callbacks?.onProgress !== undefined && Number.isFinite(config.highWaterMark)
-
-      this.settled = true
-      this.clearTimeout()
       this.networkDetails = result.response
-      this.stopReading()
-      if (callbacks?.onProgress !== undefined) {
+      this.settle()
+
+      if (this.progressive && callbacks?.onProgress !== undefined) {
         callbacks.onProgress(this.stats, context, data, result.response)
       }
       callbacks?.onSuccess(
         {
           code: result.code,
-          data: progressive ? new ArrayBuffer(0) : data,
+          data: this.progressive ? new ArrayBuffer(0) : data,
           url: result.url,
         },
         this.stats,
@@ -162,11 +153,10 @@ export function createStoryaFragmentLoader(
       }
 
       const context = this.context
-      this.settled = true
-      this.clearTimeout()
+      const callbacks = this.callbacks
       this.networkDetails = failure.response
-      this.stopReading()
-      this.callbacks?.onError(
+      this.settle()
+      callbacks?.onError(
         { code: failure.code, text: failure.message },
         context,
         failure.response,
@@ -180,28 +170,51 @@ export function createStoryaFragmentLoader(
       }
 
       const context = this.context
-      this.settled = true
-      this.timeoutTimer = undefined
-      this.changeController.abort()
-      this.stopReading()
+      const callbacks = this.callbacks
       this.stats.loading.end = performance.now()
-      this.callbacks?.onTimeout(this.stats, context, this.networkDetails)
+      this.settle()
+      callbacks?.onTimeout(this.stats, context, this.networkDetails)
     }
 
-    private clearTimeout(): void {
-      if (this.timeoutTimer === undefined) {
-        return
+    private settle(): void {
+      this.settled = true
+      this.unsubscribe?.()
+      this.unsubscribe = undefined
+      if (this.timeoutTimer !== undefined) {
+        globalThis.clearTimeout(this.timeoutTimer)
+        this.timeoutTimer = undefined
       }
-      globalThis.clearTimeout(this.timeoutTimer)
-      this.timeoutTimer = undefined
-    }
 
-    private stopReading(): void {
       if (!this.reading || this.context === null) {
         return
       }
       this.reading = false
-      loader.stopReading(this.context)
+      if (loader.state.destroyed) {
+        return
+      }
+
+      const context = this.context
+      loader.update(state => {
+        state.locateSegment(context)?.stopReading()
+        return undefined
+      })
+    }
+
+    private updateStats(segment: VirtualStreamSegment): void {
+      const completedAt = segment.outcome.type === 'pending' ? 0 : segment.outcome.completedAt
+      const loaded = segment.loadedBytes
+      const start = segment.startedAt ?? 0
+      const end = completedAt || performance.now()
+
+      this.stats.loaded = loaded
+      this.stats.retry = this.initialRetry + segment.retryCount
+      this.stats.total = segment.length ?? 0
+      this.stats.chunkCount = segment.chunks.filter(chunk => chunk.state === 'ready').length
+      this.stats.loading.start = start
+      this.stats.loading.first = segment.firstByteAt ?? 0
+      this.stats.loading.end = completedAt
+      const elapsed = end - start
+      this.stats.bwEstimate = start > 0 && elapsed > 0 ? (loaded * 8 * 1000) / elapsed : 0
     }
   }
 }
