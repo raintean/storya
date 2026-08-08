@@ -48,6 +48,22 @@ interface LogEntryOptions {
   tag?: string
 }
 
+interface LoaderParameterInputs {
+  chunkSizeMiB: string
+  idleTimeoutMs: string
+  maxConcurrency: string
+  maxRescueAttempts: string
+  windowSize: string
+}
+
+interface LoaderParameters {
+  chunkSize: number
+  idleTimeoutMs: number
+  maxConcurrency: number
+  maxRescueAttempts: number
+  windowSize: number
+}
+
 interface QualityLevel {
   bitrate: number
   height: number
@@ -73,6 +89,14 @@ const websocketIdleConnectionTimeoutMs = 30_000
 const websocketMaxConnections = DEFAULT_MAX_CONCURRENCY * 2
 const websocketMaxRequestsPerConnection = 50
 const websocketMinIdleConnections = 6
+
+const defaultLoaderParameterInputs: LoaderParameterInputs = {
+  chunkSizeMiB: String(DEFAULT_CHUNK_SIZE / (1024 * 1024)),
+  idleTimeoutMs: '5000',
+  maxConcurrency: String(DEFAULT_MAX_CONCURRENCY),
+  maxRescueAttempts: '1',
+  windowSize: String(DEFAULT_WINDOW_SIZE),
+}
 
 const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
@@ -107,8 +131,12 @@ export function App() {
   const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
   const [workerUrl, setWorkerUrl] = useState('')
   const [proxyOriginsText, setProxyOriginsText] = useState('')
+  const [loaderParameterInputs, setLoaderParameterInputs] = useState(defaultLoaderParameterInputs)
   const [activeLoaderMode, setActiveLoaderMode] = useState<LoaderMode | null>(null)
   const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
+  const [activeLoaderParameters, setActiveLoaderParameters] = useState<LoaderParameters | null>(
+    null,
+  )
   const [source, setSource] = useState(defaultSource)
   const [qualityLevels, setQualityLevels] = useState<QualityLevel[]>([])
   const [selectedLevel, setSelectedLevel] = useState(-2)
@@ -178,6 +206,19 @@ export function App() {
         return
       }
 
+      let loaderParameters: LoaderParameters | null = null
+      if (loaderMode === 'parallel') {
+        try {
+          loaderParameters = parseLoaderParameters(loaderParameterInputs)
+        } catch (cause) {
+          const message = cause instanceof Error ? cause.message : 'Loader 参数无效'
+          setStatus('等待有效的 Loader 参数')
+          setError(message)
+          appendLog(message, 'error', { tag: '加载器' })
+          return
+        }
+      }
+
       destroyPlaybackSession()
       video.pause()
       video.removeAttribute('src')
@@ -191,6 +232,7 @@ export function App() {
       setDiagnostics(emptyDiagnostics)
       setActiveLoaderMode(null)
       setActiveTransportMode(null)
+      setActiveLoaderParameters(null)
       setError(null)
       playbackLevelIndexRef.current = -1
       setStatus('正在加载播放列表')
@@ -241,6 +283,7 @@ export function App() {
         const parallelLoader =
           loaderMode === 'parallel'
             ? new ParallelSegmentLoader({
+                ...(loaderParameters ?? {}),
                 ...(transport === undefined ? {} : { transport }),
               })
             : null
@@ -362,14 +405,20 @@ export function App() {
         hls.loadSource(normalizedSource)
         setActiveLoaderMode(loaderMode)
         setActiveTransportMode(loaderMode === 'parallel' ? transportMode : null)
+        setActiveLoaderParameters(loaderParameters)
         appendLog(
-          loaderMode === 'parallel'
-            ? `启用 ${DEFAULT_MAX_CONCURRENCY} 路并行 Range Loader`
-            : '启用 hls.js 原生 FetchLoader',
+          loaderParameters === null
+            ? '启用 hls.js 原生 FetchLoader'
+            : `启用 ${String(loaderParameters.maxConcurrency)} 路并行 Range Loader`,
           'default',
           { tag: '加载器' },
         )
-        if (loaderMode === 'parallel') {
+        if (loaderParameters !== null) {
+          appendLog(
+            `窗口 ${String(loaderParameters.windowSize)} 个 Segment, Chunk ${formatBytes(loaderParameters.chunkSize)}, rescue ${String(loaderParameters.maxRescueAttempts)} 次`,
+            'default',
+            { tag: '调度策略' },
+          )
           appendLog(
             relayEndpoint !== undefined
               ? `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`
@@ -398,6 +447,7 @@ export function App() {
     [
       appendLog,
       destroyPlaybackSession,
+      loaderParameterInputs,
       loaderMode,
       proxyOriginsText,
       source,
@@ -430,6 +480,10 @@ export function App() {
         tag: 'Transport',
       })
     }
+  }
+
+  const handleLoaderParameterChange = (name: keyof LoaderParameterInputs, value: string) => {
+    setLoaderParameterInputs(current => ({ ...current, [name]: value }))
   }
 
   const handleLevelChange = (value: string) => {
@@ -513,7 +567,7 @@ export function App() {
         </div>
       </header>
 
-      <form className="source-bar panel" onSubmit={handleSubmit}>
+      <form id="stream-source-form" className="source-bar panel" onSubmit={handleSubmit}>
         <label htmlFor="source">HLS SOURCE</label>
         <input
           id="source"
@@ -576,9 +630,10 @@ export function App() {
             <PanelHeading index="01" eyebrow="LOADER STATE" title="VirtualStream 状态">
               <div className="stream-legend">
                 <span data-state="cached">缓存</span>
+                <span data-state="planning">探测</span>
                 <span data-state="loading">填充</span>
                 <span data-state="needed">待领取</span>
-                <span data-state="retrying">重试</span>
+                <span data-state="rescuing">补救</span>
                 <span data-state="failed">失败</span>
               </div>
             </PanelHeading>
@@ -689,10 +744,116 @@ export function App() {
                   <small>填写一个或多个 HTTP(S) Origin, 使用换行、空格或逗号分隔</small>
                 </div>
               ) : null}
+              {loaderMode === 'parallel' ? (
+                <div className="loader-parameters">
+                  <div className="loader-parameters-heading">
+                    <span>PARALLEL POLICY</span>
+                    <small>NEXT SESSION</small>
+                  </div>
+                  <div className="loader-parameter-grid">
+                    <label className="loader-parameter" htmlFor="window-size">
+                      <span>WINDOW</span>
+                      <div>
+                        <input
+                          id="window-size"
+                          form="stream-source-form"
+                          type="number"
+                          min="1"
+                          max="24"
+                          step="1"
+                          value={loaderParameterInputs.windowSize}
+                          onChange={event =>
+                            handleLoaderParameterChange('windowSize', event.target.value)
+                          }
+                          required
+                        />
+                        <small>SEG</small>
+                      </div>
+                    </label>
+                    <label className="loader-parameter" htmlFor="max-concurrency">
+                      <span>WORKERS</span>
+                      <div>
+                        <input
+                          id="max-concurrency"
+                          form="stream-source-form"
+                          type="number"
+                          min="1"
+                          max="12"
+                          step="1"
+                          value={loaderParameterInputs.maxConcurrency}
+                          onChange={event =>
+                            handleLoaderParameterChange('maxConcurrency', event.target.value)
+                          }
+                          required
+                        />
+                        <small>REQ</small>
+                      </div>
+                    </label>
+                    <label className="loader-parameter" htmlFor="chunk-size">
+                      <span>CHUNK SIZE</span>
+                      <div>
+                        <input
+                          id="chunk-size"
+                          form="stream-source-form"
+                          type="number"
+                          min="0.25"
+                          max="16"
+                          step="0.25"
+                          value={loaderParameterInputs.chunkSizeMiB}
+                          onChange={event =>
+                            handleLoaderParameterChange('chunkSizeMiB', event.target.value)
+                          }
+                          required
+                        />
+                        <small>MiB</small>
+                      </div>
+                    </label>
+                    <label className="loader-parameter" htmlFor="idle-timeout">
+                      <span>SLOW DETECT</span>
+                      <div>
+                        <input
+                          id="idle-timeout"
+                          form="stream-source-form"
+                          type="number"
+                          min="100"
+                          max="60000"
+                          step="100"
+                          value={loaderParameterInputs.idleTimeoutMs}
+                          onChange={event =>
+                            handleLoaderParameterChange('idleTimeoutMs', event.target.value)
+                          }
+                          required
+                        />
+                        <small>MS</small>
+                      </div>
+                    </label>
+                    <label className="loader-parameter is-wide" htmlFor="max-rescue-attempts">
+                      <span>RESCUE LIMIT</span>
+                      <div>
+                        <input
+                          id="max-rescue-attempts"
+                          form="stream-source-form"
+                          type="number"
+                          min="0"
+                          max="10"
+                          step="1"
+                          value={loaderParameterInputs.maxRescueAttempts}
+                          onChange={event =>
+                            handleLoaderParameterChange('maxRescueAttempts', event.target.value)
+                          }
+                          required
+                        />
+                        <small>TRY</small>
+                      </div>
+                    </label>
+                  </div>
+                  <p>参数在下一次加载会话生效. RESCUE 设为 0 会关闭慢速补救.</p>
+                </div>
+              ) : null}
               <dl className="runtime-facts">
                 <div>
                   <dt>REQUEST LIMIT</dt>
-                  <dd>{DEFAULT_MAX_CONCURRENCY}</dd>
+                  <dd>{activeLoaderParameters?.maxConcurrency ?? '—'}</dd>
                 </div>
                 <div>
                   <dt>SESSION LOADER</dt>
@@ -708,11 +869,37 @@ export function App() {
                 </div>
                 <div>
                   <dt>CHUNK SIZE</dt>
-                  <dd>{formatBytes(DEFAULT_CHUNK_SIZE)}</dd>
+                  <dd>
+                    {activeLoaderParameters === null
+                      ? '—'
+                      : formatBytes(activeLoaderParameters.chunkSize)}
+                  </dd>
                 </div>
                 <div>
                   <dt>PREFETCH AHEAD</dt>
-                  <dd>{DEFAULT_WINDOW_SIZE - 1} segments</dd>
+                  <dd>
+                    {activeLoaderParameters === null
+                      ? '—'
+                      : `${String(activeLoaderParameters.windowSize - 1)} segments`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>SLOW DETECTOR</dt>
+                  <dd>
+                    {activeLoaderParameters === null
+                      ? '—'
+                      : `${String(activeLoaderParameters.idleTimeoutMs)} ms`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>RESCUE LIMIT</dt>
+                  <dd>
+                    {activeLoaderParameters === null
+                      ? '—'
+                      : activeLoaderParameters.maxRescueAttempts === 0
+                        ? 'OFF'
+                        : `${String(activeLoaderParameters.maxRescueAttempts)} attempts`}
+                  </dd>
                 </div>
                 <div>
                   <dt>REGISTRY REVISION</dt>
@@ -921,6 +1108,43 @@ function formatLoaderMode(mode: LoaderMode | null): string {
 
 function hasActiveReader(stream: ParallelSegmentLoaderDiagnostics['streams'][number]): boolean {
   return stream.segments.some(segment => segment.readerCount > 0)
+}
+
+function parseLoaderParameters(inputs: LoaderParameterInputs): LoaderParameters {
+  const windowSize = Number(inputs.windowSize)
+  const maxConcurrency = Number(inputs.maxConcurrency)
+  const chunkSizeMiB = Number(inputs.chunkSizeMiB)
+  const idleTimeoutMs = Number(inputs.idleTimeoutMs)
+  const maxRescueAttempts = Number(inputs.maxRescueAttempts)
+
+  if (!Number.isSafeInteger(windowSize) || windowSize < 1 || windowSize > 24) {
+    throw new Error('预加载窗口必须是 1 到 24 之间的整数')
+  }
+  if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 12) {
+    throw new Error('并发数必须是 1 到 12 之间的整数')
+  }
+  if (
+    !Number.isFinite(chunkSizeMiB) ||
+    chunkSizeMiB < 0.25 ||
+    chunkSizeMiB > 16 ||
+    !Number.isSafeInteger(chunkSizeMiB * 4)
+  ) {
+    throw new Error('Chunk 大小必须是 0.25 到 16 MiB, 步长为 0.25 MiB')
+  }
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 100 || idleTimeoutMs > 60_000) {
+    throw new Error('慢速检测时间必须是 100 到 60000 ms 之间的整数')
+  }
+  if (!Number.isSafeInteger(maxRescueAttempts) || maxRescueAttempts < 0 || maxRescueAttempts > 10) {
+    throw new Error('Rescue 次数必须是 0 到 10 之间的整数')
+  }
+
+  return {
+    chunkSize: Math.round(chunkSizeMiB * 1024 * 1024),
+    idleTimeoutMs,
+    maxConcurrency,
+    maxRescueAttempts,
+    windowSize,
+  }
 }
 
 function parseProxyOrigins(value: string): string[] {

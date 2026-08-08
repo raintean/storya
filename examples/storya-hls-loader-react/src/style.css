@@ -9,6 +9,7 @@
   --green: #62f5b2;
   --green-dim: #153f30;
   --blue: #64b5f6;
+  --cyan: #52d7d0;
   --violet: #b595ff;
   --amber: #f4bd62;
   --red: #ff6b73;
@@ -547,12 +548,16 @@ select:disabled {
   --legend-color: var(--blue);
 }
 
+.stream-legend [data-state='planning'] {
+  --legend-color: var(--cyan);
+}
+
 .stream-legend [data-state='needed'] {
   --legend-color: var(--amber);
 }
 
-.stream-legend [data-state='retrying'] {
-  --legend-color: #ff8d65;
+.stream-legend [data-state='rescuing'] {
+  --legend-color: var(--violet);
 }
 
 .stream-legend [data-state='failed'] {
@@ -727,7 +732,7 @@ select:disabled {
 
 .segment-track {
   position: relative;
-  min-height: 65px;
+  min-height: 74px;
   background: linear-gradient(90deg, rgb(110 129 120 / 7%) 1px, transparent 1px), #080d10;
   background-size: 10% 100%;
   border: 1px solid #192329;
@@ -758,7 +763,26 @@ select:disabled {
   border-color: rgb(100 181 246 / 43%);
 }
 
-.segment-cell.is-empty.is-prefetch {
+.segment-cell.is-planning {
+  color: #72ded8;
+  background: repeating-linear-gradient(
+    135deg,
+    rgb(82 215 208 / 10%),
+    rgb(82 215 208 / 10%) 4px,
+    transparent 4px,
+    transparent 8px
+  );
+  border-color: rgb(82 215 208 / 38%);
+  border-style: dashed;
+}
+
+.segment-cell.is-verifying {
+  color: #82d8ff;
+  background: rgb(62 135 170 / 18%);
+  border-color: rgb(82 215 208 / 42%);
+}
+
+.segment-cell.is-queued.is-prefetch {
   color: #b9985f;
   background: repeating-linear-gradient(
     135deg,
@@ -781,18 +805,7 @@ select:disabled {
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 35%);
 }
 
-.segment-cell.is-frontier::before {
-  position: absolute;
-  top: 0;
-  right: 0;
-  left: 0;
-  height: 2px;
-  background: var(--green);
-  content: '';
-}
-
-.segment-name,
-.segment-state {
+.segment-name {
   position: relative;
   z-index: 1;
   display: block;
@@ -803,16 +816,61 @@ select:disabled {
   white-space: nowrap;
 }
 
-.segment-state {
-  margin-top: 3px;
+.segment-heading {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.segment-heading b {
+  flex: 0 0 auto;
   color: currentColor;
+  font-size: 7px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  opacity: 0.62;
+}
+
+.segment-state {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+  justify-content: space-between;
+  overflow: hidden;
+  margin-top: 2px;
+  color: currentColor;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
   opacity: 0.72;
+}
+
+.segment-state strong,
+.segment-state span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-state strong {
+  font-weight: 650;
+}
+
+.segment-state span {
+  flex: 0 1 auto;
+  text-align: right;
 }
 
 .chunk-track {
   position: relative;
   height: 8px;
-  margin-top: 4px;
+  margin-top: 3px;
   background: rgb(1 5 4 / 45%);
   overflow: hidden;
 }
@@ -823,6 +881,28 @@ select:disabled {
   top: 1px;
   bottom: 1px;
   background: #36454a;
+}
+
+.chunk-placeholder {
+  right: 1px;
+  left: 1px;
+}
+
+.chunk-placeholder.is-planning {
+  background: repeating-linear-gradient(
+    90deg,
+    rgb(82 215 208 / 72%),
+    rgb(82 215 208 / 72%) 8px,
+    rgb(82 215 208 / 18%) 8px,
+    rgb(82 215 208 / 18%) 15px
+  );
+  animation: planning-flow 0.8s linear infinite;
+}
+
+@keyframes planning-flow {
+  to {
+    background-position: 15px 0;
+  }
 }
 
 .chunk.is-complete {
@@ -839,24 +919,17 @@ select:disabled {
   opacity: 0.58;
 }
 
-.chunk.is-retrying {
-  background: #ff8d65;
-  animation: retry-flash 0.75s steps(2) infinite;
+.chunk.is-rescuing {
+  background: var(--violet);
+  box-shadow: 0 0 6px rgb(181 149 255 / 60%);
+  animation: rescue-flash 0.75s steps(2) infinite;
 }
 
 .chunk.is-failed {
   background: var(--red);
 }
 
-.chunk.is-partial {
-  background: var(--violet);
-}
-
-.chunk.was-preempted {
-  box-shadow: inset 0 0 0 1px var(--violet);
-}
-
-@keyframes retry-flash {
+@keyframes rescue-flash {
   50% {
     opacity: 0.3;
   }
@@ -953,6 +1026,105 @@ select:disabled {
   margin-top: 6px;
   color: #52625b;
   line-height: 1.45;
+}
+
+.loader-parameters {
+  padding: 10px;
+  margin-top: 12px;
+  background: linear-gradient(135deg, rgb(98 245 178 / 4%), transparent 45%), #091014;
+  border: 1px solid #1a292e;
+}
+
+.loader-parameters-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #18252a;
+  font-family: var(--mono);
+}
+
+.loader-parameters-heading span {
+  color: #7f9289;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+}
+
+.loader-parameters-heading small {
+  padding: 2px 5px;
+  color: var(--green);
+  background: rgb(98 245 178 / 6%);
+  border: 1px solid rgb(98 245 178 / 17%);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+
+.loader-parameter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.loader-parameter {
+  display: block;
+  min-width: 0;
+}
+
+.loader-parameter.is-wide {
+  grid-column: 1 / -1;
+}
+
+.loader-parameter > span {
+  display: block;
+  margin-bottom: 5px;
+  color: #53655d;
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+}
+
+.loader-parameter > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  background: #070c0f;
+  border: 1px solid #1c2a30;
+}
+
+.loader-parameter > div:focus-within {
+  border-color: rgb(98 245 178 / 65%);
+}
+
+.loader-parameter input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  color: #d8e7e0;
+  background: transparent;
+  border: 0;
+  outline: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.loader-parameter small {
+  padding: 0 7px;
+  color: #43554d;
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+}
+
+.loader-parameters > p {
+  margin: 9px 0 0;
+  color: #4f6158;
+  font-family: var(--mono);
+  font-size: 8px;
+  line-height: 1.5;
 }
 
 .runtime-facts {
