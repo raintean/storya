@@ -104,7 +104,7 @@ function StreamRow({
         <span>
           reader {readerCount} · cache {cached} · need {pending}
         </span>
-        <span>window {stream.window.length} · revision driven</span>
+        <span>window {stream.window.length} · shared state</span>
       </div>
       <div className="segment-track">
         {stream.segments.map(segment => (

@@ -1053,7 +1053,7 @@ export function App() {
                   <dd>{formatBytes(diagnostics.rescue.discardedBytes)}</dd>
                 </div>
                 <div>
-                  <dt>REGISTRY REVISION</dt>
+                  <dt>STATE UPDATES</dt>
                   <dd>{diagnostics.revision}</dd>
                 </div>
                 <div>
