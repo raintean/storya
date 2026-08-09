@@ -108,7 +108,7 @@ HEAD 的 body 必须为空。当前生产 Chunk 默认为 2 MiB，因此正常�
 
 ## 取消与超时
 
-`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。默认 rescue 在 GET body 连续 2 秒没有数据时判定停滞; 已经观察满同一窗口、具有至少 2 个同期 peer 的请求如果低于 peer 中位速率的 25%, 且重新请求预计更早完成, 也会触发相同的取消和重新领取流程。`rescue: false` 或次数耗尽时不安装这些检测。
+`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。默认 rescue 在 GET body 连续 4 秒没有数据时判定停滞; 已经观察满同一窗口、具有至少 2 个同期 peer 的请求如果低于 peer 中位速率的 25%, 且重新请求预计更早完成, 也会触发相同的取消和重新领取流程。`rescue: false` 或次数耗尽时不安装这些检测。
 
 WebSocket Transport 把这两种标准取消入口映射为当前 sequence 的 `CANCEL`。Worker 先清空活动事务，再取消 pending BYOB read 并 Abort 上游 Fetch，随后回复 `CANCELED`。客户端只有收到 `CANCELED` 后才把连接恢复为 idle；确认超时会关闭连接，避免未收敛事务被错误复用。取消确认超时由调用方通过 `cancelTimeoutMs` 配置。
 

@@ -271,7 +271,7 @@ try {
   if (
     owner.rescue.maxAttempts !== 1 ||
     owner.rescue.slowRateThresholdRatio !== 0.25 ||
-    owner.rescue.stallTimeoutMs !== 2_000
+    owner.rescue.stallTimeoutMs !== 4_000
   ) {
     throw new Error('默认救援配置错误')
   }

@@ -16,7 +16,7 @@ export const DEFAULT_MAX_CONCURRENCY = 6
 export const DEFAULT_RESCUE_OPTIONS = Object.freeze({
   maxAttempts: 1,
   slowRateThresholdRatio: 0.25,
-  stallTimeoutMs: 2_000,
+  stallTimeoutMs: 4_000,
 })
 export const DEFAULT_WINDOW_SIZE = 6
 

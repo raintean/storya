@@ -584,7 +584,7 @@ HEAD 和 GET 都占用 Worker 槽位并使用两类正常请求时限; GET 另�
 
 - 响应头超时: `fragLoadPolicy.maxTimeToFirstByteMs`。
 - 完整请求超时: `fragLoadPolicy.maxLoadTimeMs`。
-- body 连续无数据的停滞检测: `rescue.stallTimeoutMs`, 默认 2 秒。
+- body 连续无数据的停滞检测: `rescue.stallTimeoutMs`, 默认 4 秒。
 - 相对于同期 GET 中位速率的慢速检测: `rescue.slowRateThresholdRatio`, 默认 0.25。
 
 GET body 每产生一段数据, Work 复制到 attempt 局部 parts, 同步更新共享 Chunk 的 loadedBytes 和 TransferTracker。只有当前 Chunk 的 `rescueAttempts < rescue.maxAttempts` 时, Work 才安装 rescue 检测。完整 body 验证通过后才提交 Chunk data。
@@ -734,7 +734,7 @@ const loader = new ParallelSegmentLoader({
   rescue: {
     maxAttempts: 1,
     slowRateThresholdRatio: 0.25,
-    stallTimeoutMs: 2_000,
+    stallTimeoutMs: 4_000,
   },
   windowSize: 6,
 })
@@ -778,6 +778,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-09: 将 `rescue.stallTimeoutMs` 默认值从 2 秒调整为 4 秒, 同时延长相对慢速检测的默认滚动观察窗口。
 - 2026-08-09: 将 `idleTimeoutMs` 和 `maxRescueAttempts` 收敛为可设为 `false` 的 `rescue` 配置, 停滞阈值更名为 `stallTimeoutMs` 并默认改为 2 秒; TransferTracker 增加同期 GET 中位速率, 当前请求低于默认 25% 且取消重试预计更早完成时复用原有 rescue 流程。
 - 2026-08-09: 增加 session 级 RescueTracker, 统计实际进入重试的 stall/slow 救援、丢弃字节、恢复结果和最近 64 个事件, 并通过 diagnostics 暴露给 example。
 - 2026-08-08: 带宽估计改为统计最近并行 GET Work 的总字节数与活跃时间并集; HEAD、前缀等待和缓存驻留时间不再压低 hls.js ABR 采样, 诊断界面同时显示 Loader 聚合带宽和 hls.js EWMA 带宽。
