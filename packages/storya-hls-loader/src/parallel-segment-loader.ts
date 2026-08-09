@@ -20,6 +20,8 @@ export const DEFAULT_RESCUE_OPTIONS = Object.freeze({
 })
 export const DEFAULT_WINDOW_SIZE = 6
 
+const NOTIFICATION_INTERVAL_MS = 8
+
 export interface ParallelSegmentLoaderRescueOptions {
   maxAttempts?: number
   slowRateThresholdRatio?: number
@@ -45,8 +47,11 @@ export class ParallelSegmentLoader {
   readonly windowSize: number
 
   private config: HlsConfig | undefined
+  private lastNotificationAt: number | undefined
   private readonly listeners = new Set<() => void>()
-  private notificationScheduled = false
+  private notificationDirty = false
+  private notificationMicrotaskScheduled = false
+  private notificationTimer: ReturnType<typeof globalThis.setTimeout> | undefined
   private readonly rescueTracker = new RescueTracker()
   private readonly transport: HttpTransport
   private readonly transferTracker: TransferTracker
@@ -200,12 +205,41 @@ export class ParallelSegmentLoader {
   }
 
   private notifyListeners(): void {
-    if (this.notificationScheduled) {
+    this.notificationDirty = true
+    this.scheduleNotification()
+  }
+
+  private scheduleNotification(): void {
+    if (this.notificationMicrotaskScheduled) {
       return
     }
-    this.notificationScheduled = true
+
+    const now = performance.now()
+    const elapsed = this.lastNotificationAt === undefined ? Infinity : now - this.lastNotificationAt
+    const remaining = NOTIFICATION_INTERVAL_MS - elapsed
+    if (remaining > 0) {
+      if (this.notificationTimer === undefined) {
+        this.notificationTimer = globalThis.setTimeout(() => {
+          this.notificationTimer = undefined
+          this.scheduleNotification()
+        }, remaining)
+      }
+      return
+    }
+
+    if (this.notificationTimer !== undefined) {
+      globalThis.clearTimeout(this.notificationTimer)
+      this.notificationTimer = undefined
+    }
+    this.notificationMicrotaskScheduled = true
     queueMicrotask(() => {
-      this.notificationScheduled = false
+      this.notificationMicrotaskScheduled = false
+      if (!this.notificationDirty) {
+        return
+      }
+
+      this.notificationDirty = false
+      this.lastNotificationAt = performance.now()
       for (const listener of [...this.listeners]) {
         listener()
       }

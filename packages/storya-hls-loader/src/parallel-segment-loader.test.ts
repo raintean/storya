@@ -265,6 +265,44 @@ globalThis.fetch = async input => {
 }
 
 const config = Hls.DefaultConfig as HlsConfig
+const notificationOwner = new ParallelSegmentLoader({ maxConcurrency: 1 })
+try {
+  const observedRevisions: number[] = []
+  const unsubscribe = notificationOwner.subscribe(() => {
+    observedRevisions.push(notificationOwner.state.revision)
+  })
+
+  notificationOwner.update(() => undefined)
+  notificationOwner.update(() => undefined)
+  await Promise.resolve()
+  if (observedRevisions.join(',') !== '2') {
+    throw new Error('同一轮同步 update 应当合并成一次即时通知')
+  }
+
+  notificationOwner.update(() => undefined)
+  await Promise.resolve()
+  notificationOwner.update(() => undefined)
+  await Promise.resolve()
+  if (observedRevisions.join(',') !== '2') {
+    throw new Error('通知间隔内的 update 不应反复唤醒 listener')
+  }
+
+  await new Promise(resolve => globalThis.setTimeout(resolve, 30))
+  if (observedRevisions.join(',') !== '2,4') {
+    throw new Error('通知间隔结束后应当补发一次通知并暴露最新 revision')
+  }
+
+  await new Promise(resolve => globalThis.setTimeout(resolve, 12))
+  notificationOwner.update(() => undefined)
+  await Promise.resolve()
+  if (observedRevisions.join(',') !== '2,4,5') {
+    throw new Error('空闲超过通知间隔后的首个 update 应当即时通知')
+  }
+  unsubscribe()
+} finally {
+  notificationOwner.destroy()
+}
+
 const estimatorOwner = new ParallelSegmentLoader({ maxConcurrency: 1 })
 try {
   estimatorOwner.recordTransfer(100, 0, 100)

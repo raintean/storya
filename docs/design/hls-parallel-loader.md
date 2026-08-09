@@ -159,7 +159,8 @@ loader.update(state => {
 同步执行 mutation
   -> state.reconcile()
   -> revision + 1
-  -> 合并安排一次 microtask 通知
+  -> 标记通知 dirty
+  -> 按 8ms 窗口合并安排 listener 通知
 ```
 
 约束如下:
@@ -174,7 +175,9 @@ loader.update(state => {
 
 ### 通知规则
 
-Loader 持有实例级全局 listener 集合。listener 不携带 Segment、Chunk、结果或 diff, 只表示“共享状态可能发生变化”。多个同步更新可以合并为一次 microtask 通知。
+Loader 持有实例级全局 listener 集合。listener 不携带 Segment、Chunk、结果或 diff, 只表示“共享状态可能发生变化”。通知采用固定 8ms 的 leading + trailing 调度: 首次变化通过 microtask 尽快通知; 距上次通知不足 8ms 的后续变化只标记 dirty, 在窗口结束时最多补发一次通知。持续变化时全局 listener 最多约每秒唤醒 125 轮, 但每次 `update()` 仍然同步完成事务并单独增加 `revision`。
+
+订阅者总是读取通知发生时的最新状态, 不依赖逐个观察中间 revision。若 trailing timer 在后台页面被浏览器延迟, 后续 `update()` 发现 8ms 窗口已经结束时会取消旧 timer 并通过 microtask 立即补发, 避免持续更新完全受 timer clamp 限制。前台页面正常调度时, 状态就绪、失效取消和空闲 Worker 领取新任务相对原实现最多增加约 8ms 通知延迟; 后台页面仍受浏览器 timer clamp 影响。当前 Worker 完成 Work 后直接调度自己的下一次领取, 不等待全局通知。
 
 Controller 不订阅。FragmentLoader 和 Worker 持续订阅, 被通知后重新读取自己关心的状态:
 
@@ -781,6 +784,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-09: 全局 listener 通知改为固定 8ms 的 leading + trailing 合并调度, 保持统一 `update()` 和逐事务 revision, 限制高频 body 进度更新引起的 Worker 与 FragmentLoader 唤醒。
 - 2026-08-09: 默认救援次数从 1 调整为 2; 次数耗尽后继续检测 stall 并快速失败 Segment, 增加 `exhaustedStallCount` 诊断; 明确 rescue 不跨 attempt 复用部分数据。
 - 2026-08-09: 将 `rescue.stallTimeoutMs` 默认值从 2 秒调整为 4 秒, 同时延长相对慢速检测的默认滚动观察窗口。
 - 2026-08-09: 将 `idleTimeoutMs` 和 `maxRescueAttempts` 收敛为可设为 `false` 的 `rescue` 配置, 停滞阈值更名为 `stallTimeoutMs` 并默认改为 2 秒; TransferTracker 增加同期 GET 中位速率, 当前请求低于默认 25% 且取消重试预计更早完成时复用原有 rescue 流程。
