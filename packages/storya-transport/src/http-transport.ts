@@ -13,11 +13,7 @@ export interface HttpTransportResponse {
   arrayBuffer(): Promise<ArrayBuffer>
 }
 
-export type HttpTransportRangeRequestMode = 'resumable' | 'stable'
-
 export interface HttpTransport {
-  readonly rangeRequestMode?: HttpTransportRangeRequestMode
-
   request(request: Request, options?: HttpTransportRequestOptions): Promise<HttpTransportResponse>
   destroy(): void
 }

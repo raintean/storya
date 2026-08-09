@@ -4,7 +4,6 @@ export { createAbortError, HttpTransportFailure } from './http-transport'
 export type {
   HttpTransport,
   HttpTransportFailureCode,
-  HttpTransportRangeRequestMode,
   HttpTransportRequestOptions,
   HttpTransportResponse,
 } from './http-transport'

@@ -136,8 +136,6 @@ const webSocketConnecting = 0
 const webSocketOpen = 1
 
 export class WebSocketHttpTransport implements HttpTransport {
-  readonly rangeRequestMode = 'stable' as const
-
   private readonly channels = new Set<WebSocketChannel>()
   private destroyed = false
   private nextChannelId = 0

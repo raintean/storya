@@ -29,8 +29,6 @@ storya-transport
 
 ```ts
 interface HttpTransport {
-  readonly rangeRequestMode?: 'resumable' | 'stable'
-
   request(request: Request, options?: HttpTransportRequestOptions): Promise<HttpTransportResponse>
   destroy(): void
 }
@@ -82,7 +80,7 @@ client <--- CANCELED ---------------- Worker
 
 每个 frame 使用 5 字节固定头：1 字节 `TransportFrameKind` 加 4 字节大端 sequence。`REQUEST_HEAD`、`RESPONSE_HEAD` 和 `ERROR` payload 使用 Protobuf；`RESPONSE_BODY` payload 直接承载媒体字节；`RESPONSE_END`、`CANCEL` 和 `CANCELED` 没有 payload。
 
-`HttpRequestHead` 包含 method、URL、request headers 和 `max_response_bytes`。`HttpResponseHead` 包含 status、status text、最终 URL 和原始 response headers。`TransportError` 区分无效请求、不支持的 method、响应过大、上游失败和内部失败；HTTP 4xx、5xx 仍然是正常 HTTP response。
+`HttpRequestHead` 包含 method、URL、request headers 和 `max_response_bytes`。`HttpResponseHead` 包含 status、status text、最终 URL 和原始 response headers。协议为 `TransportError` 定义无效请求、不支持的 method、响应过大、上游失败和内部失败; 当前 Worker 实际发送无效请求、响应过大和上游失败三类。HTTP 4xx、5xx 仍然是正常 HTTP response。
 
 Worker 以 128 KiB 为目标读取上游 body。每次为 frame header 和 body 一次性分配连续缓冲区，BYOB reader 直接写入 header 后方，再把同一视图发送给 WebSocket。客户端 frame decoder 使用 `Uint8Array.subarray()` 暴露 payload，`ReadableStream` 继续传递该视图，不执行媒体数据复制。最后一个 frame 可以小于 128 KiB；Cloudflare runtime 和浏览器内部是否复制不属于协议保证。
 
@@ -166,6 +164,7 @@ Fetch、Proxy、WebSocket Transport、统一请求/流量/缓存统计、Rust HT
 
 ## 修改历史
 
+- 2026-08-09: 删除已无消费者的 `rangeRequestMode`; 当前 Loader 的 rescue 对所有 Transport 都从原 Chunk 起点完整重下, Transport 不再暴露旧版部分续传策略。
 - 2026-08-09: WebSocket Transport 接入统一 `TransportStatistics`, 按调用方实际消费的 response body 统计请求与字节, 将 Edge Worker 转发的 `CF-Cache-Status` 明确标记为上游缓存; 三种 Transport 同时公开统计快照。
 - 2026-08-09: Loader 的 rescue 检测改为可关闭的统一策略; body 连续 2 秒无数据判定停滞, 持续有数据但明显低于同期 GET 中位速率且重试预计更快时也取消当前请求并重新领取, Transport 接口不增加慢速语义。
 - 2026-08-08: 新 Loader 改为逐段读取统一 Transport response body, 恢复响应头、流量空闲和完整请求超时; 停滞 Chunk 由 Loader 取消并重新领取, 不向 Fetch Transport 引入调度状态。
