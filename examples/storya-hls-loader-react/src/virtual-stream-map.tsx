@@ -12,9 +12,6 @@ interface VirtualStreamMapProps {
   snapshot: ParallelSegmentLoaderDiagnostics
 }
 
-const playbackInitialPosition = 0.15
-const playbackPanThreshold = 0.35
-const timelinePanStep = 0.2
 const visibleSegmentCount = 7
 
 interface TimelineViewport {
@@ -47,7 +44,6 @@ export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: Virtua
   )
   timelineViewportRef.current = viewport
   const bounds = viewport.bounds
-  const markers = [{ className: 'playback', label: '播放', value: playbackTime }]
 
   return (
     <div className="stream-map">
@@ -64,24 +60,9 @@ export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: Virtua
 
       <div className="stream-rows">
         <div className="stream-markers" aria-hidden="true">
-          {markers.map(marker => {
-            const edge = findMarkerEdge(marker.value, bounds)
-            const position = toClampedPercent(marker.value, bounds)
-            const boundary = position <= 0 ? 'is-at-start' : position >= 100 ? 'is-at-end' : ''
-            return (
-              <i
-                className={`marker marker-${marker.className} ${boundary} ${edge === undefined ? '' : `is-${edge}`}`}
-                key={marker.className}
-                style={{ left: `${position}%` }}
-              >
-                <span>
-                  {edge === 'before' ? '← ' : ''}
-                  {marker.label}
-                  {edge === 'after' ? ' →' : ''}
-                </span>
-              </i>
-            )
-          })}
+          <i className="marker marker-playback is-at-start">
+            <span>播放</span>
+          </i>
         </div>
 
         {streams.map(stream => (
@@ -216,54 +197,29 @@ function updateTimelineViewport(
   }
 
   const span = current.bounds.end - current.bounds.start
-  if (playbackTime < current.bounds.start || playbackTime > current.bounds.end) {
-    return {
-      ...current,
-      bounds: positionTimelineAtPlayback(span, playbackTime),
-    }
-  }
-
-  const playbackPosition = toPercent(playbackTime, current.bounds) / 100
-  if (playbackPosition < playbackPanThreshold) {
-    return current
-  }
-
-  const shift = span * timelinePanStep
   return {
     ...current,
-    bounds: {
-      end: current.bounds.end + shift,
-      start: current.bounds.start + shift,
-    },
+    bounds: positionTimelineAtPlayback(span, playbackTime),
   }
 }
 
 function positionTimelineAtPlayback(span: number, playbackTime: number): TimelineBounds {
-  const start = Math.max(0, playbackTime - span * playbackInitialPosition)
+  const start = Number.isFinite(playbackTime) ? Math.max(0, playbackTime) : 0
   return { end: start + span, start }
 }
 
 function createTicks(start: number, end: number): number[] {
   const step = (end - start) / 4
-  return Array.from({ length: 5 }, (_, index) => start + step * index)
+  const first = Math.floor(start / step) * step
+  const ticks: number[] = []
+  for (let tick = first; tick <= end; tick += step) {
+    ticks.push(tick)
+  }
+  return ticks
 }
 
 function toPercent(value: number, bounds: TimelineBounds): number {
   return ((value - bounds.start) / Math.max(bounds.end - bounds.start, 1)) * 100
-}
-
-function toClampedPercent(value: number, bounds: TimelineBounds): number {
-  return Math.min(100, Math.max(0, toPercent(value, bounds)))
-}
-
-function findMarkerEdge(value: number, bounds: TimelineBounds): 'after' | 'before' | undefined {
-  if (value < bounds.start) {
-    return 'before'
-  }
-  if (value > bounds.end) {
-    return 'after'
-  }
-  return undefined
 }
 
 function getStreamLabel(

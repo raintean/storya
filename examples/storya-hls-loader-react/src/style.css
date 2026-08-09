@@ -591,6 +591,7 @@ select:disabled {
 .stream-ruler > div {
   position: relative;
   border-top: 1px solid #1c272c;
+  overflow: hidden;
 }
 
 .stream-ruler b {
@@ -749,6 +750,7 @@ select:disabled {
   color: #66756f;
   background: #111a1e;
   border: 1px solid #263339;
+  transition: left 200ms linear;
 }
 
 .segment-cell.is-ready {
