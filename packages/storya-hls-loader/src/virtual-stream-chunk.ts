@@ -13,6 +13,7 @@ export interface VirtualStreamChunkCompletion {
 export type VirtualStreamChunkPhase =
   | { lastFailure: string | undefined; type: 'empty' }
   | {
+      data: Uint8Array | undefined
       generation: number
       loadedBytes: number
       startedAt: number
@@ -77,6 +78,7 @@ export class VirtualStreamChunk {
     }
     this.attempt += 1
     this.phase = {
+      data: undefined,
       generation,
       loadedBytes: 0,
       startedAt,
@@ -91,12 +93,37 @@ export class VirtualStreamChunk {
     return this.phase.type === 'filling' && this.phase.generation === generation
   }
 
-  updateProgress(generation: number, loadedBytes: number): boolean {
+  updateProgress(generation: number, loadedBytes: number, data?: Uint8Array): boolean {
     if (!this.isCurrent(generation) || this.phase.type !== 'filling') {
       return false
     }
+    if (data !== undefined) {
+      if (loadedBytes !== this.phase.loadedBytes + data.byteLength) {
+        return false
+      }
+      if (this.phase.data === undefined || this.phase.data.byteLength < loadedBytes) {
+        const capacity = Math.max(loadedBytes, (this.phase.data?.byteLength ?? 0) * 2)
+        const buffer = new Uint8Array(capacity)
+        if (this.phase.data !== undefined) {
+          buffer.set(this.phase.data.subarray(0, this.phase.loadedBytes))
+        }
+        this.phase.data = buffer
+      }
+      this.phase.data.set(data, this.phase.loadedBytes)
+    }
     this.phase.loadedBytes = loadedBytes
     return true
+  }
+
+  copyProgressData(generation: number): Uint8Array | undefined {
+    if (
+      !this.isCurrent(generation) ||
+      this.phase.type !== 'filling' ||
+      this.phase.data === undefined
+    ) {
+      return undefined
+    }
+    return this.phase.data.slice(0, this.phase.loadedBytes)
   }
 
   complete(generation: number, completion: VirtualStreamChunkCompletion): boolean {

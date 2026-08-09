@@ -359,7 +359,7 @@ export function App() {
           autoStartLoad: false,
           preferManagedMediaSource: true,
           preserveManualLevelOnError: true,
-          progressive: false,
+          progressive: parallelLoader !== null,
           ...(parallelLoader === null
             ? {}
             : {

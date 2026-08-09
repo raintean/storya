@@ -23,9 +23,11 @@ export function createStoryaFragmentLoader(
     stats: LoaderStats = createLoaderStats()
 
     private callbacks: LoaderCallbacks<FragmentLoaderContext> | undefined
+    private highWaterMark = Number.POSITIVE_INFINITY
     private initialRetry = 0
     private loadStartedAt = 0
     private networkDetails: Response | null = null
+    private progressOffset = 0
     private progressive = false
     private reading = false
     private settled = false
@@ -51,6 +53,7 @@ export function createStoryaFragmentLoader(
       this.loadStartedAt = performance.now()
       this.stats.loading.start = this.loadStartedAt
       this.progressive = callbacks.onProgress !== undefined && Number.isFinite(config.highWaterMark)
+      this.highWaterMark = this.progressive ? Math.max(0, config.highWaterMark ?? 0) : Infinity
 
       loader.update(state => {
         const streamId = `${context.frag.type}:${context.frag.level}`
@@ -117,6 +120,7 @@ export function createStoryaFragmentLoader(
       }
 
       this.updateStats(segment)
+      this.emitProgress(segment)
       if (segment.outcome.type === 'ready') {
         this.succeed(segment.outcome)
       } else if (segment.outcome.type === 'failed') {
@@ -131,23 +135,88 @@ export function createStoryaFragmentLoader(
 
       const context = this.context
       const callbacks = this.callbacks
-      const data = result.data.slice(0)
+      const data = this.progressive ? new ArrayBuffer(0) : result.data.slice(0)
       this.networkDetails = result.response
       this.settle()
 
-      if (this.progressive && callbacks?.onProgress !== undefined) {
-        callbacks.onProgress(this.stats, context, data, result.response)
-      }
       callbacks?.onSuccess(
         {
           code: result.code,
-          data: this.progressive ? new ArrayBuffer(0) : data,
+          data,
           url: result.url,
         },
         this.stats,
         context,
         result.response,
       )
+    }
+
+    private emitProgress(segment: VirtualStreamSegment): void {
+      if (!this.progressive || this.context === null || this.callbacks?.onProgress === undefined) {
+        return
+      }
+
+      if (segment.outcome.type === 'ready') {
+        if (this.progressOffset >= segment.outcome.data.byteLength) {
+          return
+        }
+        const data = segment.outcome.data.slice(this.progressOffset)
+        this.progressOffset = segment.outcome.data.byteLength
+        this.networkDetails = segment.outcome.response
+        this.callbacks.onProgress(this.stats, this.context, data, segment.outcome.response)
+        return
+      }
+
+      const sources: Array<{
+        data: Uint8Array
+        endExclusive: number
+        start: number
+      }> = []
+      let contiguousEnd = 0
+      let response = this.networkDetails
+      for (const chunk of segment.chunks) {
+        if (chunk.start !== contiguousEnd) {
+          break
+        }
+        if (
+          chunk.phase.type === 'ready' &&
+          chunk.phase.data !== undefined &&
+          chunk.endExclusive !== undefined
+        ) {
+          contiguousEnd = chunk.endExclusive
+          sources.push({ data: chunk.phase.data, endExclusive: contiguousEnd, start: chunk.start })
+          response = chunk.phase.response
+          continue
+        }
+        if (
+          chunk.phase.type === 'filling' &&
+          chunk.phase.data !== undefined &&
+          chunk.phase.loadedBytes > 0
+        ) {
+          contiguousEnd = chunk.start + chunk.phase.loadedBytes
+          sources.push({ data: chunk.phase.data, endExclusive: contiguousEnd, start: chunk.start })
+        }
+        break
+      }
+      const byteLength = contiguousEnd - this.progressOffset
+      if (byteLength <= 0 || byteLength < this.highWaterMark) {
+        return
+      }
+
+      const data = new Uint8Array(byteLength)
+      for (const source of sources) {
+        const start = Math.max(this.progressOffset, source.start)
+        if (start >= source.endExclusive) {
+          continue
+        }
+        const sourceStart = start - source.start
+        const sourceEnd = source.endExclusive - source.start
+        data.set(source.data.subarray(sourceStart, sourceEnd), start - this.progressOffset)
+      }
+
+      this.progressOffset = contiguousEnd
+      this.networkDetails = response ?? null
+      this.callbacks.onProgress(this.stats, this.context, data.buffer, response)
     }
 
     private fail(failure: SegmentLoadFailure): void {
@@ -212,7 +281,9 @@ export function createStoryaFragmentLoader(
       this.stats.loaded = loaded
       this.stats.retry = this.initialRetry + segment.retryCount
       this.stats.total = segment.length ?? 0
-      this.stats.chunkCount = segment.chunks.filter(chunk => chunk.state === 'ready').length
+      if (!this.progressive) {
+        this.stats.chunkCount = segment.chunks.filter(chunk => chunk.state === 'ready').length
+      }
       const elapsed = end - segmentStartedAt
       const bandwidthEstimate = loader.bandwidthEstimate
       if (segment.outcome.type === 'ready' && segmentStartedAt > 0 && loaded > 0) {

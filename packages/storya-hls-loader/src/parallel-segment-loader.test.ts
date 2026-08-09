@@ -33,6 +33,10 @@ const resources = new Map([
     ]),
   ],
   ['https://example.com/segment-14.ts', new Uint8Array([140, 141, 142, 143])],
+  [
+    'https://example.com/segment-15.ts',
+    new Uint8Array([150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161]),
+  ],
 ])
 const fetchCounts = new Map<string, number>()
 const requestMethods = new Map<string, string[]>()
@@ -78,6 +82,43 @@ globalThis.fetch = async input => {
       })
     }
     const range = parseRange(request.headers.get('range'), payload.byteLength)
+    if (
+      request.url.endsWith('segment-15.ts') &&
+      range.start === 0 &&
+      rangeFetchCount(request.url, request.headers.get('range')) === 1
+    ) {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(payload.slice(range.start, range.start + 2))
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
+    if (request.url.endsWith('segment-15.ts') && range.start === 0) {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(payload.slice(range.start, range.start + 2))
+          controller.enqueue(payload.slice(range.start + 2, range.endExclusive))
+          controller.close()
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
+    if (request.url.endsWith('segment-15.ts') && range.start > 0) {
+      await abortableDelay(range.start === 4 ? 80 : 40, request.signal)
+    }
     if (request.url.endsWith('segment-12.ts') && range.start === 0) {
       let timer: ReturnType<typeof globalThis.setTimeout> | undefined
       const body = new ReadableStream<Uint8Array>({
@@ -713,6 +754,93 @@ try {
   } finally {
     responseHeaderPlanningOwner.destroy()
   }
+
+  const progressiveOwner = new ParallelSegmentLoader({
+    chunkSize: 4,
+    maxConcurrency: 3,
+    rescue: {
+      maxAttempts: 1,
+      slowRateThresholdRatio: 0,
+      stallTimeoutMs: 30,
+    },
+  })
+  try {
+    const fragment = createFragment(15)
+    const context = createContext(fragment)
+    const expected = resources.get(context.url)
+    if (expected === undefined) {
+      throw new Error('渐进提交测试缺少 Segment 数据')
+    }
+    replaceWindow(progressiveOwner, [fragment], config)
+
+    const progressChunks: ArrayBuffer[] = []
+    let completed = false
+    let resolveFirstProgress: ((data: ArrayBuffer) => void) | undefined
+    const firstProgress = new Promise<ArrayBuffer>(resolve => {
+      resolveFirstProgress = resolve
+    })
+    const loader = new progressiveOwner.fLoader(config)
+    const result = new Promise<LoaderResponse>((resolve, reject) => {
+      loader.load(
+        context,
+        { ...createLoaderConfiguration(), highWaterMark: 1 },
+        {
+          onAbort: () => reject(new Error('渐进提交测试被取消')),
+          onError: error => reject(new Error(error.text)),
+          onProgress: (_stats, _context, data) => {
+            if (!(data instanceof ArrayBuffer)) {
+              reject(new Error('渐进提交必须使用 ArrayBuffer'))
+              return
+            }
+            const owned = data.slice(0)
+            progressChunks.push(owned)
+            resolveFirstProgress?.(owned)
+            resolveFirstProgress = undefined
+          },
+          onSuccess: response => {
+            completed = true
+            resolve(response)
+          },
+          onTimeout: () => reject(new Error('渐进提交测试超时')),
+        },
+      )
+    })
+
+    const leading = await settleWithin(firstProgress, 500)
+    if (completed) {
+      throw new Error('首段 filling 数据应当在完整 Segment 完成前提交')
+    }
+    assertBytes(new Uint8Array(leading), expected.slice(0, 2), '首段 filling 数据错误')
+    const filling = progressiveOwner.getDiagnostics().streams[0]?.segments[0]?.chunks[0]
+    if (filling?.state !== 'filling' || filling.loadedBytes !== 2) {
+      throw new Error('fLoader 应当从尚未 ready 的 filling Chunk 提交数据')
+    }
+    await waitForCondition(() => {
+      const chunks = progressiveOwner.getDiagnostics().streams[0]?.segments[0]?.chunks
+      return (
+        chunks?.[1]?.state === 'filling' &&
+        chunks[2]?.state === 'ready' &&
+        progressChunks.reduce((total, data) => total + data.byteLength, 0) >= 4
+      )
+    })
+    assertBytes(
+      concatenateBuffers(progressChunks),
+      expected.slice(0, 4),
+      '救援重试或乱序 Chunk 不应产生重复、越序提交',
+    )
+
+    const response = await settleWithin(result, 500)
+    if (!(response.data instanceof ArrayBuffer) || response.data.byteLength !== 0) {
+      throw new Error('渐进提交完成后的 onSuccess 不应重复返回 Segment 数据')
+    }
+    assertBytes(concatenateBuffers(progressChunks), expected, '渐进提交没有按顺序覆盖完整 Segment')
+    if (rangeFetchCount(context.url, 'bytes=0-3') !== 2) {
+      throw new Error('filling 渐进提交后的停滞救援仍应完整重试原 Chunk')
+    }
+    loader.destroy()
+  } finally {
+    progressiveOwner.destroy()
+  }
 } finally {
   owner.destroy()
   globalThis.fetch = originalFetch
@@ -798,13 +926,27 @@ function assertPayload(response: LoaderResponse, expected: Uint8Array | undefine
   if (!(response.data instanceof ArrayBuffer) || expected === undefined) {
     throw new Error('fLoader 没有返回 ArrayBuffer')
   }
-  const actual = new Uint8Array(response.data)
+  assertBytes(new Uint8Array(response.data), expected, 'fLoader 返回了错误的 Segment 数据')
+}
+
+function assertBytes(actual: Uint8Array, expected: Uint8Array, message: string): void {
   if (
     actual.byteLength !== expected.byteLength ||
     actual.some((value, index) => value !== expected[index])
   ) {
-    throw new Error('fLoader 返回了错误的 Segment 数据')
+    throw new Error(message)
   }
+}
+
+function concatenateBuffers(buffers: readonly ArrayBuffer[]): Uint8Array {
+  const result = new Uint8Array(buffers.reduce((total, buffer) => total + buffer.byteLength, 0))
+  let offset = 0
+  for (const buffer of buffers) {
+    const data = new Uint8Array(buffer)
+    result.set(data, offset)
+    offset += data.byteLength
+  }
+  return result
 }
 
 function parseRange(

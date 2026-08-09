@@ -170,12 +170,15 @@ export class SegmentFetchWork {
           response,
         )
       }
-      this.prepareResponseHeaders(createNetworkDetails(transportResponse), firstByteAt)
+      const publishProgress = this.prepareResponseHeaders(
+        createNetworkDetails(transportResponse),
+        firstByteAt,
+      )
       if (!this.isCurrent()) {
         await transportResponse.body?.cancel('Chunk response headers 校验失败')
         throw new ChunkRequestFailure('Chunk response headers 校验失败')
       }
-      const data = await this.readResponseBody(transportResponse)
+      const data = await this.readResponseBody(transportResponse, publishProgress)
       const response = await this.createReadableRangeResponse(
         request,
         transportResponse,
@@ -197,13 +200,16 @@ export class SegmentFetchWork {
     }
   }
 
-  private async readResponseBody(response: HttpTransportResponse): Promise<Uint8Array> {
+  private async readResponseBody(
+    response: HttpTransportResponse,
+    publishProgress: boolean,
+  ): Promise<Uint8Array> {
     const parts: Uint8Array[] = []
     const bodyStartedAt = performance.now()
     const expectedBytes = resolveExpectedResponseBytes(
       response.headers,
       this.requestStart,
-      this.requestEnd,
+      response.status === 200 ? undefined : this.requestEnd,
       this.resourceLength,
     )
     this.loader.startTransferBody(this.generation, bodyStartedAt)
@@ -267,11 +273,22 @@ export class SegmentFetchWork {
       if (data.byteLength === 0 || this.controller.signal.aborted) {
         return
       }
-      const owned = data.slice()
-      parts.push(owned)
-      this.receivedBytes += owned.byteLength
-      this.loader.recordTransferProgress(this.generation, owned.byteLength, performance.now())
-      this.updateChunkProgress(this.receivedBytes)
+      this.receivedBytes += data.byteLength
+      this.loader.recordTransferProgress(this.generation, data.byteLength, performance.now())
+      if (expectedBytes !== undefined && this.receivedBytes > expectedBytes) {
+        throw new ChunkRequestFailure(
+          `Chunk body 超出了响应声明的长度: ${this.context.url} ${this.requestStart}-${String(
+            this.requestEnd,
+          )}, 期望 ${expectedBytes}, 实际 ${this.receivedBytes}`,
+        )
+      }
+      if (publishProgress) {
+        this.updateChunkProgress(this.receivedBytes, data)
+      } else {
+        const owned = data.slice()
+        parts.push(owned)
+        this.updateChunkProgress(this.receivedBytes)
+      }
       resetStallTimer()
     }
 
@@ -320,6 +337,14 @@ export class SegmentFetchWork {
     const transferCompletedAt = performance.now()
     this.loader.finishTransfer(this.generation, transferCompletedAt, true)
     this.transferFinished = true
+
+    if (publishProgress) {
+      const data = this.copyChunkProgressData()
+      if (data === undefined || data.byteLength !== this.receivedBytes) {
+        throw new ChunkRequestFailure('Chunk 渐进数据与接收长度不一致')
+      }
+      return data
+    }
 
     const data = new Uint8Array(this.receivedBytes)
     let offset = 0
@@ -392,18 +417,23 @@ export class SegmentFetchWork {
     }
   }
 
-  private updateChunkProgress(loadedBytes: number): void {
+  private updateChunkProgress(loadedBytes: number, data?: Uint8Array): void {
     if (this.loader.state.destroyed || !this.isCurrent()) {
       return
     }
     this.loader.update(state => {
-      this.locateChunk(state)?.chunk.updateProgress(this.generation, loadedBytes)
+      this.locateChunk(state)?.chunk.updateProgress(this.generation, loadedBytes, data)
       return undefined
     })
   }
 
-  private prepareResponseHeaders(response: Response, firstByteAt: number): void {
+  private copyChunkProgressData(): Uint8Array | undefined {
+    return this.locateChunk(this.loader.state)?.chunk.copyProgressData(this.generation)
+  }
+
+  private prepareResponseHeaders(response: Response, firstByteAt: number): boolean {
     if (response.status === 200) {
+      let publishProgress = false
       this.loader.update(state => {
         const located = this.locateChunk(state)
         if (located === undefined) {
@@ -417,14 +447,21 @@ export class SegmentFetchWork {
           )
           return undefined
         }
+        const validator = response.headers.get('etag') ?? response.headers.get('last-modified')
+        if (segment.validator !== null && validator !== null && validator !== segment.validator) {
+          segment.fail(createFailure('Segment 资源标识在 Range 请求之间发生变化'), firstByteAt)
+          return undefined
+        }
+        segment.validator ??= validator
         segment.firstByteAt ??= firstByteAt
         segment.useSequentialRange()
+        publishProgress = true
         return undefined
       })
-      return
+      return publishProgress
     }
     if (response.status !== 206 || !this.rangeEnabled) {
-      return
+      return false
     }
 
     let contentRange: ParsedContentRange | undefined
@@ -435,12 +472,13 @@ export class SegmentFetchWork {
         this.locateChunk(state)?.segment.fail(toFailure(cause), firstByteAt)
         return undefined
       })
-      return
+      return false
     }
     if (contentRange === undefined) {
-      return
+      return false
     }
 
+    let publishProgress = false
     this.loader.update(state => {
       const located = this.locateChunk(state)
       if (located === undefined) {
@@ -483,11 +521,17 @@ export class SegmentFetchWork {
         return undefined
       }
       const validator = response.headers.get('etag') ?? response.headers.get('last-modified')
+      if (segment.validator !== null && validator !== null && validator !== segment.validator) {
+        segment.fail(createFailure('Segment 资源标识在 Range 请求之间发生变化'), firstByteAt)
+        return undefined
+      }
       segment.validator ??= validator
       segment.firstByteAt ??= firstByteAt
       segment.verifyRange()
+      publishProgress = true
       return undefined
     })
+    return publishProgress
   }
 
   private completeChunk(result: SegmentFetchResult): void {

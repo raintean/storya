@@ -98,7 +98,8 @@ hls.js
   +-- StoryaFragmentLoader
         +-- update(state => readerCount + 1)
         +-- subscribe(global change)
-        +-- ready 后复制数据并回调 hls.js
+        +-- 按顺序复制连续 filling/ready 数据并渐进回调 hls.js
+        +-- Segment ready 后结束正式读取
         +-- update(state => readerCount - 1)
 
 ParallelSegmentLoader
@@ -115,7 +116,7 @@ ParallelSegmentLoader
   +-- getDiagnostics()
 ```
 
-网络下载可以并行和乱序完成, 但只有 hls.js 原生 `StreamController` 选中的当前 Fragment 会通过 fLoader 返回并进入后续解析和 append。并行发生在数据准备层, 不改变媒体时间线消费顺序。
+网络下载可以并行和乱序完成, 但只有 hls.js 原生 `StreamController` 选中的当前 Fragment 会通过 fLoader 渐进提交或最终返回, 进入后续解析和 append。并行发生在数据准备层, 不改变媒体时间线消费顺序。
 
 ## ParallelSegmentLoader
 
@@ -280,7 +281,7 @@ Controller 不创建预加载专用 fLoader, 不发送请求, 不读取 Segment 
 
 `load()` 执行以下步骤:
 
-1. 保存本次 hls.js context、callbacks 和 timeout 配置。
+1. 保存本次 hls.js context、callbacks、highWaterMark 和 timeout 配置。
 2. 在一个事务中确保 Stream/Segment 存在并调用 `segment.startReading()`。
 3. `readerCount + 1`; 如果 Segment 曾失败, 清除失败 outcome 和 failed Chunk, 保留已经 ready 的 Chunk。
 4. 注册全局 listener。
@@ -293,14 +294,22 @@ Controller 不创建预加载专用 fLoader, 不发送请求, 不读取 Segment 
 
 listener 被触发后直接定位 Segment:
 
-- `pending`: 更新 LoaderStats 后返回, 继续订阅。
-- `ready`: 复制 canonical ArrayBuffer, 结束 reader 生命周期, 再调用 `onProgress/onSuccess`。
+- `pending`: 更新 LoaderStats; progressive 开启时复制并提交从上次游标开始的最长连续 filling/ready 数据, 然后继续订阅。
+- `ready`: progressive 开启时从 canonical ArrayBuffer 补交尚未提交的尾部; 结束 reader 生命周期后调用 `onSuccess`。
 - `failed`: 保存 failure 和 Response, 结束 reader 生命周期, 再调用 `onError`。
 - Loader 已销毁或 reader 对应的 Segment 不存在: 作为内部加载错误结束。
 
 hls.js callback 始终在 `loader.update()` 之外调用, 避免 callback 重入共享事务。
 
-ready 时必须先执行 `data.slice(0)`, 再减少 readerCount。最后一个 reader 结束后, 窗口外 Segment 可能立即被 reconcile 驱离; 同时复制也避免 hls.js 转移或修改返回的 ArrayBuffer 破坏 Loader 中的 canonical 数据。
+progressive 由 hls.js 的 `progressive: true` 开启。当前 hls.js `BaseStreamController` 使用该配置决定是否把 progress callback 传给 `FragmentLoader`; `enableStreamingMode()` 检查的是通用 `config.loader` 而不是 `fLoader`, 因此配置自定义 fLoader 不会自动开启 progressive。开启后 hls.js 向 fLoader 提供 `onProgress` 和有限的 `highWaterMark`, fLoader 为每个 reader 独立维护已提交字节游标。
+
+GET response head 的状态、Range 边界和可用 validator 校验通过后, Work 把每段 body 数据同步追加到 filling phase 的可增长 data buffer, `loadedBytes` 表示其中可读取的有效前缀。fLoader 可以跨 ready Chunk 和当前 filling Chunk 复制最长连续数据; 后续 Chunk 乱序先完成时必须等待前缀。连续新增数据达到 highWaterMark 后可以合并一次提交, Segment 最终 ready 时无条件刷新剩余尾部。`Content-Range` 不可见等无法在读取 body 前证明边界的响应不暴露 filling data, 仍等待完整校验成为 ready。
+
+stall/slow rescue 仍把当前 filling phase 释放为 empty 并从相同 Chunk 起点完整重下。fLoader 的已提交字节游标不回退; 新 attempt 的 filling data 尚未追上游标时不会重复提交, 超过游标后只提交新后缀。因此不跨 attempt 保留共享 data, 也不改变现有 Range 请求边界。
+
+所有 `onProgress` 数据都复制后再交给 hls.js, 避免 hls.js 转移或修改 ArrayBuffer 破坏 canonical 数据。Segment 完整组装后会释放 Chunk 中的重复 data, 所以最终刷新从 canonical outcome 复制尚未提交的后缀。progressive `onSuccess` 返回空 ArrayBuffer, 防止 hls.js 重复解析已经通过 `onProgress` 提交的数据; 未开启 progressive 时仍在 ready 后复制并一次性返回完整 canonical ArrayBuffer。
+
+success 时必须先复制最终返回所需的数据, 再减少 readerCount。最后一个 reader 结束后, 窗口外 Segment 可能立即被 reconcile 驱离。
 
 ### 结束读取
 
@@ -324,7 +333,7 @@ success、failure、timeout、abort 和 destroy 都通过同一个 settle 边界
 - Segment 内部网络计时从首个媒体 GET Chunk claim 开始; HEAD 规划和等待前缀门禁的时间不计入。
 - `loaded`: 所有 Chunk 当前唯一有效字节数。
 - `total`: 已知 Segment 长度。
-- `chunkCount`: ready Chunk 数量。
+- `chunkCount`: 非 progressive 模式下为 ready Chunk 数量; progressive 模式下由 hls.js 按实际 progress 回调累计。
 - `retry`: hls.js 初始 retry 加 Worker rescue 次数。
 - `bwEstimate`: Loader 当前的聚合传输带宽; hls.js 采样后会用自身 EWMA 结果覆盖该字段。
 
@@ -497,12 +506,12 @@ Chunk phase 为:
 
 ```text
 empty   { lastFailure }
-filling { generation, workerId, startedAt, loadedBytes }
+filling { generation, workerId, startedAt, loadedBytes, data }
 ready   { byteLength, data, response, url, firstByteAt, completedAt }
 failed  { failure }
 ```
 
-`attempt` 记录总 claim 次数, `rescueAttempts` 记录停滞或相对慢速触发的补救次数。Chunk 完成前的 body 数据只保存在 Work 局部; 完整验证后才一次性进入 ready phase。
+`attempt` 记录总 claim 次数, `rescueAttempts` 记录停滞或相对慢速触发的补救次数。filling data 使用按需扩容的 Uint8Array, 只有 `[0, loadedBytes)` 是当前 attempt 已发布的有效前缀。完整 body 验证后 data 收敛为精确长度并进入 ready phase; rescue、普通取消或失败会随 phase 转换释放当前 attempt 的 filling data。
 
 ## 长度发现、Chunk 规划与 Range 行为
 
@@ -590,7 +599,7 @@ HEAD 和 GET 都占用 Worker 槽位并使用两类正常请求时限; GET 另�
 - body 连续无数据的停滞检测: `rescue.stallTimeoutMs`, 默认 4 秒。
 - 相对于同期 GET 中位速率的慢速检测: `rescue.slowRateThresholdRatio`, 默认 0.25。
 
-GET body 每产生一段数据, Work 复制到 attempt 局部 parts, 同步更新共享 Chunk 的 loadedBytes 和 TransferTracker。完整 body 验证通过后才提交 Chunk data; rescue 会丢弃当前 attempt 的局部 parts, 下一次从相同 Chunk 起点完整重下, 不跨 attempt 复用部分数据。
+GET body 每产生一段数据, Work 同步更新 TransferTracker。响应头已经证明状态、Range 边界和 validator 时, 数据同时追加到共享 Chunk 的 filling data 并可供正式 fLoader 渐进读取; 否则继续保存在 Work 局部直到完整验证。完整 body 验证通过后提交精确的 ready data。rescue 会丢弃当前 attempt 的 filling data 或局部 parts, 下一次从相同 Chunk 起点完整重下, 不跨 attempt 复用部分数据。
 
 `rescue.maxAttempts > 0` 时每个 attempt 都安装停滞检测。当前 Chunk 的 `rescueAttempts < rescue.maxAttempts` 时还会安装相对慢速检测, 并允许停滞或慢速触发重新领取; 次数耗尽后不再判断相对慢速, 但停滞会快速终止 Segment, 避免单个 Chunk 等待正常完整请求时限。
 
@@ -714,7 +723,7 @@ const loader = new ParallelSegmentLoader()
 const hls = new Hls({
   audioStreamController: ParallelAudioStreamController,
   fLoader: loader.fLoader,
-  progressive: false,
+  progressive: true,
   streamController: ParallelStreamController,
 })
 
@@ -748,7 +757,7 @@ const loader = new ParallelSegmentLoader({
 const hls = new Hls({
   audioStreamController: ParallelAudioStreamController,
   fLoader: loader.fLoader,
-  progressive: false,
+  progressive: true,
   streamController: ParallelStreamController,
 })
 
@@ -771,6 +780,7 @@ const diagnostics = loader.getDiagnostics()
 - 可配置或关闭的停滞与同期相对慢速 rescue。
 - ETag/Last-Modified 一致性检查。
 - canonical Segment 缓存、窗口重叠保留和确定性驱离。
+- hls.js 正式 reader 对连续 filling/ready 数据的有序渐进提交。
 - Fetch、HTTP Proxy 和 WebSocket Transport 注入。
 - 基于并行 GET 活跃区间的 Loader 聚合带宽估计, 以及排除缓存驻留时间的 hls.js LoaderStats 适配。
 - Stream/Segment/Chunk/Worker 诊断。
@@ -784,6 +794,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-09: fLoader 支持按 highWaterMark 有序提交已经通过响应头校验的连续 filling/ready 数据; rescue 重试依靠 reader 游标跳过已提交前缀, 最终从 canonical Segment 补齐尾部并以空 payload 完成; example 在并行模式下显式开启 hls.js progressive。
 - 2026-08-09: 全局 listener 通知改为固定 8ms 的 leading + trailing 合并调度, 保持统一 `update()` 和逐事务 revision, 限制高频 body 进度更新引起的 Worker 与 FragmentLoader 唤醒。
 - 2026-08-09: 默认救援次数从 1 调整为 2; 次数耗尽后继续检测 stall 并快速失败 Segment, 增加 `exhaustedStallCount` 诊断; 明确 rescue 不跨 attempt 复用部分数据。
 - 2026-08-09: 将 `rescue.stallTimeoutMs` 默认值从 2 秒调整为 4 秒, 同时延长相对慢速检测的默认滚动观察窗口。
