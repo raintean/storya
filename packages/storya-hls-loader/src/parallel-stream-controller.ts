@@ -1,11 +1,24 @@
-import Hls from 'hls.js'
-import type { Level, MediaFragment } from 'hls.js'
+import Hls, { Events } from 'hls.js'
+import type { Level, MediaAttachedData, MediaDetachingData, MediaFragment } from 'hls.js'
 import { ParallelSegmentLoader } from './parallel-segment-loader'
 
 const NativeStreamController = Hls.DefaultConfig.streamController
 
 export class ParallelStreamController extends NativeStreamController {
   private activeStreamId: string | undefined
+
+  protected override onMediaAttached(event: Events.MEDIA_ATTACHED, data: MediaAttachedData): void {
+    super.onMediaAttached(event, data)
+    data.media.addEventListener('seeking', this.onParallelMediaSeeking)
+  }
+
+  protected override onMediaDetaching(
+    event: Events.MEDIA_DETACHING,
+    data: MediaDetachingData,
+  ): void {
+    this.media?.removeEventListener('seeking', this.onParallelMediaSeeking)
+    super.onMediaDetaching(event, data)
+  }
 
   public override stopLoad(): void {
     const loader = this.requireSegmentLoader()
@@ -82,6 +95,17 @@ export class ParallelStreamController extends NativeStreamController {
       return undefined
     })
     this.activeStreamId = streamId
+  }
+
+  protected resetTransmuxerAfterSeekAbort(): void {
+    // hls.js 的 seeking listener 先执行; fragCurrent 为空表示没有可继续渐进解析的请求
+    if (this.fragCurrent === null) {
+      this.resetTransmuxer()
+    }
+  }
+
+  private readonly onParallelMediaSeeking = (): void => {
+    this.resetTransmuxerAfterSeekAbort()
   }
 
   private requireSegmentLoader(): ParallelSegmentLoader {

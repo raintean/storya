@@ -4,12 +4,30 @@ import { ParallelSegmentLoader } from './parallel-segment-loader.ts'
 import { ParallelStreamController } from './parallel-stream-controller.ts'
 
 class TestParallelStreamController extends ParallelStreamController {
+  private resetTransmuxerCount = 0
+
+  getResetTransmuxerCount(): number {
+    return this.resetTransmuxerCount
+  }
+
+  resetAfterSeekForTest(): void {
+    this.resetTransmuxerAfterSeekAbort()
+  }
+
+  setCurrentFragmentForTest(fragment: MediaFragment | null): void {
+    this.fragCurrent = fragment
+  }
+
   updateWindowForTest(fragment: MediaFragment, level: Level): void {
     this.updateSegmentWindow(fragment, level)
   }
 
   setBitrateTestForTest(value: boolean): void {
     this.bitrateTest = value
+  }
+
+  protected override resetTransmuxer(): void {
+    this.resetTransmuxerCount += 1
   }
 }
 
@@ -43,6 +61,19 @@ try {
 
   controller.setBitrateTestForTest(false)
   controller.updateWindowForTest(fragments[2] as MediaFragment, level)
+
+  controller.setCurrentFragmentForTest(fragments[2] as MediaFragment)
+  controller.resetAfterSeekForTest()
+  if (controller.getResetTransmuxerCount() !== 0) {
+    throw new Error('seek 保留当前渐进请求时不应重置 transmuxer')
+  }
+
+  controller.setCurrentFragmentForTest(null)
+  controller.resetAfterSeekForTest()
+  if (controller.getResetTransmuxerCount() !== 1) {
+    throw new Error('seek 取消当前渐进请求后应重置 transmuxer')
+  }
+
   controller.stopLoad()
   if (loader.getDiagnostics().streams.length !== 0) {
     throw new Error('stopLoad 应清除窗口和没有 reader 的 Segment')

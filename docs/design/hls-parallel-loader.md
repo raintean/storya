@@ -247,10 +247,14 @@ URL 和 byte range 属于 identity。相同媒体序号但资源位置不同的�
 
 ## ParallelStreamController 与 ParallelAudioStreamController
 
-两个 Controller 分别继承 hls.js 默认 main `StreamController` 和 `AudioStreamController`, 都只覆写两个调度入口:
+两个 Controller 分别继承 hls.js 默认 main `StreamController` 和 `AudioStreamController`, 覆写调度和 seek 生命周期入口:
 
 - `loadFragment()` 在调用原生实现前更新窗口。
 - `stopLoad()` 清除当前 Controller 持有的窗口, 再调用原生实现。
+- `onMediaAttached()` 在 hls.js 原生 `seeking` listener 后注册补充 listener; 原生逻辑因 seek 取消当前 Fragment、令 `fragCurrent` 为空时, 重置对应轨道的 transmuxer。
+- `onMediaDetaching()` 移除补充 listener, 再调用原生实现。
+
+渐进读取被 seek 取消后, 同一 Fragment 随后可能从字节 0 重新读取。hls.js 原生 seek 路径只重置加载状态, 不重置 transmuxer; 若 sequence number 相同, 解析器可能把新 attempt 误判为旧 attempt 的连续输入。补充重置会清除 partial parser 状态, 并在启用 demux Worker 时切换 instance number, 从而丢弃旧 attempt 尚未返回的解析结果。原生逻辑保留当前 Fragment 请求时不会重置, 避免从 Segment 中部继续到达的数据失去前置解析状态。
 
 普通 VOD/传统 HLS 流程中, 窗口包含当前 Fragment 和它后面的 Fragment。窗口长度由 `ParallelSegmentLoaderOptions.windowSize` 配置, 默认为 6, 因而默认包含当前 Fragment 和后续最多 5 个 Fragment。gap 或没有 URL 的 Fragment 不进入窗口。窗口顺序来自 Level details 中的 Fragment 顺序。
 
@@ -794,6 +798,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-09: main/audio Controller 在 seek 取消渐进 Fragment 后重置对应 transmuxer, 隔离同一 Fragment 重试的旧 partial parser 状态和延迟 Worker 结果。
 - 2026-08-09: fLoader 支持按 highWaterMark 有序提交已经通过响应头校验的连续 filling/ready 数据; rescue 重试依靠 reader 游标跳过已提交前缀, 最终从 canonical Segment 补齐尾部并以空 payload 完成; example 在并行模式下显式开启 hls.js progressive。
 - 2026-08-09: 全局 listener 通知改为固定 8ms 的 leading + trailing 合并调度, 保持统一 `update()` 和逐事务 revision, 限制高频 body 进度更新引起的 Worker 与 FragmentLoader 唤醒。
 - 2026-08-09: 默认救援次数从 1 调整为 2; 次数耗尽后继续检测 stall 并快速失败 Segment, 增加 `exhaustedStallCount` 诊断; 明确 rescue 不跨 attempt 复用部分数据。

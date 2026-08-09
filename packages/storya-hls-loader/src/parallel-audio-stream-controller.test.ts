@@ -4,8 +4,26 @@ import { ParallelAudioStreamController } from './parallel-audio-stream-controlle
 import { ParallelSegmentLoader } from './parallel-segment-loader.ts'
 
 class TestParallelAudioStreamController extends ParallelAudioStreamController {
+  private resetTransmuxerCount = 0
+
+  getResetTransmuxerCount(): number {
+    return this.resetTransmuxerCount
+  }
+
+  resetAfterSeekForTest(): void {
+    this.resetTransmuxerAfterSeekAbort()
+  }
+
+  setCurrentFragmentForTest(fragment: MediaFragment | null): void {
+    this.fragCurrent = fragment
+  }
+
   updateWindowForTest(fragment: MediaFragment, level: Level): void {
     this.updateSegmentWindow(fragment, level)
+  }
+
+  protected override resetTransmuxer(): void {
+    this.resetTransmuxerCount += 1
   }
 }
 
@@ -54,6 +72,18 @@ try {
   assertWindow(loader, 'audio:1', [0, 1, 2])
   if (loader.getDiagnostics().streams.some(stream => stream.id === 'audio:0')) {
     throw new Error('切换音轨时应清除旧音频窗口')
+  }
+
+  controller.setCurrentFragmentForTest(secondTrackFragments[0] as MediaFragment)
+  controller.resetAfterSeekForTest()
+  if (controller.getResetTransmuxerCount() !== 0) {
+    throw new Error('seek 保留当前音频渐进请求时不应重置 transmuxer')
+  }
+
+  controller.setCurrentFragmentForTest(null)
+  controller.resetAfterSeekForTest()
+  if (controller.getResetTransmuxerCount() !== 1) {
+    throw new Error('seek 取消当前音频渐进请求后应重置 transmuxer')
   }
 
   controller.stopLoad()
