@@ -13,6 +13,7 @@ interface VirtualStreamMapProps {
 }
 
 const visibleSegmentCount = 7
+const playbackTimelinePosition = 0.3
 
 interface TimelineViewport {
   bounds: TimelineBounds
@@ -60,7 +61,10 @@ export function VirtualStreamMap({ levelLabels, playbackTime, snapshot }: Virtua
 
       <div className="stream-rows">
         <div className="stream-markers" aria-hidden="true">
-          <i className="marker marker-playback is-at-start">
+          <i
+            className="marker marker-playback"
+            style={{ left: `${playbackTimelinePosition * 100}%` }}
+          >
             <span>播放</span>
           </i>
         </div>
@@ -204,13 +208,14 @@ function updateTimelineViewport(
 }
 
 function positionTimelineAtPlayback(span: number, playbackTime: number): TimelineBounds {
-  const start = Number.isFinite(playbackTime) ? Math.max(0, playbackTime) : 0
+  const normalizedPlaybackTime = Number.isFinite(playbackTime) ? Math.max(0, playbackTime) : 0
+  const start = normalizedPlaybackTime - span * playbackTimelinePosition
   return { end: start + span, start }
 }
 
 function createTicks(start: number, end: number): number[] {
   const step = (end - start) / 4
-  const first = Math.floor(start / step) * step
+  const first = Math.ceil(Math.max(0, start) / step) * step
   const ticks: number[] = []
   for (let tick = first; tick <= end; tick += step) {
     ticks.push(tick)
