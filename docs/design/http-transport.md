@@ -152,16 +152,21 @@ Worker 使用 Paid 计划运行，CPU time 上限为 300 秒，单次调用 subr
 
 ## 可观测性
 
-连接池自定义 debug 回调记录连接创建、建立和关闭，包含连接年龄、请求次数、池大小和关闭原因。正常回收原因只有 `idle` 与 `max-requests`。调用方使用内置 `debug: true` 时，控制台只输出连接关闭事件，并采用与 Proxy Transport 一致的单行可读格式，不输出连接创建、建立或逐请求日志。
+Fetch、Proxy 和 WebSocket Transport 共用 `TransportStatistics`。请求通过各自参数校验并正式进入 Transport 后开始计数, `HttpTransportResponse` 在统一边界包装 body, 因而三者按相同口径统计请求、成功、失败、取消和调用方实际消费的响应字节。每个具体 Transport 通过 `getStatistics()` 返回只读快照; 有变化时默认每 5 秒输出一次单行摘要。
+
+缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态, Proxy 表示物理 Proxy HTTP 响应的 CDN 缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; Edge Worker 转发的状态只表示上游 Fetch, 所以它的摘要明确标记为“上游缓存”。
+
+WebSocket 连接池自定义 debug 回调仍然独立记录连接创建、建立和关闭，包含连接年龄、请求次数、池大小和关闭原因。正常回收原因只有 `idle` 与 `max-requests`。调用方使用内置 `debug: true` 时，控制台只额外输出连接关闭事件, 不把连接生命周期混入请求统计。
 
 Edge Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/response 热路径不输出逐请求或逐消息日志，异常异步任务才写结构化错误。
 
 ## 实现状态
 
-Fetch、Proxy、WebSocket Transport、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
+Fetch、Proxy、WebSocket Transport、统一请求/流量/缓存统计、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
 
 ## 修改历史
 
+- 2026-08-09: WebSocket Transport 接入统一 `TransportStatistics`, 按调用方实际消费的 response body 统计请求与字节, 将 Edge Worker 转发的 `CF-Cache-Status` 明确标记为上游缓存; 三种 Transport 同时公开统计快照。
 - 2026-08-09: Loader 的 rescue 检测改为可关闭的统一策略; body 连续 2 秒无数据判定停滞, 持续有数据但明显低于同期 GET 中位速率且重试预计更快时也取消当前请求并重新领取, Transport 接口不增加慢速语义。
 - 2026-08-08: 新 Loader 改为逐段读取统一 Transport response body, 恢复响应头、流量空闲和完整请求超时; 停滞 Chunk 由 Loader 取消并重新领取, 不向 Fetch Transport 引入调度状态。
 - 2026-08-08: 新 `ParallelSegmentLoader` 接回统一 `HttpTransport`, 默认 Fetch, example 恢复 Fetch、HTTP Proxy 和 WebSocket relay 选择; 慢速补救明确为尚未迁移。

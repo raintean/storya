@@ -11,6 +11,7 @@ export interface TransportStatisticsSnapshot {
   cacheBypassCount: number
   cacheHitCount: number
   cacheHitRate: number | undefined
+  cacheLabel: string
   cacheMissCount: number
   cacheStatusCounts: Record<string, number>
   cacheUnknownCount: number
@@ -26,6 +27,7 @@ export interface TransportStatisticsSnapshot {
 }
 
 export interface TransportStatisticsOptions {
+  cacheLabel?: string
   intervalMs?: number
   logger?: (message: string, snapshot: TransportStatisticsSnapshot) => void
 }
@@ -36,6 +38,7 @@ export class TransportStatistics {
   private activeRequestCount = 0
   private cacheBypassCount = 0
   private cacheHitCount = 0
+  private readonly cacheLabel: string
   private cacheMissCount = 0
   private readonly cacheStatusCounts = new Map<string, number>()
   private cacheUnknownCount = 0
@@ -59,6 +62,7 @@ export class TransportStatistics {
       throw new Error('Transport 统计输出间隔必须大于 0')
     }
     this.intervalMs = intervalMs
+    this.cacheLabel = options.cacheLabel ?? '缓存'
     this.logger = options.logger ?? (message => console.info(message))
     this.transport = transport
   }
@@ -82,6 +86,7 @@ export class TransportStatistics {
       cacheBypassCount: this.cacheBypassCount,
       cacheHitCount: this.cacheHitCount,
       cacheHitRate: cacheDecisions === 0 ? undefined : this.cacheHitCount / cacheDecisions,
+      cacheLabel: this.cacheLabel,
       cacheMissCount: this.cacheMissCount,
       cacheStatusCounts: Object.fromEntries(
         [...this.cacheStatusCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
@@ -182,7 +187,7 @@ export function formatTransportStatistics(snapshot: TransportStatisticsSnapshot)
     `取消 ${snapshot.canceledCount}`,
     `进行中 ${snapshot.activeRequestCount}`,
     `数据 ${formatBytes(snapshot.responseBytes)}`,
-    `缓存 HIT ${snapshot.cacheHitCount} / MISS ${snapshot.cacheMissCount} / BYPASS ${snapshot.cacheBypassCount} / 未知 ${snapshot.cacheUnknownCount}`,
+    `${snapshot.cacheLabel} HIT ${snapshot.cacheHitCount} / MISS ${snapshot.cacheMissCount} / BYPASS ${snapshot.cacheBypassCount} / 未知 ${snapshot.cacheUnknownCount}`,
     `命中率 ${cacheHitRate}`,
     ...(cacheStatuses.length === 0 ? [] : [`CF ${cacheStatuses}`]),
   ]

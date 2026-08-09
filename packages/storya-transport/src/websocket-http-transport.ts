@@ -15,6 +15,7 @@ import type {
   HttpTransportResponse,
 } from './http-transport'
 import { createAbortError, HttpTransportFailure } from './http-transport'
+import { TransportStatistics, type TransportStatisticsSnapshot } from './transport-statistics'
 import { WebSocketHttpResponse } from './websocket-http-response'
 
 interface WebSocketEventMapLike {
@@ -142,6 +143,9 @@ export class WebSocketHttpTransport implements HttpTransport {
   private nextChannelId = 0
   private readonly options: ResolvedOptions
   private readonly pending: PendingRequest[] = []
+  private readonly statistics = new TransportStatistics('WebSocketHttpTransport', {
+    cacheLabel: '上游缓存',
+  })
   private readonly url: string
 
   constructor(url: string, options: WebSocketHttpTransportOptions) {
@@ -177,6 +181,7 @@ export class WebSocketHttpTransport implements HttpTransport {
       )
     }
 
+    const statistics = this.statistics.startRequest()
     return new Promise<HttpTransportResponse>((resolve, reject) => {
       const pending: PendingRequest = {
         abortListener: () => {
@@ -194,7 +199,17 @@ export class WebSocketHttpTransport implements HttpTransport {
       request.signal.addEventListener('abort', pending.abortListener, { once: true })
       this.pending.push(pending)
       this.drain()
-    })
+    }).then(
+      response => statistics.trackResponse(response, request.method !== 'HEAD'),
+      error => {
+        statistics.reject(error)
+        throw error
+      },
+    )
+  }
+
+  getStatistics(): TransportStatisticsSnapshot {
+    return this.statistics.snapshot()
   }
 
   destroy(): void {
@@ -211,6 +226,7 @@ export class WebSocketHttpTransport implements HttpTransport {
       channel.destroy(error)
     }
     this.channels.clear()
+    this.statistics.destroy()
   }
 
   private createChannel(): void {

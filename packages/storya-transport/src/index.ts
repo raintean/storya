@@ -8,6 +8,7 @@ export type {
   HttpTransportRequestOptions,
   HttpTransportResponse,
 } from './http-transport'
+export type { TransportStatisticsSnapshot } from './transport-statistics'
 export {
   createProxyUrl,
   decodeProxyTargetUrl,

@@ -97,11 +97,18 @@ class FakeRelay {
     entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_END, entry.sequence))
   }
 
-  respondHead(url: string, contentLength?: number): void {
+  respondHead(
+    url: string,
+    contentLength?: number,
+    responseHeaders: Record<string, string> = {},
+  ): void {
     const entry = this.findRequest(url)
     const path = new URL(entry.request.url).pathname
     const head = create(HttpResponseHeadSchema, {
-      headers: [{ name: 'content-length', value: String(contentLength ?? path.length) }],
+      headers: [
+        { name: 'content-length', value: String(contentLength ?? path.length) },
+        ...Object.entries(responseHeaders).map(([name, value]) => ({ name, value })),
+      ],
       status: 200,
       statusText: 'OK',
       url: entry.request.url,
@@ -239,6 +246,7 @@ async function testTransportStatistics(): Promise<void> {
   assert(snapshot.activeRequestCount === 0, 'Transport 统计活动请求数量错误')
   assert(snapshot.responseBytes === 12, 'Transport 统计实际响应字节错误')
   assert(snapshot.cacheHitCount === 1, 'Transport 统计缓存命中数量错误')
+  assert(snapshot.cacheLabel === '缓存', 'Transport 统计默认缓存标签错误')
   assert(snapshot.cacheMissCount === 1, 'Transport 统计缓存未命中数量错误')
   assert(snapshot.cacheBypassCount === 1, 'Transport 统计缓存绕过数量错误')
   assert(snapshot.cacheUnknownCount === 1, 'Transport 统计未知缓存数量错误')
@@ -264,6 +272,36 @@ async function testFetchTransport(): Promise<void> {
   const response = await transport.request(new Request('https://example.com/fetch'))
   assert(requestedUrl === 'https://example.com/fetch', 'Fetch transport 没有转发请求')
   assert(decode(await response.arrayBuffer()) === 'fetch', 'Fetch 响应错误')
+  const statistics = transport.getStatistics()
+  assert(statistics.successCount === 1, 'Fetch transport 没有记录成功请求')
+  assert(statistics.responseBytes === 5, 'Fetch transport 没有记录响应字节')
+  transport.destroy()
+}
+
+async function testWebSocketTransportStatistics(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay)
+  const url = 'https://example.com/hold/statistics'
+  const responsePromise = transport.request(new Request(url))
+  await waitFor(() => relay.requests.length === 1)
+  relay.respondHead(url, 4, { 'cf-cache-status': 'HIT' })
+  const response = await responsePromise
+  relay.respondBody(url, new Uint8Array([1, 2]))
+  relay.respondBody(url, new Uint8Array([3, 4]))
+  relay.respondEnd(url)
+  assert((await response.arrayBuffer()).byteLength === 4, 'WebSocket 统计测试响应错误')
+
+  const statistics = transport.getStatistics()
+  assert(statistics.requestCount === 1, 'WebSocket transport 没有记录请求数量')
+  assert(statistics.successCount === 1, 'WebSocket transport 没有记录成功请求')
+  assert(statistics.activeRequestCount === 0, 'WebSocket transport 成功后仍有活动统计')
+  assert(statistics.responseBytes === 4, 'WebSocket transport 没有记录消费的响应字节')
+  assert(statistics.cacheHitCount === 1, 'WebSocket transport 没有记录上游缓存命中')
+  assert(statistics.cacheLabel === '上游缓存', 'WebSocket transport 缓存标签不明确')
+  assert(
+    formatTransportStatistics(statistics).includes('上游缓存 HIT 1'),
+    'WebSocket transport 统计摘要没有标记上游缓存',
+  )
   transport.destroy()
 }
 
@@ -323,6 +361,9 @@ async function testHeadContentLength(): Promise<void> {
   assert(response.status === 200, 'HEAD 响应没有成功返回')
   assert(response.headers.get('content-length') === '5', 'HEAD 响应丢失 Content-Length')
   assert((await response.arrayBuffer()).byteLength === 0, 'HEAD 响应不应包含 body')
+  const statistics = transport.getStatistics()
+  assert(statistics.successCount === 1, 'WebSocket HEAD 请求没有记录成功统计')
+  assert(statistics.cacheUnknownCount === 1, '无缓存头的 WebSocket 请求没有归入 UNKNOWN')
   transport.destroy()
 }
 
@@ -337,6 +378,7 @@ async function testAbortSendsCancelAndReusesConnection(): Promise<void> {
   controller.abort()
   await assertRejectsAbort(response, '请求 Abort 没有结束 WebSocket 事务')
   assert(relay.canceledSequences.length === 1, '请求 Abort 没有发送 CANCEL')
+  assert(transport.getStatistics().canceledCount === 1, '请求 Abort 没有计入取消统计')
 
   const next = await transport.request(new Request('https://example.com/next'))
   assert(decode(await next.arrayBuffer()) === '/next', 'CANCELED 后连接没有恢复复用')
@@ -353,6 +395,7 @@ async function testBodyCancelSendsCancel(): Promise<void> {
   const response = await responsePromise
   await response.body?.cancel()
   assert(relay.canceledSequences.length === 1, 'response body cancel 没有发送 CANCEL')
+  assert(transport.getStatistics().canceledCount === 1, 'body cancel 没有计入取消统计')
 
   await (await transport.request(new Request('https://example.com/reused'))).arrayBuffer()
   assert(relay.clients.length === 1, 'body cancel 确认后连接没有恢复复用')
@@ -520,6 +563,9 @@ async function testConnectionFactoryFailure(): Promise<void> {
     failed = cause instanceof Error && cause.message === 'WebSocket 连接创建失败'
   }
   assert(failed, 'WebSocket 工厂同步失败时请求没有结束')
+  const statistics = transport.getStatistics()
+  assert(statistics.failureCount === 1, 'WebSocket 连接失败没有计入失败统计')
+  assert(statistics.activeRequestCount === 0, 'WebSocket 连接失败后仍有活动统计')
   transport.destroy()
 }
 
@@ -632,6 +678,7 @@ function assert(condition: boolean, message: string): asserts condition {
 testTransportFrameBodyView()
 await testTransportStatistics()
 await testFetchTransport()
+await testWebSocketTransportStatistics()
 await testStreamingResponse()
 await testSequentialReuse()
 await testConcurrentGrowth()

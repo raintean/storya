@@ -5,7 +5,7 @@ import type {
 } from './http-transport'
 import { HttpTransportFailure } from './http-transport'
 import type { FetchFunction } from './fetch-http-transport'
-import { TransportStatistics } from './transport-statistics'
+import { TransportStatistics, type TransportStatisticsSnapshot } from './transport-statistics'
 
 const proxyPathPattern = /^\/proxy\/([A-Za-z0-9_-]+)\.jpg$/
 const headDescriptorPrefix = 'storya-proxy-head-v1\n'
@@ -89,6 +89,10 @@ export class ProxyHttpTransport implements HttpTransport {
       statistics.reject(error)
       throw error
     }
+  }
+
+  getStatistics(): TransportStatisticsSnapshot {
+    return this.statistics.snapshot()
   }
 
   destroy(): void {

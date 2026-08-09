@@ -4,7 +4,7 @@ import type {
   HttpTransportResponse,
 } from './http-transport'
 import { HttpTransportFailure } from './http-transport'
-import { TransportStatistics } from './transport-statistics'
+import { TransportStatistics, type TransportStatisticsSnapshot } from './transport-statistics'
 
 export type FetchFunction = (request: Request) => Promise<Response>
 
@@ -33,6 +33,10 @@ export class FetchHttpTransport implements HttpTransport {
       statistics.reject(error)
       throw error
     }
+  }
+
+  getStatistics(): TransportStatisticsSnapshot {
+    return this.statistics.snapshot()
   }
 
   destroy(): void {
