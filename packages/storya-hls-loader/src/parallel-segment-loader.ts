@@ -14,7 +14,7 @@ import type { VirtualStreamChunk } from './virtual-stream-chunk'
 export const DEFAULT_CHUNK_SIZE = 2 * 1024 * 1024
 export const DEFAULT_MAX_CONCURRENCY = 6
 export const DEFAULT_RESCUE_OPTIONS = Object.freeze({
-  maxAttempts: 1,
+  maxAttempts: 2,
   slowRateThresholdRatio: 0.25,
   stallTimeoutMs: 4_000,
 })
@@ -173,6 +173,10 @@ export class ParallelSegmentLoader {
 
   recordRescue(chunk: VirtualStreamChunk, event: RescueEventRecord): void {
     this.rescueTracker.record(chunk, event)
+  }
+
+  recordExhaustedStall(): void {
+    this.rescueTracker.recordExhaustedStall()
   }
 
   markRescueRecovered(chunk: VirtualStreamChunk): void {

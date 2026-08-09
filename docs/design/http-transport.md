@@ -92,7 +92,7 @@ WebSocket Transport 收到 `RESPONSE_HEAD` 后立即返回 `HttpTransportRespons
 
 Fetch、Proxy 和 WebSocket 对 HLS Loader 统一表现为流式 Transport。HEAD 与 GET 共用 `SegmentLoadWorker` 固定并发池。`SegmentFetchWork` 使用 `ReadableStreamDefaultReader` 逐段读取 GET body, 实时更新 Chunk 已接收字节。两种 Work 都通过 Request AbortSignal 表达窗口取消和请求超时; response head 已返回的 GET 还会使用 body cancel。调度优先级只影响空闲 Worker 的下一次领取, 不取消已经发出的有效请求。
 
-连续无数据、相对同期 GET 明显过慢或请求超时由 `SegmentFetchWork` 结束当前 attempt; rescue 会把 Chunk 恢复为可调度状态, 后续重新领取属于 `SegmentLoadWorker` 的调度, 不属于 `FetchHttpTransport`。Transport 仍然只负责把 Fetch response 原样暴露为统一流接口。
+连续无数据、相对同期 GET 明显过慢或请求超时由 `SegmentFetchWork` 结束当前 attempt; 救援额度内会把 Chunk 恢复为可调度状态, 后续重新领取属于 `SegmentLoadWorker` 的调度。额度耗尽后不再检测相对慢速, 但再次停滞会取消请求并快速失败 Segment。Transport 不参与这些判断。
 
 ## 响应上限
 
@@ -108,7 +108,7 @@ HEAD 的 body 必须为空。当前生产 Chunk 默认为 2 MiB，因此正常�
 
 ## 取消与超时
 
-`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。默认 rescue 在 GET body 连续 4 秒没有数据时判定停滞; 已经观察满同一窗口、具有至少 2 个同期 peer 的请求如果低于 peer 中位速率的 25%, 且重新请求预计更早完成, 也会触发相同的取消和重新领取流程。`rescue: false` 或次数耗尽时不安装这些检测。
+`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。默认 rescue 在 GET body 连续 4 秒没有数据时判定停滞; 已经观察满同一窗口、具有至少 2 个同期 peer 的请求如果低于 peer 中位速率的 25%, 且重新请求预计更早完成, 也会触发相同的取消和重新领取流程。`rescue: false` 关闭两类检测; 次数耗尽后只关闭相对慢速检测, stall 检测仍用于快速失败。
 
 WebSocket Transport 把这两种标准取消入口映射为当前 sequence 的 `CANCEL`。Worker 先清空活动事务，再取消 pending BYOB read 并 Abort 上游 Fetch，随后回复 `CANCELED`。客户端只有收到 `CANCELED` 后才把连接恢复为 idle；确认超时会关闭连接，避免未收敛事务被错误复用。取消确认超时由调用方通过 `cancelTimeoutMs` 配置。
 

@@ -24,6 +24,7 @@ export interface RescueEventDiagnostics {
 
 export interface RescueStatisticsDiagnostics {
   discardedBytes: number
+  exhaustedStallCount: number
   pendingEvents: number
   recentEvents: RescueEventDiagnostics[]
   recoveredEvents: number
@@ -56,6 +57,7 @@ interface PendingChunkRescues {
 
 export class RescueTracker {
   private discardedBytes = 0
+  private exhaustedStallCount = 0
   private nextEventId = 1
   private readonly pendingByChunk = new WeakMap<object, PendingChunkRescues>()
   private readonly recentEvents: RescueEventDiagnostics[] = []
@@ -103,6 +105,10 @@ export class RescueTracker {
     }
   }
 
+  recordExhaustedStall(): void {
+    this.exhaustedStallCount += 1
+  }
+
   markRecovered(chunk: object): void {
     const pending = this.pendingByChunk.get(chunk)
     if (pending === undefined) {
@@ -121,6 +127,7 @@ export class RescueTracker {
   getDiagnostics(): RescueStatisticsDiagnostics {
     return {
       discardedBytes: this.discardedBytes,
+      exhaustedStallCount: this.exhaustedStallCount,
       pendingEvents: this.totalEvents - this.recoveredEvents,
       recentEvents: this.recentEvents.map(event => ({ ...event })),
       recoveredEvents: this.recoveredEvents,

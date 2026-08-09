@@ -67,7 +67,7 @@ VirtualStreamChunk
 - `StoryaFragmentLoader` 把一次 hls.js fLoader 调用转换为 `readerCount` 生命周期, 并观察 Segment outcome。
 - `SegmentLoadWorker` 观察状态, 领取 HEAD 或 GET 任务, 创建对应 Work, 状态变化时取消已经失效的 Work。
 - `SegmentPlanningWork` 负责一次 HEAD 长度探测。
-- `SegmentFetchWork` 负责一次 GET attempt, 包括 response head 处理、流式读取、Range 校验、提交和超时补救。
+- `SegmentFetchWork` 负责一次 GET attempt, 包括 response head 处理、流式读取、Range 校验、提交、正常超时和 rescue 检测。
 
 不建立 Registry、Filler、Scheduler、Owner、Reader、Writer 或 Worker host adapter。参与者可以同步读取共享状态, 修改则必须经过 `ParallelSegmentLoader.update()`。
 
@@ -587,7 +587,9 @@ HEAD 和 GET 都占用 Worker 槽位并使用两类正常请求时限; GET 另�
 - body 连续无数据的停滞检测: `rescue.stallTimeoutMs`, 默认 4 秒。
 - 相对于同期 GET 中位速率的慢速检测: `rescue.slowRateThresholdRatio`, 默认 0.25。
 
-GET body 每产生一段数据, Work 复制到 attempt 局部 parts, 同步更新共享 Chunk 的 loadedBytes 和 TransferTracker。只有当前 Chunk 的 `rescueAttempts < rescue.maxAttempts` 时, Work 才安装 rescue 检测。完整 body 验证通过后才提交 Chunk data。
+GET body 每产生一段数据, Work 复制到 attempt 局部 parts, 同步更新共享 Chunk 的 loadedBytes 和 TransferTracker。完整 body 验证通过后才提交 Chunk data; rescue 会丢弃当前 attempt 的局部 parts, 下一次从相同 Chunk 起点完整重下, 不跨 attempt 复用部分数据。
+
+`rescue.maxAttempts > 0` 时每个 attempt 都安装停滞检测。当前 Chunk 的 `rescueAttempts < rescue.maxAttempts` 时还会安装相对慢速检测, 并允许停滞或慢速触发重新领取; 次数耗尽后不再判断相对慢速, 但停滞会快速终止 Segment, 避免单个 Chunk 等待正常完整请求时限。
 
 Proxy 为获得 CDN 缓存语义可能把上游 `206` 包装成物理 `200`; `ProxyHttpTransport` 在返回 HLS Loader 前恢复逻辑 status 和 `Content-Range`。因此浏览器 Network 面板可能显示 `200`, 诊断中仍显示逻辑 `206`。
 
@@ -595,7 +597,7 @@ Proxy 为获得 CDN 缓存语义可能把上游 `206` 包装成物理 `200`; `Pr
 
 普通网络错误、HTTP 错误、Range 校验错误或资源 validator 变化会使 Segment 进入 failed outcome。Segment failure 会让同一 Segment 仍在 filling 的其他 Chunk 一起失败, 对应 Worker 收到通知后取消失效 Work。
 
-rescue 是正常请求时限之外的额外补救。停滞是零吞吐的慢速极限状态, 两种信号共用同一次数和状态转换。默认允许补救 1 次:
+rescue 是正常请求时限之外的额外补救。停滞是零吞吐的慢速极限状态, 两种信号共用同一次数和状态转换。默认允许补救 2 次, 即最多创建 3 个网络 attempt:
 
 ```text
 body 连续无数据达到 stallTimeoutMs
@@ -608,8 +610,9 @@ body 连续无数据达到 stallTimeoutMs
        -> 当前 Work 结束
        -> Worker 重新执行全局调度
   -> 已达上限
-       -> 当前 Work 不安装 rescue 检测
-       -> 继续等待自然完成、正常 timeout 或上层取消
+       -> 不再安装相对慢速检测
+       -> stall 检测仍然保留
+       -> 再次停滞时取消 Work 并快速失败 Segment
 ```
 
 相对慢速检测使用 `rescue.stallTimeoutMs` 作为滚动观察窗口。当前 GET 必须已经观察满一个窗口并收到过数据, 同期至少存在 2 个有效 peer。系统比较 `currentRate / peerMedianRate` 与配置阈值, 再计算:
@@ -621,13 +624,13 @@ retryEta    = expectedResponseBytes / peerMedianRate + peerMedianTtfb
 
 只有当前速率低于阈值且 `continueEta > retryEta` 时才取消。判断没有绝对带宽下限; 所有同期请求一起变慢时不会把其中某一个误判为离群慢请求。`rescue.slowRateThresholdRatio = 0` 只关闭非零吞吐的相对慢速检测, 停滞检测仍然存在。
 
-例如 `rescue.maxAttempts = 1` 时, 第一个 Work 可以触发 rescue。第二个 Work 创建时 rescue 次数已经用完, 因而不再安装检测。rescue 次数耗尽本身不会使 Chunk 或 Segment 失败。
+例如 `rescue.maxAttempts = 2` 时, 前两个 Work 都可以触发 rescue。第三个 Work 不再因相对慢速触发重试; 如果 body 连续无数据达到 `stallTimeoutMs`, 则以救援耗尽错误结束 Segment, 交给 hls.js 原生恢复流程处理。诊断中的 `exhaustedStallCount` 记录这种情况。
 
 `rescue: false` 与 `rescue: { maxAttempts: 0 }` 都会从第一个 Work 起关闭全部 rescue 检测。
 
 救援检测发生时, `SegmentFetchWork` 先在局部保存原因、速率比较、ETA、已接收字节和触发时间。只有取消完成后仍定位到相同 generation, 且 `chunk.rescue()` 成功把 Chunk 释放为 empty 时, Loader 的 `RescueTracker` 才记录事件。因此失效 generation、普通取消和正常 timeout 不会产生虚假的救援统计。
 
-`RescueTracker` 为当前 Loader session 维护累计计数, 并只保留最近 64 个事件详情。事件初始 outcome 为 `pending`; 同一个 `VirtualStreamChunk` 后续完整校验并提交为 ready 时, 该 Chunk 关联的全部 pending 救援事件改为 `recovered`。累计统计包括总事件数、stall/slow 分类、已恢复数、未恢复数和被取消 attempt 已接收但未提交的字节数。Tracker 使用 Chunk 对象的弱引用关联恢复结果, 不延长已驱离 Chunk 的生命周期。
+`RescueTracker` 为当前 Loader session 维护累计计数, 并只保留最近 64 个事件详情。事件初始 outcome 为 `pending`; 同一个 `VirtualStreamChunk` 后续完整校验并提交为 ready 时, 该 Chunk 关联的全部 pending 救援事件改为 `recovered`。累计统计包括总事件数、stall/slow 分类、已恢复数、未恢复数、救援耗尽后的停滞数和被取消 attempt 已接收但未提交的字节数。Tracker 使用 Chunk 对象的弱引用关联恢复结果, 不延长已驱离 Chunk 的生命周期。
 
 响应头超时和完整请求超时属于正常 attempt failure, 不消耗 rescue 次数。外部窗口变化或 Worker destroy 使用普通取消, 只释放仍然有效的 generation。
 
@@ -732,7 +735,7 @@ const loader = new ParallelSegmentLoader({
   chunkSize: 2 * 1024 * 1024,
   maxConcurrency: 6,
   rescue: {
-    maxAttempts: 1,
+    maxAttempts: 2,
     slowRateThresholdRatio: 0.25,
     stallTimeoutMs: 4_000,
   },
@@ -778,6 +781,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-09: 默认救援次数从 1 调整为 2; 次数耗尽后继续检测 stall 并快速失败 Segment, 增加 `exhaustedStallCount` 诊断; 明确 rescue 不跨 attempt 复用部分数据。
 - 2026-08-09: 将 `rescue.stallTimeoutMs` 默认值从 2 秒调整为 4 秒, 同时延长相对慢速检测的默认滚动观察窗口。
 - 2026-08-09: 将 `idleTimeoutMs` 和 `maxRescueAttempts` 收敛为可设为 `false` 的 `rescue` 配置, 停滞阈值更名为 `stallTimeoutMs` 并默认改为 2 秒; TransferTracker 增加同期 GET 中位速率, 当前请求低于默认 25% 且取消重试预计更早完成时复用原有 rescue 流程。
 - 2026-08-09: 增加 session 级 RescueTracker, 统计实际进入重试的 stall/slow 救援、丢弃字节、恢复结果和最近 64 个事件, 并通过 diagnostics 暴露给 example。

@@ -12,10 +12,12 @@ tracker.record(chunk, {
   peerMedianRate: 500,
   retryEtaMs: 2_100,
 })
+tracker.recordExhaustedStall()
 
 const pending = tracker.getDiagnostics()
 if (
   pending.totalEvents !== 2 ||
+  pending.exhaustedStallCount !== 1 ||
   pending.stallEvents !== 1 ||
   pending.slowEvents !== 1 ||
   pending.pendingEvents !== 2 ||

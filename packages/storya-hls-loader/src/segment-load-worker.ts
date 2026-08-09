@@ -171,8 +171,9 @@ export class SegmentLoadWorker {
         requestStart,
         resourceLength:
           segment.length === undefined ? undefined : segment.resourceStart + segment.length,
-        rescueEnabled: chunk.rescueAttempts < this.loader.rescue.maxAttempts,
+        rescueAvailable: chunk.rescueAttempts < this.loader.rescue.maxAttempts,
         segmentKey: segment.key,
+        stallDetectionEnabled: this.loader.rescue.maxAttempts > 0,
         startedAt,
         streamId: segment.streamId,
         transport: this.transport,

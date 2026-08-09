@@ -15,9 +15,10 @@ export interface SegmentFetchWorkOptions {
   rangeEnabled: boolean
   requestEnd: number | undefined
   requestStart: number
-  rescueEnabled: boolean
+  rescueAvailable: boolean
   resourceLength: number | undefined
   segmentKey: string
+  stallDetectionEnabled: boolean
   startedAt: number
   streamId: string
   transport: HttpTransport
@@ -53,9 +54,10 @@ export class SegmentFetchWork {
   private readonly rangeEnabled: boolean
   private receivedBytes = 0
   private detectedRescue: DetectedRescue | undefined
-  private readonly rescueEnabled: boolean
+  private readonly rescueAvailable: boolean
   private readonly resourceLength: number | undefined
   private started = false
+  private readonly stallDetectionEnabled: boolean
   private readonly transport: HttpTransport
   private transferFinished = false
 
@@ -68,9 +70,10 @@ export class SegmentFetchWork {
     this.rangeEnabled = options.rangeEnabled
     this.requestEnd = options.requestEnd
     this.requestStart = options.requestStart
-    this.rescueEnabled = options.rescueEnabled
+    this.rescueAvailable = options.rescueAvailable
     this.resourceLength = options.resourceLength
     this.segmentKey = options.segmentKey
+    this.stallDetectionEnabled = options.stallDetectionEnabled
     this.startedAt = options.startedAt
     this.streamId = options.streamId
     this.transport = options.transport
@@ -207,17 +210,19 @@ export class SegmentFetchWork {
     let slowTimer: ReturnType<typeof globalThis.setInterval> | undefined
     let stallTimer: ReturnType<typeof globalThis.setTimeout> | undefined
     const resetStallTimer = () => {
-      if (!this.rescueEnabled) {
+      if (!this.stallDetectionEnabled) {
         return
       }
       if (stallTimer !== undefined) {
         globalThis.clearTimeout(stallTimer)
       }
       stallTimer = globalThis.setTimeout(() => {
-        this.abortForRescue(
-          'stall',
-          `Chunk 连续 ${this.loader.rescue.stallTimeoutMs}ms 没有收到数据`,
-        )
+        const message = `Chunk 连续 ${this.loader.rescue.stallTimeoutMs}ms 没有收到数据`
+        if (this.rescueAvailable) {
+          this.abortForRescue('stall', message)
+        } else {
+          this.abortForExhaustedStall(`${message}, 救援次数已经耗尽`)
+        }
       }, this.loader.rescue.stallTimeoutMs)
     }
     const checkSlowTransfer = () => {
@@ -272,7 +277,7 @@ export class SegmentFetchWork {
 
     resetStallTimer()
     if (
-      this.rescueEnabled &&
+      this.rescueAvailable &&
       expectedBytes !== undefined &&
       this.loader.rescue.slowRateThresholdRatio > 0
     ) {
@@ -660,6 +665,15 @@ export class SegmentFetchWork {
         return undefined
       }
       if (!isRescueAbort(this.controller.signal.reason)) {
+        if (isRescueExhaustedAbort(this.controller.signal.reason)) {
+          const reason = this.controller.signal.reason
+          this.loader.recordExhaustedStall()
+          segment.fail(
+            createFailure(reason instanceof Error ? reason.message : 'Chunk 停滞且救援次数已耗尽'),
+            completedAt,
+          )
+          return undefined
+        }
         if (isTimeoutAbort(this.controller.signal.reason)) {
           const reason = this.controller.signal.reason
           segment.fail(
@@ -721,6 +735,12 @@ export class SegmentFetchWork {
       timestamp: Date.now(),
     }
     this.controller.abort(new DOMException(message, 'RescueError'))
+  }
+
+  private abortForExhaustedStall(message: string): void {
+    if (!this.controller.signal.aborted) {
+      this.controller.abort(new DOMException(message, 'RescueExhaustedError'))
+    }
   }
 
   private locateChunk(
@@ -795,6 +815,10 @@ function toFailure(cause: unknown): SegmentLoadFailure {
 
 function isRescueAbort(reason: unknown): boolean {
   return reason instanceof DOMException && reason.name === 'RescueError'
+}
+
+function isRescueExhaustedAbort(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === 'RescueExhaustedError'
 }
 
 function isTimeoutAbort(reason: unknown): boolean {

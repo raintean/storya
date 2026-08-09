@@ -130,6 +130,7 @@ const emptyDiagnostics: ParallelSegmentLoaderDiagnostics = {
   revision: 0,
   rescue: {
     discardedBytes: 0,
+    exhaustedStallCount: 0,
     pendingEvents: 0,
     recentEvents: [],
     recoveredEvents: 0,
@@ -1030,7 +1031,7 @@ export function App() {
                       ? '—'
                       : activeLoaderParameters.rescue === false
                         ? 'OFF'
-                        : `${String(activeLoaderParameters.rescue.maxAttempts)} attempts`}
+                        : `${String(activeLoaderParameters.rescue.maxAttempts)} rescues · ${String(activeLoaderParameters.rescue.maxAttempts + 1)} attempts`}
                   </dd>
                 </div>
                 <div>
@@ -1043,7 +1044,8 @@ export function App() {
                 <div>
                   <dt>RESCUE REASONS</dt>
                   <dd>
-                    {diagnostics.rescue.stallEvents} stall · {diagnostics.rescue.slowEvents} slow
+                    {diagnostics.rescue.stallEvents} stall · {diagnostics.rescue.slowEvents} slow ·{' '}
+                    {diagnostics.rescue.exhaustedStallCount} exhausted
                   </dd>
                 </div>
                 <div>
