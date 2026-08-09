@@ -142,7 +142,7 @@ idle timeout 只关闭超出 `minIdleConnections` 的空闲连接。如果池从
 
 Worker 只接受 GET 和 HEAD。它过滤 Host、Connection、Transfer-Encoding 等 hop-by-hop 或运行时管理的 header，从 WebSocket 握手继承浏览器 User-Agent，并根据握手 Origin 生成只包含 origin 的 Referer。
 
-Worker 使用普通 `fetch()` 回源，跟随重定向，先返回 status、最终 URL 和 headers，再流式返回 body。当前只限制 URL scheme 为 HTTP/HTTPS，尚未实现鉴权、请求额度、内网地址拦截或逐跳重定向校验。
+Worker 使用带有 Cloudflare Fetch Cache 配置的 `fetch()` 回源，跟随重定向，先返回 status、最终 URL 和 headers，再流式返回 body。所有 GET/HEAD 子请求启用 `cacheEverything`; 200-299 响应忽略源站缓存头并强制使用一年的 Edge TTL，300-399 响应立即过期，400-599 响应不进入缓存。缓存 key 保持 Cloudflare 默认行为，包含完整目标 URL，不使用自定义 key。当前只限制 URL scheme 为 HTTP/HTTPS，尚未实现鉴权、请求额度、内网地址拦截或逐跳重定向校验。
 
 Worker 禁用 `permessage-deflate`。媒体通常已经压缩，重复压缩只会增加 CPU。
 
@@ -152,7 +152,7 @@ Worker 使用 Paid 计划运行，CPU time 上限为 300 秒，单次调用 subr
 
 Fetch、Proxy 和 WebSocket Transport 共用 `TransportStatistics`。请求通过各自参数校验并正式进入 Transport 后开始计数, `HttpTransportResponse` 在统一边界包装 body, 因而三者按相同口径统计请求、成功、失败、取消和调用方实际消费的响应字节。每个具体 Transport 通过 `getStatistics()` 返回只读快照; 有变化时默认每 5 秒输出一次单行摘要。
 
-缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态, Proxy 表示物理 Proxy HTTP 响应的 CDN 缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; Edge Worker 转发的状态只表示上游 Fetch, 所以它的摘要明确标记为“上游缓存”。
+缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态, Proxy 表示物理 Proxy HTTP 响应的 CDN 缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; Edge Worker 转发的状态表示配置在 Worker 子请求上的 Cloudflare Fetch Cache, 所以它的摘要标记为“Worker Fetch 缓存”。
 
 WebSocket 连接池自定义 debug 回调仍然独立记录连接创建、建立和关闭，包含连接年龄、请求次数、池大小和关闭原因。正常回收原因只有 `idle` 与 `max-requests`。调用方使用内置 `debug: true` 时，控制台只额外输出连接关闭事件, 不把连接生命周期混入请求统计。
 
@@ -164,6 +164,7 @@ Fetch、Proxy、WebSocket Transport、统一请求/流量/缓存统计、Rust HT
 
 ## 修改历史
 
+- 2026-08-09: Edge Worker 的 GET/HEAD 子请求启用 `cacheEverything`, 200-299 响应强制使用一年 Edge TTL, 重定向立即过期, 错误响应不缓存; WebSocket Transport 将对应统计标记为 Worker Fetch 缓存。
 - 2026-08-09: 删除已无消费者的 `rangeRequestMode`; 当前 Loader 的 rescue 对所有 Transport 都从原 Chunk 起点完整重下, Transport 不再暴露旧版部分续传策略。
 - 2026-08-09: WebSocket Transport 接入统一 `TransportStatistics`, 按调用方实际消费的 response body 统计请求与字节, 将 Edge Worker 转发的 `CF-Cache-Status` 明确标记为上游缓存; 三种 Transport 同时公开统计快照。
 - 2026-08-09: Loader 的 rescue 检测改为可关闭的统一策略; body 连续 2 秒无数据判定停滞, 持续有数据但明显低于同期 GET 中位速率且重试预计更快时也取消当前请求并重新领取, Transport 接口不增加慢速语义。

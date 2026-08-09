@@ -21,6 +21,7 @@ interface RelayTransaction {
 }
 
 const responseBodyFrameBytes = 128 * 1024
+const upstreamCacheTtlSeconds = 365 * 24 * 60 * 60
 const blockedRequestHeaders = new Set([
   'connection',
   'content-length',
@@ -144,6 +145,14 @@ function createTransportResponse(request: Request, ctx: ExecutionContext): Respo
       const headers = createUpstreamHeaders(head, clientHeaders)
       const response = await fetch(
         new Request(target, {
+          cf: {
+            cacheEverything: true,
+            cacheTtlByStatus: {
+              '200-299': upstreamCacheTtlSeconds,
+              '300-399': 0,
+              '400-599': -1,
+            },
+          },
           headers,
           method: head.method,
           redirect: 'follow',

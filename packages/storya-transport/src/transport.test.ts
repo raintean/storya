@@ -296,11 +296,11 @@ async function testWebSocketTransportStatistics(): Promise<void> {
   assert(statistics.successCount === 1, 'WebSocket transport 没有记录成功请求')
   assert(statistics.activeRequestCount === 0, 'WebSocket transport 成功后仍有活动统计')
   assert(statistics.responseBytes === 4, 'WebSocket transport 没有记录消费的响应字节')
-  assert(statistics.cacheHitCount === 1, 'WebSocket transport 没有记录上游缓存命中')
-  assert(statistics.cacheLabel === '上游缓存', 'WebSocket transport 缓存标签不明确')
+  assert(statistics.cacheHitCount === 1, 'WebSocket transport 没有记录 Worker Fetch 缓存命中')
+  assert(statistics.cacheLabel === 'Worker Fetch 缓存', 'WebSocket transport 缓存标签不明确')
   assert(
-    formatTransportStatistics(statistics).includes('上游缓存 HIT 1'),
-    'WebSocket transport 统计摘要没有标记上游缓存',
+    formatTransportStatistics(statistics).includes('Worker Fetch 缓存 HIT 1'),
+    'WebSocket transport 统计摘要没有标记 Worker Fetch 缓存',
   )
   transport.destroy()
 }

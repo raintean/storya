@@ -142,7 +142,7 @@ export class WebSocketHttpTransport implements HttpTransport {
   private readonly options: ResolvedOptions
   private readonly pending: PendingRequest[] = []
   private readonly statistics = new TransportStatistics('WebSocketHttpTransport', {
-    cacheLabel: '上游缓存',
+    cacheLabel: 'Worker Fetch 缓存',
   })
   private readonly url: string
 
