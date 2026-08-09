@@ -1119,7 +1119,55 @@ select:disabled {
   letter-spacing: 0.06em;
 }
 
-.loader-parameters > p {
+.rescue-parameters {
+  padding: 9px;
+  margin-top: 10px;
+  background: rgb(181 149 255 / 3%);
+  border: 1px solid rgb(181 149 255 / 17%);
+}
+
+.rescue-parameters[data-disabled='true'] .loader-parameter-grid,
+.rescue-parameters[data-disabled='true'] > p {
+  opacity: 0.42;
+}
+
+.rescue-parameters-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--mono);
+}
+
+.rescue-parameters-heading > span {
+  color: #8778ad;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+}
+
+.rescue-toggle {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  color: var(--violet);
+  cursor: pointer;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+}
+
+.rescue-toggle input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--violet);
+}
+
+.rescue-parameters[data-disabled='true'] .rescue-toggle {
+  color: #52625b;
+}
+
+.loader-parameters > p,
+.rescue-parameters > p {
   margin: 9px 0 0;
   color: #4f6158;
   font-family: var(--mono);

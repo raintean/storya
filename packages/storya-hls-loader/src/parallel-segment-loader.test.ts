@@ -26,6 +26,12 @@ const resources = new Map([
   ['https://example.com/segment-10.ts', new Uint8Array([90, 91, 92, 93, 94, 95, 96, 97])],
   ['https://example.com/segment-11.ts', new Uint8Array([100, 101, 102, 103, 104, 105])],
   ['https://example.com/segment-12.ts', new Uint8Array([110, 111, 112, 113, 114])],
+  [
+    'https://example.com/segment-13.ts',
+    new Uint8Array([
+      120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135,
+    ]),
+  ],
 ])
 const fetchCounts = new Map<string, number>()
 const requestMethods = new Map<string, string[]>()
@@ -33,6 +39,7 @@ const requestRanges = new Map<string, (string | null)[]>()
 let activeFetches = 0
 let maxActiveFetches = 0
 let prefetchBodyCanceled = false
+let slowBodyCanceled = false
 let stalledBodyCanceled = false
 
 globalThis.fetch = async input => {
@@ -168,6 +175,58 @@ globalThis.fetch = async input => {
         status: 206,
       })
     }
+    if (request.url.endsWith('segment-13.ts') && (range.start === 4 || range.start === 8)) {
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          if (timer !== undefined) {
+            globalThis.clearTimeout(timer)
+          }
+        },
+        start(controller) {
+          controller.enqueue(payload.slice(range.start, range.start + 1))
+          timer = globalThis.setTimeout(() => {
+            controller.enqueue(payload.slice(range.start + 1, range.endExclusive))
+            controller.close()
+          }, 10)
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
+    if (
+      request.url.endsWith('segment-13.ts') &&
+      range.start === 12 &&
+      rangeFetchCount(request.url, request.headers.get('range')) === 1
+    ) {
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          slowBodyCanceled = true
+          if (timer !== undefined) {
+            globalThis.clearTimeout(timer)
+          }
+        },
+        start(controller) {
+          controller.enqueue(payload.slice(range.start, range.start + 1))
+          timer = globalThis.setTimeout(() => {
+            controller.enqueue(payload.slice(range.start + 1, range.start + 2))
+          }, 25)
+        },
+      })
+      return new Response(body, {
+        headers: {
+          'content-range': `bytes ${range.start}-${range.endExclusive - 1}/${payload.byteLength}`,
+          etag: '"stable"',
+        },
+        status: 206,
+      })
+    }
     return new Response(payload.slice(range.start, range.endExclusive).buffer, {
       headers: {
         age: '3',
@@ -209,8 +268,12 @@ const firstFragment = createFragment(1)
 const firstContext = createContext(firstFragment)
 
 try {
-  if (owner.maxRescueAttempts !== 1) {
-    throw new Error('默认应只允许一次慢速补救')
+  if (
+    owner.rescue.maxAttempts !== 1 ||
+    owner.rescue.slowRateThresholdRatio !== 0.25 ||
+    owner.rescue.stallTimeoutMs !== 2_000
+  ) {
+    throw new Error('默认救援配置错误')
   }
   replaceWindow(owner, [firstFragment], config)
   const first = startLoad(owner, firstContext, config)
@@ -336,9 +399,12 @@ try {
 
   const rescueOwner = new ParallelSegmentLoader({
     chunkSize: 4,
-    idleTimeoutMs: 50,
     maxConcurrency: 2,
-    maxRescueAttempts: 1,
+    rescue: {
+      maxAttempts: 1,
+      slowRateThresholdRatio: 0,
+      stallTimeoutMs: 50,
+    },
   })
   try {
     const rescueFragment = createFragment(6)
@@ -360,6 +426,22 @@ try {
     if (rescuedSegment?.chunks[1]?.attempt !== 2 || rescuedSegment.loadedBytes !== 8) {
       throw new Error('Chunk 补救完成后诊断状态错误')
     }
+    const rescueStatistics = rescueOwner.getDiagnostics().rescue
+    const rescueEvent = rescueStatistics.recentEvents[0]
+    if (
+      rescueStatistics.totalEvents !== 1 ||
+      rescueStatistics.stallEvents !== 1 ||
+      rescueStatistics.slowEvents !== 0 ||
+      rescueStatistics.recoveredEvents !== 1 ||
+      rescueStatistics.pendingEvents !== 0 ||
+      rescueStatistics.discardedBytes !== 2 ||
+      rescueEvent?.reason !== 'stall' ||
+      rescueEvent.outcome !== 'recovered' ||
+      rescueEvent.attempt !== 1 ||
+      rescueEvent.discardedBytes !== 2
+    ) {
+      throw new Error('停滞救援应当记录原因、丢弃字节和恢复结果')
+    }
     rescued.loader.destroy()
   } finally {
     rescueOwner.destroy()
@@ -367,9 +449,8 @@ try {
 
   const rescueDisabledOwner = new ParallelSegmentLoader({
     chunkSize: 4,
-    idleTimeoutMs: 50,
     maxConcurrency: 1,
-    maxRescueAttempts: 0,
+    rescue: false,
   })
   try {
     const rescueDisabledFragment = createFragment(7)
@@ -377,11 +458,67 @@ try {
     const rescueDisabled = startLoad(rescueDisabledOwner, rescueDisabledContext, config)
     assertPayload(await rescueDisabled.promise, resources.get(rescueDisabledContext.url))
     if (fetchCount(rescueDisabledContext.url) !== 2) {
-      throw new Error('禁用 rescue 时不应因为 body idle 创建额外 Work')
+      throw new Error('禁用 rescue 时不应因为 body 停滞创建额外 Work')
+    }
+    if (rescueDisabledOwner.getDiagnostics().rescue.totalEvents !== 0) {
+      throw new Error('禁用 rescue 时不应产生救援统计')
     }
     rescueDisabled.loader.destroy()
   } finally {
     rescueDisabledOwner.destroy()
+  }
+
+  const maxAttemptsDisabledOwner = new ParallelSegmentLoader({ rescue: { maxAttempts: 0 } })
+  try {
+    if (maxAttemptsDisabledOwner.rescue.maxAttempts !== rescueDisabledOwner.rescue.maxAttempts) {
+      throw new Error('rescue: false 应等价于 maxAttempts 为 0')
+    }
+  } finally {
+    maxAttemptsDisabledOwner.destroy()
+  }
+
+  const slowRescueOwner = new ParallelSegmentLoader({
+    chunkSize: 4,
+    maxConcurrency: 3,
+    rescue: {
+      maxAttempts: 1,
+      slowRateThresholdRatio: 0.25,
+      stallTimeoutMs: 40,
+    },
+  })
+  try {
+    const slowFragment = createFragment(13)
+    const slowContext = createContext(slowFragment)
+    replaceWindow(slowRescueOwner, [slowFragment], config)
+    const slowLoad = startLoad(slowRescueOwner, slowContext, config)
+    assertPayload(await slowLoad.promise, resources.get(slowContext.url))
+    if (rangeFetchCount(slowContext.url, 'bytes=12-15') !== 2 || !slowBodyCanceled) {
+      throw new Error('明显慢于同期 GET 且重试预计更快的 Chunk 应取消并重新领取')
+    }
+    const slowSegment = slowRescueOwner.getDiagnostics().streams[0]?.segments[0]
+    if (slowSegment?.chunks[3]?.rescueAttempts !== 1) {
+      throw new Error('慢速补救次数没有写入 Chunk 诊断')
+    }
+    const slowStatistics = slowRescueOwner.getDiagnostics().rescue
+    const slowEvent = slowStatistics.recentEvents[0]
+    if (
+      slowStatistics.totalEvents !== 1 ||
+      slowStatistics.slowEvents !== 1 ||
+      slowStatistics.stallEvents !== 0 ||
+      slowStatistics.recoveredEvents !== 1 ||
+      slowEvent?.reason !== 'slow' ||
+      slowEvent.outcome !== 'recovered' ||
+      slowEvent.currentRate === undefined ||
+      slowEvent.peerMedianRate === undefined ||
+      slowEvent.peerCount !== 2 ||
+      slowEvent.continueEtaMs === undefined ||
+      slowEvent.retryEtaMs === undefined
+    ) {
+      throw new Error('慢速救援应当记录 peer 比较、ETA 和恢复结果')
+    }
+    slowLoad.loader.destroy()
+  } finally {
+    slowRescueOwner.destroy()
   }
 
   const nonPreemptiveOwner = new ParallelSegmentLoader({ chunkSize: 4, maxConcurrency: 2 })
@@ -600,6 +737,10 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
 
 function fetchCount(url: string): number {
   return fetchCounts.get(url) ?? 0
+}
+
+function rangeFetchCount(url: string, range: string | null): number {
+  return requestRanges.get(url)?.filter(value => value === range).length ?? 0
 }
 
 async function waitForCondition(predicate: () => boolean): Promise<void> {

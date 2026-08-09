@@ -7,26 +7,29 @@ import {
 } from './diagnostics'
 import { createStoryaFragmentLoader } from './fragment-loader'
 import { ParallelSegmentLoaderState } from './parallel-segment-loader-state'
+import { RescueTracker, type RescueEventRecord } from './rescue-tracker'
+import { TransferTracker, type TransferRateComparison } from './transfer-tracker'
+import type { VirtualStreamChunk } from './virtual-stream-chunk'
 
 export const DEFAULT_CHUNK_SIZE = 2 * 1024 * 1024
 export const DEFAULT_MAX_CONCURRENCY = 6
+export const DEFAULT_RESCUE_OPTIONS = Object.freeze({
+  maxAttempts: 1,
+  slowRateThresholdRatio: 0.25,
+  stallTimeoutMs: 2_000,
+})
 export const DEFAULT_WINDOW_SIZE = 6
 
-const defaultIdleTimeoutMs = 5_000
-const defaultMaxRescueAttempts = 1
-const maxTransferSamples = 64
-
-interface TransferSample {
-  bytes: number
-  completedAt: number
-  startedAt: number
+export interface ParallelSegmentLoaderRescueOptions {
+  maxAttempts?: number
+  slowRateThresholdRatio?: number
+  stallTimeoutMs?: number
 }
 
 export interface ParallelSegmentLoaderOptions {
   chunkSize?: number
-  idleTimeoutMs?: number
   maxConcurrency?: number
-  maxRescueAttempts?: number
+  rescue?: false | ParallelSegmentLoaderRescueOptions
   transport?: HttpTransport
   windowSize?: number
 }
@@ -36,34 +39,34 @@ export class ParallelSegmentLoader {
 
   readonly chunkSize: number
   readonly fLoader: FragmentLoaderConstructor
-  readonly idleTimeoutMs: number
   readonly maxConcurrency: number
-  readonly maxRescueAttempts: number
+  readonly rescue: Readonly<Required<ParallelSegmentLoaderRescueOptions>>
   readonly state: ParallelSegmentLoaderState
   readonly windowSize: number
 
-  private bandwidthEstimateValue = 0
   private config: HlsConfig | undefined
   private readonly listeners = new Set<() => void>()
   private notificationScheduled = false
+  private readonly rescueTracker = new RescueTracker()
   private readonly transport: HttpTransport
-  private readonly transferSamples: TransferSample[] = []
+  private readonly transferTracker: TransferTracker
   private updating = false
   private readonly workers: SegmentLoadWorker[]
 
   constructor(options: ParallelSegmentLoaderOptions = {}) {
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
-    this.idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
     this.maxConcurrency = options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY
-    this.maxRescueAttempts = options.maxRescueAttempts ?? defaultMaxRescueAttempts
+    this.rescue = resolveRescueOptions(options.rescue)
     this.windowSize = options.windowSize ?? DEFAULT_WINDOW_SIZE
     requirePositiveInteger(this.chunkSize, 'chunkSize')
-    requirePositiveInteger(this.idleTimeoutMs, 'idleTimeoutMs')
     requirePositiveInteger(this.maxConcurrency, 'maxConcurrency')
-    requireNonNegativeInteger(this.maxRescueAttempts, 'maxRescueAttempts')
+    requireNonNegativeInteger(this.rescue.maxAttempts, 'rescue.maxAttempts')
+    requireRatio(this.rescue.slowRateThresholdRatio, 'rescue.slowRateThresholdRatio')
+    requirePositiveInteger(this.rescue.stallTimeoutMs, 'rescue.stallTimeoutMs')
     requirePositiveInteger(this.windowSize, 'windowSize')
 
     this.state = new ParallelSegmentLoaderState()
+    this.transferTracker = new TransferTracker(this.rescue.stallTimeoutMs)
     this.transport = options.transport ?? new FetchHttpTransport()
     this.fLoader = createStoryaFragmentLoader(this)
     ParallelSegmentLoader.owners.set(this.fLoader, this)
@@ -93,7 +96,7 @@ export class ParallelSegmentLoader {
   }
 
   get bandwidthEstimate(): number {
-    return this.bandwidthEstimateValue
+    return this.transferTracker.bandwidthEstimate
   }
 
   configure(config: HlsConfig): void {
@@ -138,27 +141,42 @@ export class ParallelSegmentLoader {
     return createParallelSegmentLoaderDiagnostics(
       this.state,
       this.maxConcurrency,
-      this.bandwidthEstimateValue,
+      this.transferTracker.bandwidthEstimate,
+      this.rescueTracker.getDiagnostics(),
       this.workers.map(worker => worker.getDiagnostics()),
     )
   }
 
   recordTransfer(bytes: number, startedAt: number, completedAt: number): void {
-    if (
-      !Number.isSafeInteger(bytes) ||
-      bytes <= 0 ||
-      !Number.isFinite(startedAt) ||
-      !Number.isFinite(completedAt) ||
-      completedAt <= startedAt
-    ) {
-      return
-    }
+    this.transferTracker.recordCompletedTransfer(bytes, startedAt, completedAt)
+  }
 
-    this.transferSamples.push({ bytes, completedAt, startedAt })
-    if (this.transferSamples.length > maxTransferSamples) {
-      this.transferSamples.splice(0, this.transferSamples.length - maxTransferSamples)
-    }
-    this.bandwidthEstimateValue = estimateBandwidth(this.transferSamples)
+  startTransfer(generation: number, startedAt: number): void {
+    this.transferTracker.start(generation, startedAt)
+  }
+
+  startTransferBody(generation: number, startedAt: number): void {
+    this.transferTracker.startBody(generation, startedAt)
+  }
+
+  recordTransferProgress(generation: number, bytes: number, recordedAt: number): void {
+    this.transferTracker.recordProgress(generation, bytes, recordedAt)
+  }
+
+  finishTransfer(generation: number, completedAt: number, bodyCompleted: boolean): void {
+    this.transferTracker.finish(generation, completedAt, bodyCompleted)
+  }
+
+  compareTransferRate(generation: number, now: number): TransferRateComparison | undefined {
+    return this.transferTracker.compareWithPeers(generation, now)
+  }
+
+  recordRescue(chunk: VirtualStreamChunk, event: RescueEventRecord): void {
+    this.rescueTracker.record(chunk, event)
+  }
+
+  markRescueRecovered(chunk: VirtualStreamChunk): void {
+    this.rescueTracker.markRecovered(chunk)
   }
 
   destroy(): void {
@@ -215,34 +233,17 @@ function requireNonNegativeInteger(value: number, name: string): void {
   }
 }
 
-function estimateBandwidth(samples: readonly TransferSample[]): number {
-  // 并行 GET 的字节全部计入, 但重叠的活跃时间只计算一次
-  const sorted = [...samples].sort(
-    (left, right) => left.startedAt - right.startedAt || left.completedAt - right.completedAt,
-  )
-  let activeStartedAt: number | undefined
-  let activeCompletedAt = 0
-  let activeDuration = 0
-  let bytes = 0
-
-  for (const sample of sorted) {
-    bytes += sample.bytes
-    if (activeStartedAt === undefined) {
-      activeStartedAt = sample.startedAt
-      activeCompletedAt = sample.completedAt
-      continue
-    }
-    if (sample.startedAt > activeCompletedAt) {
-      activeDuration += activeCompletedAt - activeStartedAt
-      activeStartedAt = sample.startedAt
-      activeCompletedAt = sample.completedAt
-      continue
-    }
-    activeCompletedAt = Math.max(activeCompletedAt, sample.completedAt)
+function requireRatio(value: number, name: string): void {
+  if (!Number.isFinite(value) || value < 0 || value >= 1) {
+    throw new Error(`${name} 必须是大于等于 0 且小于 1 的有限数值`)
   }
+}
 
-  if (activeStartedAt !== undefined) {
-    activeDuration += activeCompletedAt - activeStartedAt
-  }
-  return activeDuration > 0 ? (bytes * 8 * 1000) / activeDuration : 0
+function resolveRescueOptions(
+  options: false | ParallelSegmentLoaderRescueOptions | undefined,
+): Readonly<Required<ParallelSegmentLoaderRescueOptions>> {
+  return Object.freeze({
+    ...DEFAULT_RESCUE_OPTIONS,
+    ...(options === false ? { maxAttempts: 0 } : options),
+  })
 }

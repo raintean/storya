@@ -4,6 +4,7 @@ import type { FormEvent } from 'react'
 import {
   DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CONCURRENCY,
+  DEFAULT_RESCUE_OPTIONS,
   DEFAULT_WINDOW_SIZE,
   ParallelAudioStreamController,
   ParallelSegmentLoader,
@@ -51,17 +52,24 @@ interface LogEntryOptions {
 
 interface LoaderParameterInputs {
   chunkSizeMiB: string
-  idleTimeoutMs: string
   maxConcurrency: string
-  maxRescueAttempts: string
+  rescueEnabled: boolean
+  rescueMaxAttempts: string
+  slowRateThresholdPercent: string
+  stallTimeoutMs: string
   windowSize: string
 }
 
 interface LoaderParameters {
   chunkSize: number
-  idleTimeoutMs: number
   maxConcurrency: number
-  maxRescueAttempts: number
+  rescue:
+    | false
+    | {
+        maxAttempts: number
+        slowRateThresholdRatio: number
+        stallTimeoutMs: number
+      }
   windowSize: number
 }
 
@@ -93,9 +101,11 @@ const websocketMinIdleConnections = 6
 
 const defaultLoaderParameterInputs: LoaderParameterInputs = {
   chunkSizeMiB: String(DEFAULT_CHUNK_SIZE / (1024 * 1024)),
-  idleTimeoutMs: '5000',
   maxConcurrency: String(DEFAULT_MAX_CONCURRENCY),
-  maxRescueAttempts: '1',
+  rescueEnabled: true,
+  rescueMaxAttempts: String(DEFAULT_RESCUE_OPTIONS.maxAttempts),
+  slowRateThresholdPercent: String(DEFAULT_RESCUE_OPTIONS.slowRateThresholdRatio * 100),
+  stallTimeoutMs: String(DEFAULT_RESCUE_OPTIONS.stallTimeoutMs),
   windowSize: String(DEFAULT_WINDOW_SIZE),
 }
 
@@ -118,6 +128,15 @@ const emptyDiagnostics: ParallelSegmentLoaderDiagnostics = {
   destroyed: false,
   maxConcurrency: DEFAULT_MAX_CONCURRENCY,
   revision: 0,
+  rescue: {
+    discardedBytes: 0,
+    pendingEvents: 0,
+    recentEvents: [],
+    recoveredEvents: 0,
+    slowEvents: 0,
+    stallEvents: 0,
+    totalEvents: 0,
+  },
   streams: [],
   timestamp: 0,
   workers: [],
@@ -129,6 +148,7 @@ export function App() {
   const parallelLoaderRef = useRef<ParallelSegmentLoader | null>(null)
   const logIdRef = useRef(0)
   const playbackLevelIndexRef = useRef(-1)
+  const rescueEventOutcomesRef = useRef(new Map<number, 'pending' | 'recovered'>())
   const [loaderMode, setLoaderMode] = useState<LoaderMode>('parallel')
   const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
   const [workerUrl, setWorkerUrl] = useState('')
@@ -182,12 +202,54 @@ export function App() {
 
       const parallelLoader = parallelLoaderRef.current
       if (parallelLoader !== null) {
-        setDiagnostics(parallelLoader.getDiagnostics())
+        const snapshot = parallelLoader.getDiagnostics()
+        setDiagnostics(snapshot)
+        const nextOutcomes = new Map<number, 'pending' | 'recovered'>()
+        for (const event of snapshot.rescue.recentEvents) {
+          const previousOutcome = rescueEventOutcomesRef.current.get(event.id)
+          nextOutcomes.set(event.id, event.outcome)
+          if (previousOutcome === undefined) {
+            const details: LogEntryDetail[] = [
+              { label: 'Chunk', value: event.chunkKey },
+              { label: 'Attempt', value: String(event.attempt) },
+              { label: '已丢弃', value: formatBytes(event.discardedBytes) },
+              { label: '触发耗时', value: `${event.elapsedMs.toFixed(0)} ms` },
+              { label: '结果', value: event.outcome === 'recovered' ? '已恢复' : '重试中' },
+            ]
+            if (
+              event.reason === 'slow' &&
+              event.currentRate !== undefined &&
+              event.peerMedianRate !== undefined
+            ) {
+              details.push(
+                { label: '当前速率', value: formatBandwidth(event.currentRate * 8) },
+                { label: 'Peer 中位数', value: formatBandwidth(event.peerMedianRate * 8) },
+                { label: 'Peer 数量', value: String(event.peerCount ?? 0) },
+              )
+              if (event.continueEtaMs !== undefined && event.retryEtaMs !== undefined) {
+                details.push(
+                  { label: '继续 ETA', value: `${event.continueEtaMs.toFixed(0)} ms` },
+                  { label: '重试 ETA', value: `${event.retryEtaMs.toFixed(0)} ms` },
+                )
+              }
+            }
+            appendLog(
+              event.reason === 'stall'
+                ? 'Chunk 停滞, 已取消并重试'
+                : 'Chunk 相对慢速, 已取消并重试',
+              'rescued',
+              { details, tag: '救援' },
+            )
+          } else if (previousOutcome === 'pending' && event.outcome === 'recovered') {
+            appendLog(`Chunk ${event.chunkKey} 救援后恢复`, 'success', { tag: '救援完成' })
+          }
+        }
+        rescueEventOutcomesRef.current = nextOutcomes
       }
     }, 180)
 
     return () => window.clearInterval(timer)
-  }, [])
+  }, [appendLog])
 
   const destroyPlaybackSession = useCallback(() => {
     const hls = hlsRef.current
@@ -232,6 +294,7 @@ export function App() {
       setMetrics(initialMetrics)
       setFrontier(initialFrontier)
       setDiagnostics(emptyDiagnostics)
+      rescueEventOutcomesRef.current = new Map()
       setActiveLoaderMode(null)
       setActiveTransportMode(null)
       setActiveLoaderParameters(null)
@@ -417,8 +480,12 @@ export function App() {
           { tag: '加载器' },
         )
         if (loaderParameters !== null) {
+          const rescueSummary =
+            loaderParameters.rescue === false
+              ? 'rescue 关闭'
+              : `rescue ${String(loaderParameters.rescue.maxAttempts)} 次, 停滞 ${String(loaderParameters.rescue.stallTimeoutMs)} ms, 慢速阈值 ${formatPercent(loaderParameters.rescue.slowRateThresholdRatio)}`
           appendLog(
-            `窗口 ${String(loaderParameters.windowSize)} 个 Segment, Chunk ${formatBytes(loaderParameters.chunkSize)}, rescue ${String(loaderParameters.maxRescueAttempts)} 次`,
+            `窗口 ${String(loaderParameters.windowSize)} 个 Segment, Chunk ${formatBytes(loaderParameters.chunkSize)}, ${rescueSummary}`,
             'default',
             { tag: '调度策略' },
           )
@@ -485,7 +552,10 @@ export function App() {
     }
   }
 
-  const handleLoaderParameterChange = (name: keyof LoaderParameterInputs, value: string) => {
+  const handleLoaderParameterChange = <Name extends keyof LoaderParameterInputs>(
+    name: Name,
+    value: LoaderParameterInputs[Name],
+  ) => {
     setLoaderParameterInputs(current => ({ ...current, [name]: value }))
   }
 
@@ -811,46 +881,93 @@ export function App() {
                         <small>MiB</small>
                       </div>
                     </label>
-                    <label className="loader-parameter" htmlFor="idle-timeout">
-                      <span>SLOW DETECT</span>
-                      <div>
-                        <input
-                          id="idle-timeout"
-                          form="stream-source-form"
-                          type="number"
-                          min="100"
-                          max="60000"
-                          step="100"
-                          value={loaderParameterInputs.idleTimeoutMs}
-                          onChange={event =>
-                            handleLoaderParameterChange('idleTimeoutMs', event.target.value)
-                          }
-                          required
-                        />
-                        <small>MS</small>
-                      </div>
-                    </label>
-                    <label className="loader-parameter is-wide" htmlFor="max-rescue-attempts">
-                      <span>RESCUE LIMIT</span>
-                      <div>
-                        <input
-                          id="max-rescue-attempts"
-                          form="stream-source-form"
-                          type="number"
-                          min="0"
-                          max="10"
-                          step="1"
-                          value={loaderParameterInputs.maxRescueAttempts}
-                          onChange={event =>
-                            handleLoaderParameterChange('maxRescueAttempts', event.target.value)
-                          }
-                          required
-                        />
-                        <small>TRY</small>
-                      </div>
-                    </label>
                   </div>
-                  <p>参数在下一次加载会话生效. RESCUE 设为 0 会关闭慢速补救.</p>
+                  <div
+                    className="rescue-parameters"
+                    data-disabled={!loaderParameterInputs.rescueEnabled}
+                  >
+                    <div className="rescue-parameters-heading">
+                      <span>REQUEST RESCUE</span>
+                      <label className="rescue-toggle">
+                        <input
+                          form="stream-source-form"
+                          type="checkbox"
+                          checked={loaderParameterInputs.rescueEnabled}
+                          onChange={event =>
+                            handleLoaderParameterChange('rescueEnabled', event.target.checked)
+                          }
+                        />
+                        <span>{loaderParameterInputs.rescueEnabled ? 'ENABLED' : 'DISABLED'}</span>
+                      </label>
+                    </div>
+                    <div className="loader-parameter-grid">
+                      <label className="loader-parameter" htmlFor="stall-timeout">
+                        <span>STALL TIMEOUT</span>
+                        <div>
+                          <input
+                            id="stall-timeout"
+                            form="stream-source-form"
+                            type="number"
+                            min="100"
+                            max="60000"
+                            step="100"
+                            value={loaderParameterInputs.stallTimeoutMs}
+                            onChange={event =>
+                              handleLoaderParameterChange('stallTimeoutMs', event.target.value)
+                            }
+                            disabled={!loaderParameterInputs.rescueEnabled}
+                            required={loaderParameterInputs.rescueEnabled}
+                          />
+                          <small>MS</small>
+                        </div>
+                      </label>
+                      <label className="loader-parameter" htmlFor="slow-rate-threshold">
+                        <span>SLOW THRESHOLD</span>
+                        <div>
+                          <input
+                            id="slow-rate-threshold"
+                            form="stream-source-form"
+                            type="number"
+                            min="0"
+                            max="99"
+                            step="1"
+                            value={loaderParameterInputs.slowRateThresholdPercent}
+                            onChange={event =>
+                              handleLoaderParameterChange(
+                                'slowRateThresholdPercent',
+                                event.target.value,
+                              )
+                            }
+                            disabled={!loaderParameterInputs.rescueEnabled}
+                            required={loaderParameterInputs.rescueEnabled}
+                          />
+                          <small>% PEER</small>
+                        </div>
+                      </label>
+                      <label className="loader-parameter is-wide" htmlFor="max-rescue-attempts">
+                        <span>RESCUE LIMIT</span>
+                        <div>
+                          <input
+                            id="max-rescue-attempts"
+                            form="stream-source-form"
+                            type="number"
+                            min="1"
+                            max="10"
+                            step="1"
+                            value={loaderParameterInputs.rescueMaxAttempts}
+                            onChange={event =>
+                              handleLoaderParameterChange('rescueMaxAttempts', event.target.value)
+                            }
+                            disabled={!loaderParameterInputs.rescueEnabled}
+                            required={loaderParameterInputs.rescueEnabled}
+                          />
+                          <small>TRY</small>
+                        </div>
+                      </label>
+                    </div>
+                    <p>停滞表示连续无数据. 慢速阈值相对于同期 GET 中位速率, 设为 0 只检测停滞.</p>
+                  </div>
+                  <p>参数在下一次加载会话生效.</p>
                 </div>
               ) : null}
               <dl className="runtime-facts">
@@ -887,11 +1004,23 @@ export function App() {
                   </dd>
                 </div>
                 <div>
-                  <dt>SLOW DETECTOR</dt>
+                  <dt>STALL TIMEOUT</dt>
                   <dd>
                     {activeLoaderParameters === null
                       ? '—'
-                      : `${String(activeLoaderParameters.idleTimeoutMs)} ms`}
+                      : activeLoaderParameters.rescue === false
+                        ? 'OFF'
+                        : `${String(activeLoaderParameters.rescue.stallTimeoutMs)} ms`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>SLOW THRESHOLD</dt>
+                  <dd>
+                    {activeLoaderParameters === null
+                      ? '—'
+                      : activeLoaderParameters.rescue === false
+                        ? 'OFF'
+                        : formatPercent(activeLoaderParameters.rescue.slowRateThresholdRatio)}
                   </dd>
                 </div>
                 <div>
@@ -899,10 +1028,27 @@ export function App() {
                   <dd>
                     {activeLoaderParameters === null
                       ? '—'
-                      : activeLoaderParameters.maxRescueAttempts === 0
+                      : activeLoaderParameters.rescue === false
                         ? 'OFF'
-                        : `${String(activeLoaderParameters.maxRescueAttempts)} attempts`}
+                        : `${String(activeLoaderParameters.rescue.maxAttempts)} attempts`}
                   </dd>
+                </div>
+                <div>
+                  <dt>RESCUE EVENTS</dt>
+                  <dd>
+                    {diagnostics.rescue.totalEvents} total · {diagnostics.rescue.recoveredEvents}{' '}
+                    recovered
+                  </dd>
+                </div>
+                <div>
+                  <dt>RESCUE REASONS</dt>
+                  <dd>
+                    {diagnostics.rescue.stallEvents} stall · {diagnostics.rescue.slowEvents} slow
+                  </dd>
+                </div>
+                <div>
+                  <dt>DISCARDED BODY</dt>
+                  <dd>{formatBytes(diagnostics.rescue.discardedBytes)}</dd>
                 </div>
                 <div>
                   <dt>REGISTRY REVISION</dt>
@@ -924,7 +1070,8 @@ export function App() {
                 <span data-tone="success">Chunk {readyChunks}</span>
                 <span data-tone="preempted">填充 {fillingChunks}</span>
                 <span data-tone="error">失败 {failedChunks}</span>
-                <span data-tone="rescued">请求 {diagnostics.activeRequests}</span>
+                <span data-tone="rescued">救援 {diagnostics.rescue.totalEvents}</span>
+                <span data-tone="preempted">请求 {diagnostics.activeRequests}</span>
                 <button
                   type="button"
                   disabled={logs.length === 0}
@@ -1109,6 +1256,10 @@ function formatLoaderMode(mode: LoaderMode | null): string {
   return mode === 'parallel' ? 'Parallel Range' : 'hls.js Native'
 }
 
+function formatPercent(ratio: number): string {
+  return `${(ratio * 100).toFixed(0)}% peer median`
+}
+
 function hasActiveReader(stream: ParallelSegmentLoaderDiagnostics['streams'][number]): boolean {
   return stream.segments.some(segment => segment.readerCount > 0)
 }
@@ -1117,8 +1268,9 @@ function parseLoaderParameters(inputs: LoaderParameterInputs): LoaderParameters 
   const windowSize = Number(inputs.windowSize)
   const maxConcurrency = Number(inputs.maxConcurrency)
   const chunkSizeMiB = Number(inputs.chunkSizeMiB)
-  const idleTimeoutMs = Number(inputs.idleTimeoutMs)
-  const maxRescueAttempts = Number(inputs.maxRescueAttempts)
+  const rescueMaxAttempts = Number(inputs.rescueMaxAttempts)
+  const slowRateThresholdPercent = Number(inputs.slowRateThresholdPercent)
+  const stallTimeoutMs = Number(inputs.stallTimeoutMs)
 
   if (!Number.isSafeInteger(windowSize) || windowSize < 1 || windowSize > 24) {
     throw new Error('预加载窗口必须是 1 到 24 之间的整数')
@@ -1134,18 +1286,37 @@ function parseLoaderParameters(inputs: LoaderParameterInputs): LoaderParameters 
   ) {
     throw new Error('Chunk 大小必须是 0.25 到 16 MiB, 步长为 0.25 MiB')
   }
-  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 100 || idleTimeoutMs > 60_000) {
-    throw new Error('慢速检测时间必须是 100 到 60000 ms 之间的整数')
+  if (
+    inputs.rescueEnabled &&
+    (!Number.isSafeInteger(stallTimeoutMs) || stallTimeoutMs < 100 || stallTimeoutMs > 60_000)
+  ) {
+    throw new Error('停滞检测时间必须是 100 到 60000 ms 之间的整数')
   }
-  if (!Number.isSafeInteger(maxRescueAttempts) || maxRescueAttempts < 0 || maxRescueAttempts > 10) {
-    throw new Error('Rescue 次数必须是 0 到 10 之间的整数')
+  if (
+    inputs.rescueEnabled &&
+    (!Number.isSafeInteger(slowRateThresholdPercent) ||
+      slowRateThresholdPercent < 0 ||
+      slowRateThresholdPercent >= 100)
+  ) {
+    throw new Error('慢速阈值必须是 0 到 99 之间的整数百分比')
+  }
+  if (
+    inputs.rescueEnabled &&
+    (!Number.isSafeInteger(rescueMaxAttempts) || rescueMaxAttempts < 1 || rescueMaxAttempts > 10)
+  ) {
+    throw new Error('Rescue 次数必须是 1 到 10 之间的整数')
   }
 
   return {
     chunkSize: Math.round(chunkSizeMiB * 1024 * 1024),
-    idleTimeoutMs,
     maxConcurrency,
-    maxRescueAttempts,
+    rescue: inputs.rescueEnabled
+      ? {
+          maxAttempts: rescueMaxAttempts,
+          slowRateThresholdRatio: slowRateThresholdPercent / 100,
+          stallTimeoutMs,
+        }
+      : false,
     windowSize,
   }
 }

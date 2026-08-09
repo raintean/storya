@@ -36,7 +36,7 @@ interface HttpTransport {
 }
 ```
 
-Fetch、Proxy 和 WebSocket Transport 都返回流式 response。Transport 不暴露加载器调度策略；窗口失效、超时和停滞补救由 Loader 通过标准 `Request.signal` 与 `ReadableStream.cancel()` 表达。
+Fetch、Proxy 和 WebSocket Transport 都返回流式 response。Transport 不暴露加载器调度策略；窗口失效、超时、停滞和相对慢速补救由 Loader 通过标准 `Request.signal` 与 `ReadableStream.cancel()` 表达。
 
 ## HTTP Proxy Transport
 
@@ -92,7 +92,7 @@ WebSocket Transport 收到 `RESPONSE_HEAD` 后立即返回 `HttpTransportRespons
 
 Fetch、Proxy 和 WebSocket 对 HLS Loader 统一表现为流式 Transport。HEAD 与 GET 共用 `SegmentLoadWorker` 固定并发池。`SegmentFetchWork` 使用 `ReadableStreamDefaultReader` 逐段读取 GET body, 实时更新 Chunk 已接收字节。两种 Work 都通过 Request AbortSignal 表达窗口取消和请求超时; response head 已返回的 GET 还会使用 body cancel。调度优先级只影响空闲 Worker 的下一次领取, 不取消已经发出的有效请求。
 
-连续无数据或请求超时由 `SegmentFetchWork` 结束当前 attempt 并把 Chunk 恢复为可调度状态, 后续重新领取属于 `SegmentLoadWorker` 的调度, 两者都不属于 `FetchHttpTransport`。Transport 仍然只负责把 Fetch response 原样暴露为统一流接口。基于历史吞吐判断“持续有数据但明显过慢”的补救尚未迁移。
+连续无数据、相对同期 GET 明显过慢或请求超时由 `SegmentFetchWork` 结束当前 attempt; rescue 会把 Chunk 恢复为可调度状态, 后续重新领取属于 `SegmentLoadWorker` 的调度, 不属于 `FetchHttpTransport`。Transport 仍然只负责把 Fetch response 原样暴露为统一流接口。
 
 ## 响应上限
 
@@ -108,7 +108,7 @@ HEAD 的 body 必须为空。当前生产 Chunk 默认为 2 MiB，因此正常�
 
 ## 取消与超时
 
-`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。Chunk 仍有 rescue 次数时, GET body 连续 5 秒没有数据会触发补救; 次数耗尽或 `maxRescueAttempts = 0` 时不安装这项额外慢速检测。
+`SegmentPlanningWork` 和 `SegmentFetchWork` 决定何时结束当前请求, 不把 HLS 超时或“慢连接”概念传给 Transport。Work 中止请求时触发 `Request.signal`; GET response head 已经到达后停止读取时还会取消 `ReadableStream`。当前响应头和完整请求时限来自 hls.js `fragLoadPolicy`。默认 rescue 在 GET body 连续 2 秒没有数据时判定停滞; 已经观察满同一窗口、具有至少 2 个同期 peer 的请求如果低于 peer 中位速率的 25%, 且重新请求预计更早完成, 也会触发相同的取消和重新领取流程。`rescue: false` 或次数耗尽时不安装这些检测。
 
 WebSocket Transport 把这两种标准取消入口映射为当前 sequence 的 `CANCEL`。Worker 先清空活动事务，再取消 pending BYOB read 并 Abort 上游 Fetch，随后回复 `CANCELED`。客户端只有收到 `CANCELED` 后才把连接恢复为 idle；确认超时会关闭连接，避免未收敛事务被错误复用。取消确认超时由调用方通过 `cancelTimeoutMs` 配置。
 
@@ -158,10 +158,11 @@ Edge Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/re
 
 ## 实现状态
 
-Fetch、Proxy、WebSocket Transport、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。新 `ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/空闲/完整请求超时和停滞补救; 基于历史吞吐的慢速补救尚未迁移。
+Fetch、Proxy、WebSocket Transport、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
 
 ## 修改历史
 
+- 2026-08-09: Loader 的 rescue 检测改为可关闭的统一策略; body 连续 2 秒无数据判定停滞, 持续有数据但明显低于同期 GET 中位速率且重试预计更快时也取消当前请求并重新领取, Transport 接口不增加慢速语义。
 - 2026-08-08: 新 Loader 改为逐段读取统一 Transport response body, 恢复响应头、流量空闲和完整请求超时; 停滞 Chunk 由 Loader 取消并重新领取, 不向 Fetch Transport 引入调度状态。
 - 2026-08-08: 新 `ParallelSegmentLoader` 接回统一 `HttpTransport`, 默认 Fetch, example 恢复 Fetch、HTTP Proxy 和 WebSocket relay 选择; 慢速补救明确为尚未迁移。
 - 2026-08-07: WebSocket relay 恢复流式 response 和 CANCEL；控制消息使用 Protobuf，body 使用 128 KiB 原始 frame；删除 `responseMode`，Loader 对所有 Transport 统一启用首字节、流量空闲和慢速补救。继续保留单连接串行 Keep-Alive、现有连接池策略，不恢复心跳和最大连接寿命。

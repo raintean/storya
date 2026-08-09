@@ -2,6 +2,7 @@ import type { FragmentLoaderContext } from 'hls.js'
 import type { HttpTransport, HttpTransportResponse } from 'storya-transport'
 import type { ParallelSegmentLoader } from './parallel-segment-loader'
 import type { ParallelSegmentLoaderState } from './parallel-segment-loader-state'
+import type { RescueEventRecord, RescueReason } from './rescue-tracker'
 import type { VirtualStreamChunk } from './virtual-stream-chunk'
 import type { SegmentLoadFailure, VirtualStreamSegment } from './virtual-stream-segment'
 
@@ -14,9 +15,9 @@ export interface SegmentFetchWorkOptions {
   rangeEnabled: boolean
   requestEnd: number | undefined
   requestStart: number
+  rescueEnabled: boolean
   resourceLength: number | undefined
   segmentKey: string
-  slowRescueEnabled: boolean
   startedAt: number
   streamId: string
   transport: HttpTransport
@@ -28,6 +29,11 @@ interface SegmentFetchResult {
   response: Response
   url: string
 }
+
+type DetectedRescue = Omit<
+  RescueEventRecord,
+  'attempt' | 'chunkKey' | 'generation' | 'segmentKey' | 'streamId'
+>
 
 export class SegmentFetchWork {
   readonly chunkKey: string
@@ -46,11 +52,12 @@ export class SegmentFetchWork {
   private readonly planning: boolean
   private readonly rangeEnabled: boolean
   private receivedBytes = 0
+  private detectedRescue: DetectedRescue | undefined
+  private readonly rescueEnabled: boolean
   private readonly resourceLength: number | undefined
-  private readonly slowRescueEnabled: boolean
   private started = false
   private readonly transport: HttpTransport
-  private transferCompletedAt: number | undefined
+  private transferFinished = false
 
   constructor(options: SegmentFetchWorkOptions) {
     this.chunkKey = options.chunkKey
@@ -61,9 +68,9 @@ export class SegmentFetchWork {
     this.rangeEnabled = options.rangeEnabled
     this.requestEnd = options.requestEnd
     this.requestStart = options.requestStart
+    this.rescueEnabled = options.rescueEnabled
     this.resourceLength = options.resourceLength
     this.segmentKey = options.segmentKey
-    this.slowRescueEnabled = options.slowRescueEnabled
     this.startedAt = options.startedAt
     this.streamId = options.streamId
     this.transport = options.transport
@@ -74,17 +81,17 @@ export class SegmentFetchWork {
       throw new Error('SegmentFetchWork 只能执行一次')
     }
     this.started = true
+    this.loader.startTransfer(this.generation, this.startedAt)
     try {
       const result = await this.fetchChunk()
       this.completeChunk(result)
     } catch (cause) {
       this.finishFailedAttempt(cause)
     } finally {
-      this.loader.recordTransfer(
-        this.receivedBytes,
-        this.startedAt,
-        this.transferCompletedAt ?? performance.now(),
-      )
+      if (!this.transferFinished) {
+        this.loader.finishTransfer(this.generation, performance.now(), false)
+        this.transferFinished = true
+      }
     }
   }
 
@@ -189,24 +196,67 @@ export class SegmentFetchWork {
 
   private async readResponseBody(response: HttpTransportResponse): Promise<Uint8Array> {
     const parts: Uint8Array[] = []
-    let idleTimer: ReturnType<typeof globalThis.setTimeout> | undefined
-    const resetIdleTimer = () => {
-      if (!this.slowRescueEnabled) {
+    const bodyStartedAt = performance.now()
+    const expectedBytes = resolveExpectedResponseBytes(
+      response.headers,
+      this.requestStart,
+      this.requestEnd,
+      this.resourceLength,
+    )
+    this.loader.startTransferBody(this.generation, bodyStartedAt)
+    let slowTimer: ReturnType<typeof globalThis.setInterval> | undefined
+    let stallTimer: ReturnType<typeof globalThis.setTimeout> | undefined
+    const resetStallTimer = () => {
+      if (!this.rescueEnabled) {
         return
       }
-      if (idleTimer !== undefined) {
-        globalThis.clearTimeout(idleTimer)
+      if (stallTimer !== undefined) {
+        globalThis.clearTimeout(stallTimer)
       }
-      idleTimer = globalThis.setTimeout(() => {
-        if (!this.controller.signal.aborted) {
-          this.controller.abort(
-            new DOMException(
-              `Chunk 连续 ${this.loader.idleTimeoutMs}ms 没有收到数据`,
-              'RescueError',
-            ),
-          )
-        }
-      }, this.loader.idleTimeoutMs)
+      stallTimer = globalThis.setTimeout(() => {
+        this.abortForRescue(
+          'stall',
+          `Chunk 连续 ${this.loader.rescue.stallTimeoutMs}ms 没有收到数据`,
+        )
+      }, this.loader.rescue.stallTimeoutMs)
+    }
+    const checkSlowTransfer = () => {
+      if (
+        this.controller.signal.aborted ||
+        expectedBytes === undefined ||
+        this.receivedBytes <= 0 ||
+        this.receivedBytes >= expectedBytes
+      ) {
+        return
+      }
+      const comparison = this.loader.compareTransferRate(this.generation, performance.now())
+      if (
+        comparison === undefined ||
+        comparison.currentRate >=
+          comparison.peerMedianRate * this.loader.rescue.slowRateThresholdRatio
+      ) {
+        return
+      }
+      const remainingBytes = expectedBytes - this.receivedBytes
+      const continueEtaMs = (remainingBytes * 1000) / comparison.currentRate
+      const retryEtaMs =
+        (expectedBytes * 1000) / comparison.peerMedianRate + comparison.peerMedianTtfbMs
+      if (continueEtaMs <= retryEtaMs) {
+        return
+      }
+      this.abortForRescue(
+        'slow',
+        `Chunk 当前速率为同期 GET 中位速率的 ${formatRateRatio(
+          comparison.currentRate / comparison.peerMedianRate,
+        )}, 预计重新请求更快`,
+        {
+          continueEtaMs,
+          currentRate: comparison.currentRate,
+          peerCount: comparison.peerCount,
+          peerMedianRate: comparison.peerMedianRate,
+          retryEtaMs,
+        },
+      )
     }
     const accept = (data: Uint8Array) => {
       if (data.byteLength === 0 || this.controller.signal.aborted) {
@@ -215,11 +265,20 @@ export class SegmentFetchWork {
       const owned = data.slice()
       parts.push(owned)
       this.receivedBytes += owned.byteLength
+      this.loader.recordTransferProgress(this.generation, owned.byteLength, performance.now())
       this.updateChunkProgress(this.receivedBytes)
-      resetIdleTimer()
+      resetStallTimer()
     }
 
-    resetIdleTimer()
+    resetStallTimer()
+    if (
+      this.rescueEnabled &&
+      expectedBytes !== undefined &&
+      this.loader.rescue.slowRateThresholdRatio > 0
+    ) {
+      const intervalMs = Math.max(1, Math.min(250, this.loader.rescue.stallTimeoutMs / 4))
+      slowTimer = globalThis.setInterval(checkSlowTransfer, intervalMs)
+    }
     try {
       if (response.body === null) {
         accept(new Uint8Array(await response.arrayBuffer()))
@@ -246,11 +305,16 @@ export class SegmentFetchWork {
         }
       }
     } finally {
-      if (idleTimer !== undefined) {
-        globalThis.clearTimeout(idleTimer)
+      if (slowTimer !== undefined) {
+        globalThis.clearInterval(slowTimer)
+      }
+      if (stallTimer !== undefined) {
+        globalThis.clearTimeout(stallTimer)
       }
     }
-    this.transferCompletedAt = performance.now()
+    const transferCompletedAt = performance.now()
+    this.loader.finishTransfer(this.generation, transferCompletedAt, true)
+    this.transferFinished = true
 
     const data = new Uint8Array(this.receivedBytes)
     let offset = 0
@@ -470,7 +534,9 @@ export class SegmentFetchWork {
         segment.chunks.splice(0, segment.chunks.length, chunk)
         chunk.endExclusive = result.data.byteLength
         chunk.rangeEnabled = false
-        chunk.complete(this.generation, completion)
+        if (chunk.complete(this.generation, completion)) {
+          this.loader.markRescueRecovered(chunk)
+        }
         if (!segment.assemble(completedAt)) {
           segment.fail(createFailure('Segment Chunk 没有覆盖完整数据'), completedAt)
         }
@@ -564,7 +630,9 @@ export class SegmentFetchWork {
         return undefined
       }
       segment.verifyRange()
-      chunk.complete(this.generation, completion)
+      if (chunk.complete(this.generation, completion)) {
+        this.loader.markRescueRecovered(chunk)
+      }
       if (
         !segment.assemble(completedAt) &&
         segment.chunks.every(item => item.phase.type === 'ready')
@@ -609,8 +677,21 @@ export class SegmentFetchWork {
 
       const reason = this.controller.signal.reason
       if (
-        chunk.rescue(this.generation, reason instanceof Error ? reason.message : 'Chunk 请求超时')
+        chunk.rescue(
+          this.generation,
+          reason instanceof Error ? reason.message : 'Chunk 请求需要补救',
+        )
       ) {
+        if (this.detectedRescue !== undefined) {
+          this.loader.recordRescue(chunk, {
+            ...this.detectedRescue,
+            attempt: chunk.attempt,
+            chunkKey: this.chunkKey,
+            generation: this.generation,
+            segmentKey: this.segmentKey,
+            streamId: this.streamId,
+          })
+        }
         segment.retryCount += 1
         if (this.planning) {
           segment.releasePlanning(this.generation, 'Chunk 慢速补救')
@@ -618,6 +699,28 @@ export class SegmentFetchWork {
       }
       return undefined
     })
+  }
+
+  private abortForRescue(
+    reason: RescueReason,
+    message: string,
+    details: Pick<
+      DetectedRescue,
+      'continueEtaMs' | 'currentRate' | 'peerCount' | 'peerMedianRate' | 'retryEtaMs'
+    > = {},
+  ): void {
+    if (this.controller.signal.aborted) {
+      return
+    }
+    const detectedAt = performance.now()
+    this.detectedRescue = {
+      ...details,
+      discardedBytes: this.receivedBytes,
+      elapsedMs: Math.max(0, detectedAt - this.startedAt),
+      reason,
+      timestamp: Date.now(),
+    }
+    this.controller.abort(new DOMException(message, 'RescueError'))
   }
 
   private locateChunk(
@@ -704,4 +807,37 @@ function createNetworkDetails(response: HttpTransportResponse): Response {
     status: response.status,
     statusText: response.statusText,
   })
+}
+
+function resolveExpectedResponseBytes(
+  headers: Headers,
+  requestStart: number,
+  requestEnd: number | undefined,
+  resourceLength: number | undefined,
+): number | undefined {
+  const contentLength = Number.parseInt(headers.get('content-length') ?? '', 10)
+  if (Number.isSafeInteger(contentLength) && contentLength > 0) {
+    return contentLength
+  }
+  try {
+    const contentRange = parseContentRange(headers.get('content-range'))
+    if (contentRange !== undefined) {
+      return contentRange.endExclusive - contentRange.start
+    }
+  } catch {
+    return undefined
+  }
+  const boundedEnd =
+    requestEnd === undefined
+      ? resourceLength
+      : resourceLength === undefined
+        ? requestEnd
+        : Math.min(requestEnd, resourceLength)
+  return boundedEnd === undefined || boundedEnd <= requestStart
+    ? undefined
+    : boundedEnd - requestStart
+}
+
+function formatRateRatio(ratio: number): string {
+  return `${(ratio * 100).toFixed(1)}%`
 }

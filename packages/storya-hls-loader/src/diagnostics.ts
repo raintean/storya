@@ -1,4 +1,5 @@
 import { type ParallelSegmentLoaderState } from './parallel-segment-loader-state'
+import type { RescueStatisticsDiagnostics } from './rescue-tracker'
 import type { VirtualStream } from './virtual-stream'
 import type { VirtualStreamChunk } from './virtual-stream-chunk'
 import type {
@@ -24,6 +25,7 @@ export interface ParallelSegmentLoaderDiagnostics {
   destroyed: boolean
   maxConcurrency: number
   revision: number
+  rescue: RescueStatisticsDiagnostics
   streams: VirtualStreamDiagnostics[]
   timestamp: number
   workers: WorkerDiagnostics[]
@@ -83,6 +85,7 @@ export function createParallelSegmentLoaderDiagnostics(
   state: ParallelSegmentLoaderState,
   maxConcurrency: number,
   bandwidthEstimate: number,
+  rescue: RescueStatisticsDiagnostics,
   workers: WorkerDiagnostics[],
 ): ParallelSegmentLoaderDiagnostics {
   return {
@@ -91,6 +94,7 @@ export function createParallelSegmentLoaderDiagnostics(
     destroyed: state.destroyed,
     maxConcurrency,
     revision: state.revision,
+    rescue,
     streams: [...state.streams.values()]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map(stream => createStreamDiagnostics(stream)),

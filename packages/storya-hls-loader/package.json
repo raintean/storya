@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsx src/byte-ranges.test.ts && tsx src/parallel-segment-loader.test.ts && tsx src/parallel-stream-controller.test.ts && tsx src/parallel-audio-stream-controller.test.ts",
+    "test": "tsx src/byte-ranges.test.ts && tsx src/transfer-tracker.test.ts && tsx src/rescue-tracker.test.ts && tsx src/parallel-segment-loader.test.ts && tsx src/parallel-stream-controller.test.ts && tsx src/parallel-audio-stream-controller.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

@@ -23,7 +23,7 @@
 - 根据播放器当前时间直接创建、推进或取消窗口。
 - LL-HLS Part 的向前预加载窗口。Part 的正式 fLoader 请求仍然可以进入共享模型并按 Chunk 加载。
 - subtitle 的向前预加载窗口。字幕正式 fLoader 请求仍然可以进入共享模型并按 Chunk 加载。
-- 根据历史吞吐识别“持续收到数据但明显过慢”的连接。当前只处理响应头超时、连续无数据超时和完整请求超时。
+- 根据绝对带宽阈值判断慢连接。当前慢速识别只比较同一 Loader 中同期 GET 的相对速率。
 - 将逻辑 Worker 迁移为浏览器 Web Worker。
 
 ## 设计原则
@@ -103,6 +103,8 @@ hls.js
 
 ParallelSegmentLoader
   +-- state
+  +-- TransferTracker
+  +-- RescueTracker
   +-- update()
   +-- subscribe()
   +-- revision/listeners
@@ -129,7 +131,8 @@ ParallelSegmentLoader
 - 提供同步事务入口 `update()`。
 - 提供粗粒度全局订阅 `subscribe()`。
 - 生成只读诊断快照。
-- 根据最近的 GET Work 统计全局聚合传输带宽。
+- 跟踪进行中和最近完成的 GET Work, 统计全局聚合传输带宽并提供同期相对速率。
+- 统计当前 session 的实际救援事件、丢弃字节和后续恢复结果。
 - 销毁 Worker、Transport 和全部共享状态。
 
 Loader 不提供 `replaceWindow()`、`startReading()`、`inspectSegment()`、`takeNextChunk()` 或 `waitForChange()` 等角色专用代理方法。Controller、FragmentLoader、Worker 和 Work 在事务中直接调用数据模型的方法。
@@ -335,9 +338,9 @@ loading.start    = loading.first - 原始 TTFB
 
 这条时序是专门供 hls.js ABR 采样的适配值, 不再表示某个 Segment 实际发起所有并行 Chunk 请求的墙钟时间。它保留 TTFB 语义, 排除缓存驻留时间, 并让 hls.js 在 `FRAG_BUFFERED` 时根据聚合链路能力而不是单个并行 Chunk 的带宽份额进行 EWMA 采样。
 
-### 聚合传输带宽
+### 传输跟踪与聚合带宽
 
-Loader 保留最近 64 个实际收到媒体数据的 GET Work 样本。每个样本记录实际接收字节数、GET claim 时间和 body 读取结束时间。HEAD 不进入带宽样本。
+Loader 内部的 `TransferTracker` 以 generation 标识进行中的 GET Work。Work 从 claim 开始登记, response head 通过后标记 body 开始, 每次收到非空 body 数据时同步追加累计字节与时间, body 完成、取消或失败时结束登记。Tracker 同时保留最近 64 个实际收到媒体数据的完成样本; HEAD 不进入带宽样本。
 
 聚合带宽计算为:
 
@@ -348,6 +351,8 @@ Loader 保留最近 64 个实际收到媒体数据的 GET Work 样本。每个�
 并行 GET 的重叠时间只计一次, 但各请求接收的字节都计入总量; 两组请求之间没有 GET 活动的空闲间隙不计入分母。这使结果表达整个 Loader 在并行传输时实际获得的链路吞吐, 而不是某个 Chunk 的个别速率。
 
 Work 因 slow rescue、timeout 或取消而中止时, 已经接收的字节仍消耗了真实链路带宽, 所以进入聚合样本; 这些字节不会计入 Segment `loaded` 的唯一有效字节数。完整 GET body 之后为 CORS `Content-Range` 降级而追加的 HEAD 不计入 GET 传输时间。
+
+Tracker 还为尚未完成的 GET 提供最近 `rescue.stallTimeoutMs` 时间窗口的单请求速率。同期 peer 包括仍在读取 body 的其他 GET, 以及刚完成且传输时间与当前观察窗口重叠的 GET; 较快请求即使已经完成, 仍可作为剩余慢请求的比较基线。peer 必须已经收到 body 数据, 至少存在 2 个有效 peer 时才产生中位速率。
 
 ## SegmentLoadWorker
 
@@ -402,7 +407,7 @@ HEAD 可以乱序执行和完成, 但数据 GET 受窗口前缀门禁约束。�
 
 优先级只决定空闲 Worker 下一次领取哪个 Chunk。只要 active Work 仍属于存活 Segment 且 generation 有效, 新出现的正式 reader Chunk 或更高优先级候选都不会抢占它, 即使 response body 尚未产生数据。请求一旦发出, 数据可能已经在网络路径中, 因优先级变化取消会浪费请求和已传输数据。
 
-窗口驱离、Stream 切换、失败传播或 Loader/Worker 销毁仍会使 Work 失效并取消请求。body 连续无数据触发的主动替换只属于 slow rescue, 不属于调度优先级抢占。
+窗口驱离、Stream 切换、失败传播或 Loader/Worker 销毁仍会使 Work 失效并取消请求。body 停滞或相对速率过慢触发的主动替换只属于 rescue, 不属于调度优先级抢占。
 
 ## Work 与 generation
 
@@ -494,7 +499,7 @@ ready   { byteLength, data, response, url, firstByteAt, completedAt }
 failed  { failure }
 ```
 
-`attempt` 记录总 claim 次数, `rescueAttempts` 记录因 timeout 进行的补救次数。Chunk 完成前的 body 数据只保存在 Work 局部; 完整验证后才一次性进入 ready phase。
+`attempt` 记录总 claim 次数, `rescueAttempts` 记录停滞或相对慢速触发的补救次数。Chunk 完成前的 body 数据只保存在 Work 局部; 完整验证后才一次性进入 ready phase。
 
 ## 长度发现、Chunk 规划与 Range 行为
 
@@ -575,13 +580,14 @@ Transport 只处理标准 `Request`、response head 和流式 body, 不理解 St
 - 通过 Request AbortSignal 和 body cancel 表达取消。
 - 将 response 转换为 Segment/Chunk 状态。
 
-HEAD 和 GET 都占用 Worker 槽位并使用两类正常请求时限; GET 另有一类额外慢速检测:
+HEAD 和 GET 都占用 Worker 槽位并使用两类正常请求时限; GET 另有两类 rescue 检测:
 
 - 响应头超时: `fragLoadPolicy.maxTimeToFirstByteMs`。
 - 完整请求超时: `fragLoadPolicy.maxLoadTimeMs`。
-- body 连续无数据的慢速检测: `idleTimeoutMs`, 默认 5 秒。
+- body 连续无数据的停滞检测: `rescue.stallTimeoutMs`, 默认 2 秒。
+- 相对于同期 GET 中位速率的慢速检测: `rescue.slowRateThresholdRatio`, 默认 0.25。
 
-GET body 每产生一段数据, Work 复制到 attempt 局部 parts, 同步更新共享 Chunk 的 loadedBytes。只有当前 Chunk 的 `rescueAttempts < maxRescueAttempts` 时, Work 才安装并重置慢速检测计时器。完整 body 验证通过后才提交 Chunk data。
+GET body 每产生一段数据, Work 复制到 attempt 局部 parts, 同步更新共享 Chunk 的 loadedBytes 和 TransferTracker。只有当前 Chunk 的 `rescueAttempts < rescue.maxAttempts` 时, Work 才安装 rescue 检测。完整 body 验证通过后才提交 Chunk data。
 
 Proxy 为获得 CDN 缓存语义可能把上游 `206` 包装成物理 `200`; `ProxyHttpTransport` 在返回 HLS Loader 前恢复逻辑 status 和 `Content-Range`。因此浏览器 Network 面板可能显示 `200`, 诊断中仍显示逻辑 `206`。
 
@@ -589,23 +595,39 @@ Proxy 为获得 CDN 缓存语义可能把上游 `206` 包装成物理 `200`; `Pr
 
 普通网络错误、HTTP 错误、Range 校验错误或资源 validator 变化会使 Segment 进入 failed outcome。Segment failure 会让同一 Segment 仍在 filling 的其他 Chunk 一起失败, 对应 Worker 收到通知后取消失效 Work。
 
-慢速 rescue 是正常请求时限之外的额外补救。默认允许补救 1 次:
+rescue 是正常请求时限之外的额外补救。停滞是零吞吐的慢速极限状态, 两种信号共用同一次数和状态转换。默认允许补救 1 次:
 
 ```text
-body 连续无数据达到 idleTimeoutMs
-  -> rescueAttempts 未达上限
+body 连续无数据达到 stallTimeoutMs
+或者
+当前窗口速率低于同期 GET 中位速率的 slowRateThresholdRatio
+且预计继续完成时间大于重新请求时间
+  -> rescueAttempts < rescue.maxAttempts
        -> generation 释放为 empty
        -> retryCount + 1
        -> 当前 Work 结束
        -> Worker 重新执行全局调度
   -> 已达上限
-       -> 当前 Work 不安装慢速检测
+       -> 当前 Work 不安装 rescue 检测
        -> 继续等待自然完成、正常 timeout 或上层取消
 ```
 
-例如 `maxRescueAttempts = 1` 时, 第一个 Work 可以因慢速检测触发 rescue。第二个 Work 创建时 rescue 次数已经用完, 因而不再安装 body idle 计时器。rescue 次数耗尽本身不会使 Chunk 或 Segment 失败。
+相对慢速检测使用 `rescue.stallTimeoutMs` 作为滚动观察窗口。当前 GET 必须已经观察满一个窗口并收到过数据, 同期至少存在 2 个有效 peer。系统比较 `currentRate / peerMedianRate` 与配置阈值, 再计算:
 
-`maxRescueAttempts = 0` 不需要单独的禁用分支。第一个 Work 自然满足“rescue 次数已经用完”, 因而从一开始就不安装慢速检测。
+```text
+continueEta = remainingBytes / currentRate
+retryEta    = expectedResponseBytes / peerMedianRate + peerMedianTtfb
+```
+
+只有当前速率低于阈值且 `continueEta > retryEta` 时才取消。判断没有绝对带宽下限; 所有同期请求一起变慢时不会把其中某一个误判为离群慢请求。`rescue.slowRateThresholdRatio = 0` 只关闭非零吞吐的相对慢速检测, 停滞检测仍然存在。
+
+例如 `rescue.maxAttempts = 1` 时, 第一个 Work 可以触发 rescue。第二个 Work 创建时 rescue 次数已经用完, 因而不再安装检测。rescue 次数耗尽本身不会使 Chunk 或 Segment 失败。
+
+`rescue: false` 与 `rescue: { maxAttempts: 0 }` 都会从第一个 Work 起关闭全部 rescue 检测。
+
+救援检测发生时, `SegmentFetchWork` 先在局部保存原因、速率比较、ETA、已接收字节和触发时间。只有取消完成后仍定位到相同 generation, 且 `chunk.rescue()` 成功把 Chunk 释放为 empty 时, Loader 的 `RescueTracker` 才记录事件。因此失效 generation、普通取消和正常 timeout 不会产生虚假的救援统计。
+
+`RescueTracker` 为当前 Loader session 维护累计计数, 并只保留最近 64 个事件详情。事件初始 outcome 为 `pending`; 同一个 `VirtualStreamChunk` 后续完整校验并提交为 ready 时, 该 Chunk 关联的全部 pending 救援事件改为 `recovered`。累计统计包括总事件数、stall/slow 分类、已恢复数、未恢复数和被取消 attempt 已接收但未提交的字节数。Tracker 使用 Chunk 对象的弱引用关联恢复结果, 不延长已驱离 Chunk 的生命周期。
 
 响应头超时和完整请求超时属于正常 attempt failure, 不消耗 rescue 次数。外部窗口变化或 Worker destroy 使用普通取消, 只释放仍然有效的 generation。
 
@@ -649,12 +671,13 @@ Worker 的 filling attempt 不构成独立存活依据。每次共享状态事�
 - timestamp、revision、destroyed。
 - active request 数量和最大并发。
 - Loader 最近 GET Work 的聚合传输带宽。
+- 当前 session 的救援累计统计和最近 64 个救援事件, 包括原因、Chunk identity、generation、attempt、触发耗时、丢弃字节、恢复结果和可用的 peer/ETA 判断数据。
 - 每个 Worker 的 idle/loading/stopped、当前 HEAD/GET、任务类型、Stream/Segment/Chunk、Range 和 startedAt。
 - 每条 VirtualStream 的 window。
 - Segment 的 start、duration、windowIndex、readerCount、生命周期 state、planning phase/method/source、rangeMode、HTTP status 和字节数。
 - Chunk 的范围、state、实时 loadedBytes、generation、attempt 和 failure。
 
-诊断投影不修改 revision, 不参与调度, 也不暴露 ArrayBuffer、Uint8Array、Response、callback、listener 或 AbortController。example 定时轮询快照绘制 Segment 时间线和 Chunk 状态。
+诊断投影不修改 revision, 不参与调度, 也不暴露 ArrayBuffer、Uint8Array、Response、callback、listener 或 AbortController。example 定时轮询快照绘制 Segment 时间线和 Chunk 状态, 展示救援累计值并把新救援及其恢复写入事件日志。
 
 ## 生命周期
 
@@ -708,6 +731,11 @@ import {
 const loader = new ParallelSegmentLoader({
   chunkSize: 2 * 1024 * 1024,
   maxConcurrency: 6,
+  rescue: {
+    maxAttempts: 1,
+    slowRateThresholdRatio: 0.25,
+    stallTimeoutMs: 2_000,
+  },
   windowSize: 6,
 })
 
@@ -721,7 +749,7 @@ const hls = new Hls({
 const diagnostics = loader.getDiagnostics()
 ```
 
-公开运行时类为 `ParallelSegmentLoader`、`ParallelStreamController` 和 `ParallelAudioStreamController`。包同时导出默认配置常量、Loader options 和只读诊断 TypeScript 类型。`ParallelSegmentLoaderOptions` 支持 `chunkSize`、`maxConcurrency`、`windowSize`、`idleTimeoutMs`、`maxRescueAttempts` 和 `transport`。
+公开运行时类为 `ParallelSegmentLoader`、`ParallelStreamController` 和 `ParallelAudioStreamController`。包同时导出默认配置常量、Loader options 和只读诊断 TypeScript 类型。`ParallelSegmentLoaderOptions` 支持 `chunkSize`、`maxConcurrency`、`windowSize`、`rescue` 和 `transport`; `rescue` 接受 `false` 或包含 `maxAttempts`、`stallTimeoutMs`、`slowRateThresholdRatio` 的对象。
 
 ## 当前实现范围
 
@@ -734,7 +762,7 @@ const diagnostics = loader.getDiagnostics()
 - HEAD 乱序完成、后续 Segment GET 前缀门禁和每个 Segment 的 Range 验证门禁。
 - `Content-Range` CORS 隐藏时基于已知长度与精确 body 长度的安全恢复。
 - response head 和完整请求 timeout。
-- 可通过 `maxRescueAttempts` 启用或自然禁用的 body idle 慢速补救。
+- 可配置或关闭的停滞与同期相对慢速 rescue。
 - ETag/Last-Modified 一致性检查。
 - canonical Segment 缓存、窗口重叠保留和确定性驱离。
 - Fetch、HTTP Proxy 和 WebSocket Transport 注入。
@@ -746,11 +774,12 @@ const diagnostics = loader.getDiagnostics()
 - LL-HLS Part 向前窗口。
 - subtitle 向前窗口。
 - 窗口外后向缓存或基于内存预算的 LRU。
-- 基于历史吞吐的慢连接识别。
 - 真正 Web Worker 化。
 
 ## 修改历史
 
+- 2026-08-09: 将 `idleTimeoutMs` 和 `maxRescueAttempts` 收敛为可设为 `false` 的 `rescue` 配置, 停滞阈值更名为 `stallTimeoutMs` 并默认改为 2 秒; TransferTracker 增加同期 GET 中位速率, 当前请求低于默认 25% 且取消重试预计更早完成时复用原有 rescue 流程。
+- 2026-08-09: 增加 session 级 RescueTracker, 统计实际进入重试的 stall/slow 救援、丢弃字节、恢复结果和最近 64 个事件, 并通过 diagnostics 暴露给 example。
 - 2026-08-08: 带宽估计改为统计最近并行 GET Work 的总字节数与活跃时间并集; HEAD、前缀等待和缓存驻留时间不再压低 hls.js ABR 采样, 诊断界面同时显示 Loader 聚合带宽和 hls.js EWMA 带宽。
 - 2026-08-08: 增加 `ParallelAudioStreamController`, 为 alternate audio 维护独立预加载窗口; 音频 reader 结束后由 window 保持 Segment 和 VirtualStream 存活, 音轨切换和 stopLoad 时清理对应窗口。
 - 2026-08-08: 未知长度 Segment 改为“窗口首段首个 Range GET、后续 Segment HEAD”的规划流程; HEAD 与 GET 共用固定 Worker 池, 后续数据受前序 Range 模式门禁; 删除根据短 body 推断 EOF 的行为。
