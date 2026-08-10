@@ -4,10 +4,11 @@
 
 ## 项目概要
 
-Storya 是一个由 Rust 和 TypeScript 构建的视频解决方案 monorepo。仓库包含面向用户和管理员的应用、独立部署的服务与 Cloudflare Workers，以及跨运行单元复用的播放器和协议包。
+Storya 是一个由 Rust 和 TypeScript 构建的视频解决方案 monorepo。仓库包含面向用户和管理员的应用、交互示例、独立部署的服务与 Cloudflare Workers，以及跨运行单元复用的播放器和协议包。
 
 - `apps/storya-web`: 面向用户的 Web 前台。
 - `apps/storya-admin`: 面向管理人员的 Web 前台。
+- `examples/storya-hls-loader-react`: HLS 并行加载器的 React 交互示例，通过 Cloudflare Workers Static Assets 部署。
 - `services/storya-api`: Rust 中心 API 服务。
 - `workers/storya-websocket-transport`: 部署在 Cloudflare Workers 上的 WebSocket HTTP relay。
 - `packages/storya-player`: 框架无关的 Web Component 播放器。
@@ -63,12 +64,14 @@ make clean
 ### 文件组织与命名
 
 - `apps/` 放由用户直接运行或访问的应用。
+- `examples/` 放用于演示和验证共享能力的交互示例。
 - `services/` 放独立部署、持续运行的服务。
-- `workers/` 放独立部署到 Cloudflare Workers 的运行单元。
-- `packages/` 放被应用、服务和 Workers 复用的组件或协议。
+- `workers/` 放主要职责是提供服务端 Cloudflare Worker 能力的独立单元。
+- `packages/` 放被应用、示例、服务和 Workers 复用的组件或协议。
 - 叶子项目的目录名和 Rust/npm 包名统一使用 `storya-` 前缀、小写字母和 kebab-case。
 - npm 包不使用 scope，全部保持 `private: true`。
-- `apps`、`services`、`workers` 和 `packages` 只负责分组，本身不是包。
+- `apps`、`examples`、`services`、`workers` 和 `packages` 只负责分组，本身不是包。
+- 目录按项目主要职责划分，不按部署平台划分；应用或示例使用 Workers Static Assets 部署时仍保留在原目录。
 - 共享包不能反向依赖具体运行单元。只有存在真实消费者和稳定边界时才新增共享包。
 
 ### 格式化与 lint

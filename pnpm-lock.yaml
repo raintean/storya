@@ -118,6 +118,9 @@ importers:
       vite:
         specifier: 'catalog:'
         version: 8.2.0(esbuild@0.28.1)(tsx@4.23.5)
+      wrangler:
+        specifier: 'catalog:'
+        version: 4.118.0
 
   packages/storya-hls-loader:
     dependencies:

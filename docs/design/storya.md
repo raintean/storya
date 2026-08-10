@@ -1,6 +1,6 @@
 # Storya 总体设计
 
-Storya 是一个 Rust 和 TypeScript 混合的视频解决方案 monorepo。仓库统一管理工具链、依赖、跨语言协议和可复用组件，但每个应用、服务和 Cloudflare Worker 保持独立的运行与部署边界。
+Storya 是一个 Rust 和 TypeScript 混合的视频解决方案 monorepo。仓库统一管理工具链、依赖、跨语言协议和可复用组件，但每个应用、示例、服务和服务端 Cloudflare Worker 保持独立的运行与部署边界。
 
 本文描述当前已经采用的仓库级设计。尚未实现的业务能力会明确标注，不把目录骨架写成已经完成的产品功能。
 
@@ -11,6 +11,7 @@ Storya 当前包含以下运行单元与共享能力:
 ```text
 用户界面      storya-web
 管理界面      storya-admin
+交互示例      storya-hls-loader-react
 
 中心服务      storya-api
 Cloudflare Worker  storya-websocket-transport
@@ -21,6 +22,7 @@ Cloudflare Worker  storya-websocket-transport
 
 - `storya-web` 面向最终用户，负责视频浏览、播放和用户交互。当前仅包含基础页面骨架，并已经使用 `storya-player`。
 - `storya-admin` 面向运营和管理人员。当前仅包含基础页面骨架。
+- `storya-hls-loader-react` 是 HLS 并行加载器的 React 交互示例，保留在 `examples/`，通过 Cloudflare Workers Static Assets 独立部署。
 - `storya-api` 是中心 API 服务，负责未来的核心业务接口。当前只实现 `/health`。
 - `storya-websocket-transport` 是部署在 Cloudflare Workers 上的 WebSocket Transport 单元。当前实现 `/health` 和 `/transport`，通过流式 HTTP-over-WebSocket 协议透明转发 GET/HEAD。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
@@ -55,6 +57,8 @@ storya/
 ├── apps/
 │   ├── storya-web/
 │   └── storya-admin/
+├── examples/
+│   └── storya-hls-loader-react/
 ├── services/
 │   └── storya-api/
 ├── workers/
@@ -69,16 +73,19 @@ storya/
     └── memory/
 ```
 
-四类工程目录的边界如下:
+五类工程目录的边界如下:
 
-| 目录       | 责任                                 | 运行方式                   |
-| ---------- | ------------------------------------ | -------------------------- |
-| `apps`     | 面向用户或管理人员的完整应用         | 由人直接访问或运行         |
-| `services` | 独立部署并持续运行的通用服务         | 由服务端运行环境运行       |
-| `workers`  | 独立部署到 Cloudflare Workers 的单元 | 由 Cloudflare Workers 运行 |
-| `packages` | 编译期复用的组件和协议               | 不单独作为产品部署         |
+| 目录       | 责任                                            | 运行方式                   |
+| ---------- | ----------------------------------------------- | -------------------------- |
+| `apps`     | 面向用户或管理人员的完整应用                    | 由人直接访问或运行         |
+| `examples` | 演示和验证共享能力的交互示例                    | 本地运行或作为静态站点部署 |
+| `services` | 独立部署并持续运行的通用服务                    | 由服务端运行环境运行       |
+| `workers`  | 以服务端 Cloudflare Worker 能力为主要职责的单元 | 由 Cloudflare Workers 运行 |
+| `packages` | 编译期复用的组件和协议                          | 不单独作为产品部署         |
 
 所有叶子项目都使用 `storya-` 前缀、小写字母和 kebab-case。npm 包不使用 scope，也不发布到公共 registry。
+
+顶层目录按项目主要职责划分，不按部署平台划分。应用和示例即使通过 Workers Static Assets 部署，也继续保留在 `apps/` 或 `examples/`; `workers/` 只容纳本身以服务端 Worker 能力为主要职责的项目。
 
 ## 依赖方向
 
@@ -86,18 +93,19 @@ storya/
 
 ```text
 apps -----+
+examples -+
 services -+----> packages
 workers --+
 ```
 
-- `packages` 不依赖具体 `apps`、`services` 或 `workers`。
+- `packages` 不依赖具体 `apps`、`examples`、`services` 或 `workers`。
 - 一个实现只有在出现真实消费者和稳定边界后才移动到 `packages`。
 - 不因为多个项目暂时存在相似代码就提前建立 `storya-ui`、`storya-sdk` 或其他公共包。
 - `storya-player` 保持框架无关，具体页面状态和产品交互留在对应应用。
 - `storya-protocol` 只描述跨边界数据，不承载业务流程或服务实现。
 - `storya-hls-loader` 依赖 `storya-transport`, Transport 不反向依赖 HLS 或媒体类型。
 
-当前已经存在 `storya-web -> storya-player`、`storya-hls-loader -> storya-transport -> storya-protocol` 和 `storya-websocket-transport -> storya-protocol`。其他图中关系是已经采用但尚待实现的方向。
+当前已经存在 `storya-web -> storya-player`、`storya-hls-loader-react -> storya-hls-loader -> storya-transport -> storya-protocol` 和 `storya-websocket-transport -> storya-protocol`。其他图中关系是已经采用但尚待实现的方向。
 
 ## Protocol
 
@@ -153,6 +161,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 ## 部署边界
 
 - `storya-web` 和 `storya-admin` 生成独立静态前端产物。
+- `storya-hls-loader-react` 生成 Vite 静态产物，并通过独立的 Cloudflare Workers Static Assets Worker 部署。
 - `storya-api` 生成独立 Rust release 二进制。
 - `storya-websocket-transport` 作为 Cloudflare Worker 独立部署，不与中心 API 合并进程。
 - `packages` 不独立部署，其代码进入消费者构建产物。
@@ -165,6 +174,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 - Rust 和 pnpm workspace 骨架。
 - Web、Admin、中心 API 和 WebSocket Transport Worker 的最小可运行项目。
+- HLS 并行加载器 React 交互示例及其 Workers Static Assets 部署入口。
 - 框架无关播放器 Web Component。
 - HLS 自定义主 StreamController、VirtualStream 有序窗口、共享 fLoader、统一 HTTP Transport、Range Chunk 并行、正式读取抢占、Segment 驱离和诊断快照。
 - 通用 Fetch/WebSocket HTTP Transport、串行复用连接池和流式 WebSocket Transport Worker relay。
@@ -181,7 +191,8 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 ## 修改历史
 
-- 2026-08-10: 新增顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，由目录表达 Cloudflare Worker 部署形态、叶子项目名表达具体职责。
+- 2026-08-10: 为 `examples/storya-hls-loader-react` 增加 Workers Static Assets 部署入口，并明确顶层目录按项目职责而非部署平台划分。
+- 2026-08-10: 新增服务端 Worker 能力的顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，叶子项目名只表达具体职责。
 - 2026-08-10: 删除没有产品消费者且与 Fetch/WebSocket relay 能力重叠的 HTTP Proxy Transport 和独立 Rust proxy 服务，网络实现收敛为 Fetch 与 HTTP-over-WebSocket。
 - 2026-08-08: 完成新 HLS 并行加载模型, 由 Controller 维护有序窗口, Loader 统一持有多 VirtualStream、Chunk Worker、fLoader、Transport、驱离和诊断。
 - 2026-08-07: 删除 HLS VirtualStream 与 StreamFiller 架构, 将并行加载器重建为 `ParallelStreamController` 和提供 fLoader 兼容的 `ParallelSegmentLoader`。

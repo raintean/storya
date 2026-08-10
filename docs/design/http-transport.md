@@ -147,7 +147,7 @@ Fetch、WebSocket Transport、统一请求/流量/缓存统计、Protobuf 控制
 
 ## 修改历史
 
-- 2026-08-10: 新增顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，由目录表达 Cloudflare Worker 部署形态、叶子项目名表达 WebSocket Transport relay 职责。
+- 2026-08-10: 新增服务端 Worker 能力的顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，叶子项目名只表达 WebSocket Transport relay 职责。
 - 2026-08-10: 删除没有产品消费者且与现有网络路径能力重叠的 `ProxyHttpTransport` 和 `storya-http-proxy`; Transport 收敛为 Fetch 与 WebSocket relay。
 - 2026-08-10: 统计包装流改为零预取, 只记录调用方实际读取的 response body 字节, 避免取消请求多算一个预取 chunk。
 - 2026-08-09: WebSocket Transport Worker 的 GET/HEAD 子请求启用 `cacheEverything`, 200-299 响应强制使用一年 Edge TTL, 重定向立即过期, 错误响应不缓存; WebSocket Transport 将对应统计标记为 Worker Fetch 缓存。
