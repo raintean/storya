@@ -296,7 +296,7 @@ function waitForEnter(message: string): Promise<void> {
 
 function printHelp(): void {
   console.info(`用法:
-  pnpm --filter storya-edge-worker run benchmark -- [options]
+  pnpm --filter storya-websocket-transport run benchmark -- [options]
 
 交互模式会先预建连接并暂停。开始 Profiler 后按回车执行负载；负载结束后先停止
 Profiler, 再按回车关闭连接。stdin 不是 TTY 时自动使用非交互模式。

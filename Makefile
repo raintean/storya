@@ -18,11 +18,11 @@ check: generate
 
 clean:
 	$(CARGO) clean
-	find apps packages services \
+	find apps packages services workers \
 		-type d -name node_modules -prune -o \
 		-type d \( -name dist -o -name .wrangler \) -prune -exec rm -rf {} +
 	rm -rf packages/storya-protocol/generated packages/storya-protocol/typescript/generated
-	rm -f services/storya-edge-worker/worker-configuration.d.ts
+	rm -f workers/storya-websocket-transport/worker-configuration.d.ts
 
 format: pnpm-install
 	$(CARGO) fmt --all
@@ -36,7 +36,7 @@ format-check: pnpm-install
 
 generate: pnpm-install
 	$(PNPM) --filter storya-protocol exec buf generate
-	CI=true $(PNPM) --filter storya-edge-worker exec wrangler types
+	CI=true $(PNPM) --filter storya-websocket-transport exec wrangler types
 
 lint: generate
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings

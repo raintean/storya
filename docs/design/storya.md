@@ -1,19 +1,19 @@
 # Storya 总体设计
 
-Storya 是一个 Rust 和 TypeScript 混合的视频解决方案 monorepo。仓库统一管理工具链、依赖、跨语言协议和可复用组件，但每个应用和服务保持独立的运行与部署边界。
+Storya 是一个 Rust 和 TypeScript 混合的视频解决方案 monorepo。仓库统一管理工具链、依赖、跨语言协议和可复用组件，但每个应用、服务和 Cloudflare Worker 保持独立的运行与部署边界。
 
 本文描述当前已经采用的仓库级设计。尚未实现的业务能力会明确标注，不把目录骨架写成已经完成的产品功能。
 
 ## 系统边界
 
-Storya 当前包含三类运行端:
+Storya 当前包含以下运行单元与共享能力:
 
 ```text
 用户界面      storya-web
 管理界面      storya-admin
 
 中心服务      storya-api
-边缘服务      storya-edge-worker
+Cloudflare Worker  storya-websocket-transport
 
 共享能力      storya-player      storya-protocol      storya-hls-loader      storya-transport
               播放器组件          跨语言协议            HLS 并行加载           HTTP Transport
@@ -22,7 +22,7 @@ Storya 当前包含三类运行端:
 - `storya-web` 面向最终用户，负责视频浏览、播放和用户交互。当前仅包含基础页面骨架，并已经使用 `storya-player`。
 - `storya-admin` 面向运营和管理人员。当前仅包含基础页面骨架。
 - `storya-api` 是中心 API 服务，负责未来的核心业务接口。当前只实现 `/health`。
-- `storya-edge-worker` 是部署在 Cloudflare Workers 的边缘能力单元。当前实现 `/health` 和 `/transport`，通过流式 HTTP-over-WebSocket 协议透明转发 GET/HEAD；未来媒体能力可以作为独立模块加入。
+- `storya-websocket-transport` 是部署在 Cloudflare Workers 上的 WebSocket Transport 单元。当前实现 `/health` 和 `/transport`，通过流式 HTTP-over-WebSocket 协议透明转发 GET/HEAD。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
 - `storya-protocol` 是 Rust 和 TypeScript 共用的协议包。当前包含健康检查和 HTTP relay 控制消息的 Protobuf，以及 relay frame header codec；健康检查类型尚未接入 `storya-api` 的 HTTP 路由。
 - `storya-hls-loader` 是基于 hls.js 自定义 StreamController 和 fLoader 的并行加载包。`ParallelStreamController` 规划有序 Segment 窗口, `ParallelSegmentLoader` 持有多 VirtualStream 状态, 通过内部 Worker 和 `storya-transport` 完成 Segment 内 Range Chunk 与跨 Segment 并发, 并让预加载与 hls.js 正式读取共享数据; 默认网络实现为 Fetch。
@@ -39,14 +39,14 @@ storya-web ---------> storya-api
                                       |
                                       +----> HTTP 源站
                                       |
-                                      +----> storya-edge-worker ----> HTTP 源站
+                                      +----> storya-websocket-transport ----> HTTP 源站
 
 storya-admin -------> storya-api
 
 storya-protocol ----> 为需要跨进程或跨语言通信的边界提供 Schema
 ```
 
-这张图表达已采用的职责方向，不表示所有调用链都已由产品界面启用。Transport、Edge Worker 和源站转发已经实现，Web 前台尚未接入该播放链路。
+这张图表达已采用的职责方向，不表示所有调用链都已由产品界面启用。Transport、WebSocket Transport Worker 和源站转发已经实现，Web 前台尚未接入该播放链路。
 
 ## 仓库结构
 
@@ -56,8 +56,9 @@ storya/
 │   ├── storya-web/
 │   └── storya-admin/
 ├── services/
-│   ├── storya-api/
-│   └── storya-edge-worker/
+│   └── storya-api/
+├── workers/
+│   └── storya-websocket-transport/
 ├── packages/
 │   ├── storya-player/
 │   ├── storya-hls-loader/
@@ -68,13 +69,14 @@ storya/
     └── memory/
 ```
 
-三类顶层目录的边界如下:
+四类工程目录的边界如下:
 
-| 目录       | 责任                               | 运行方式           |
-| ---------- | ---------------------------------- | ------------------ |
-| `apps`     | 面向用户或管理人员的完整应用       | 由人直接访问或运行 |
-| `services` | 独立部署并持续运行的后端或边缘服务 | 由部署环境运行     |
-| `packages` | 编译期复用的组件和协议             | 不单独作为产品部署 |
+| 目录       | 责任                                 | 运行方式                   |
+| ---------- | ------------------------------------ | -------------------------- |
+| `apps`     | 面向用户或管理人员的完整应用         | 由人直接访问或运行         |
+| `services` | 独立部署并持续运行的通用服务         | 由服务端运行环境运行       |
+| `workers`  | 独立部署到 Cloudflare Workers 的单元 | 由 Cloudflare Workers 运行 |
+| `packages` | 编译期复用的组件和协议               | 不单独作为产品部署         |
 
 所有叶子项目都使用 `storya-` 前缀、小写字母和 kebab-case。npm 包不使用 scope，也不发布到公共 registry。
 
@@ -83,19 +85,19 @@ storya/
 依赖只能从具体运行单元指向共享包:
 
 ```text
-apps --------+
-             +----> packages
-services ----+
+apps -----+
+services -+----> packages
+workers --+
 ```
 
-- `packages` 不依赖具体 `apps` 或 `services`。
+- `packages` 不依赖具体 `apps`、`services` 或 `workers`。
 - 一个实现只有在出现真实消费者和稳定边界后才移动到 `packages`。
 - 不因为多个项目暂时存在相似代码就提前建立 `storya-ui`、`storya-sdk` 或其他公共包。
 - `storya-player` 保持框架无关，具体页面状态和产品交互留在对应应用。
 - `storya-protocol` 只描述跨边界数据，不承载业务流程或服务实现。
 - `storya-hls-loader` 依赖 `storya-transport`, Transport 不反向依赖 HLS 或媒体类型。
 
-当前已经存在 `storya-web -> storya-player`、`storya-hls-loader -> storya-transport -> storya-protocol` 和 `storya-edge-worker -> storya-protocol`。其他图中关系是已经采用但尚待实现的方向。
+当前已经存在 `storya-web -> storya-player`、`storya-hls-loader -> storya-transport -> storya-protocol` 和 `storya-websocket-transport -> storya-protocol`。其他图中关系是已经采用但尚待实现的方向。
 
 ## Protocol
 
@@ -152,7 +154,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 - `storya-web` 和 `storya-admin` 生成独立静态前端产物。
 - `storya-api` 生成独立 Rust release 二进制。
-- `storya-edge-worker` 作为 Cloudflare Worker 独立部署，不与中心 API 合并进程。
+- `storya-websocket-transport` 作为 Cloudflare Worker 独立部署，不与中心 API 合并进程。
 - `packages` 不独立部署，其代码进入消费者构建产物。
 
 服务之间通过公开协议通信，不通过共享数据库或读取其他服务内部状态形成隐式耦合。具体鉴权、存储、媒体源和部署拓扑尚未确定，在实现相应业务前不提前固化。
@@ -162,10 +164,10 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 当前仓库已经完成:
 
 - Rust 和 pnpm workspace 骨架。
-- Web、Admin、中心 API 和 Edge Worker 的最小可运行项目。
+- Web、Admin、中心 API 和 WebSocket Transport Worker 的最小可运行项目。
 - 框架无关播放器 Web Component。
 - HLS 自定义主 StreamController、VirtualStream 有序窗口、共享 fLoader、统一 HTTP Transport、Range Chunk 并行、正式读取抢占、Segment 驱离和诊断快照。
-- 通用 Fetch/WebSocket HTTP Transport、串行复用连接池和流式 Edge Worker relay。
+- 通用 Fetch/WebSocket HTTP Transport、串行复用连接池和流式 WebSocket Transport Worker relay。
 - Protobuf/Buf 跨语言生成链路。
 - 统一工具链、Makefile、格式化和 lint 配置。
 
@@ -173,12 +175,13 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 - 用户、权限和管理业务。
 - 视频上传、转码、媒资管理和存储。
-- 播放鉴权和 Edge Worker 的公开代理安全策略。
+- 播放鉴权和 WebSocket Transport Worker 的公开代理安全策略。
 - 播放器自适应码流、DRM、字幕、遥测等生产能力。
 - API 与 Protocol 生成类型的实际集成。
 
 ## 修改历史
 
+- 2026-08-10: 新增顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，由目录表达 Cloudflare Worker 部署形态、叶子项目名表达具体职责。
 - 2026-08-10: 删除没有产品消费者且与 Fetch/WebSocket relay 能力重叠的 HTTP Proxy Transport 和独立 Rust proxy 服务，网络实现收敛为 Fetch 与 HTTP-over-WebSocket。
 - 2026-08-08: 完成新 HLS 并行加载模型, 由 Controller 维护有序窗口, Loader 统一持有多 VirtualStream、Chunk Worker、fLoader、Transport、驱离和诊断。
 - 2026-08-07: 删除 HLS VirtualStream 与 StreamFiller 架构, 将并行加载器重建为 `ParallelStreamController` 和提供 fLoader 兼容的 `ParallelSegmentLoader`。
@@ -186,6 +189,6 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 - 2026-08-07: WebSocket relay 改为单 Request/Response 整包协议，删除流式分帧、取消、心跳和最大连接寿命；增加 TypeScript 手写二进制 codec 的 Protocol 例外。
 - 2026-08-06: 增加基于 cross 的 `x86_64-unknown-linux-musl` Rust workspace release 构建入口。
 - 2026-08-06: 增加 `storya-http-proxy` 和多 Origin HTTP Proxy Transport，Cloudflare 只作为其前置 CDN。
-- 2026-08-05: 将边缘部署单元改为 `storya-edge-worker`，增加通用 HTTP Transport、WebSocket 连接池和透明 relay。
+- 2026-08-05: 增加 WebSocket Transport Worker、通用 HTTP Transport、WebSocket 连接池和透明 relay。
 - 2026-08-05: 增加 HLS 并行加载器边界，并完成虚拟流、跨 Segment 预填充和全局请求调度。
-- 2026-08-04: 建立 Storya 总体设计，明确 apps/services/packages 边界、Protocol 机制、依赖方向和当前实现范围。
+- 2026-08-04: 建立 Storya 总体设计，明确 apps/services/packages 初始边界、Protocol 机制、依赖方向和当前实现范围。

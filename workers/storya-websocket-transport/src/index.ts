@@ -407,7 +407,7 @@ export default {
   fetch(request, _env, ctx): Response {
     const url = new URL(request.url)
     if (url.pathname === '/health') {
-      return json({ service: 'storya-edge-worker', status: 'ok' })
+      return json({ service: 'storya-websocket-transport', status: 'ok' })
     }
     if (url.pathname === '/transport') {
       if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {

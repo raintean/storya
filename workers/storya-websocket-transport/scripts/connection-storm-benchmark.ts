@@ -346,7 +346,7 @@ function assertWebSocketUrl(value: string): void {
 
 function printHelp(): void {
   console.info(`用法:
-  pnpm --filter storya-edge-worker run benchmark:connections -- [options]
+  pnpm --filter storya-websocket-transport run benchmark:connections -- [options]
 
 使用 Transport 的生产默认连接轮换参数持续发送 Range 请求，并汇总连接创建、关闭、
 关闭原因、连接寿命和每连接请求数。

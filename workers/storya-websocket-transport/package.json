@@ -1,5 +1,5 @@
 {
-  "name": "storya-edge-worker",
+  "name": "storya-websocket-transport",
   "private": true,
   "type": "module",
   "scripts": {

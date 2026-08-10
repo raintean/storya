@@ -6,6 +6,6 @@
     "**/build/**",
     "**/coverage/**",
     "packages/storya-protocol/typescript/generated/**",
-    "services/storya-edge-worker/worker-configuration.d.ts"
+    "workers/storya-websocket-transport/worker-configuration.d.ts"
   ]
 }

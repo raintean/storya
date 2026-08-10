@@ -777,7 +777,7 @@ export function App() {
                     type="url"
                     value={workerUrl}
                     onChange={event => setWorkerUrl(event.target.value)}
-                    placeholder="https://storya-edge-worker.example.workers.dev"
+                    placeholder="https://storya-websocket-transport.example.com"
                     required
                   />
                   <small>可填写 Worker 根 URL 或完整的 wss://.../transport 地址</small>

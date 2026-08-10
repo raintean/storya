@@ -2,6 +2,7 @@ packages:
   - 'apps/*'
   - 'examples/*'
   - 'services/*'
+  - 'workers/*'
   - 'packages/*'
 
 nodeVersion: 24.14.1

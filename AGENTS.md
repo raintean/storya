@@ -4,12 +4,12 @@
 
 ## 项目概要
 
-Storya 是一个由 Rust 和 TypeScript 构建的视频解决方案 monorepo。仓库包含面向用户和管理员的应用、独立部署的服务，以及跨应用复用的播放器和协议包。
+Storya 是一个由 Rust 和 TypeScript 构建的视频解决方案 monorepo。仓库包含面向用户和管理员的应用、独立部署的服务与 Cloudflare Workers，以及跨运行单元复用的播放器和协议包。
 
 - `apps/storya-web`: 面向用户的 Web 前台。
 - `apps/storya-admin`: 面向管理人员的 Web 前台。
 - `services/storya-api`: Rust 中心 API 服务。
-- `services/storya-edge-worker`: 基于 Cloudflare Workers 的边缘能力部署单元，当前提供通用 HTTP relay。
+- `workers/storya-websocket-transport`: 部署在 Cloudflare Workers 上的 WebSocket HTTP relay。
 - `packages/storya-player`: 框架无关的 Web Component 播放器。
 - `packages/storya-hls-loader`: 基于自定义 hls.js StreamController 和 fLoader 的 HLS 并行加载器。
 - `packages/storya-transport`: 提供 Fetch 和 HTTP-over-WebSocket Transport。
@@ -64,11 +64,12 @@ make clean
 
 - `apps/` 放由用户直接运行或访问的应用。
 - `services/` 放独立部署、持续运行的服务。
-- `packages/` 放被应用和服务复用的组件或协议。
+- `workers/` 放独立部署到 Cloudflare Workers 的运行单元。
+- `packages/` 放被应用、服务和 Workers 复用的组件或协议。
 - 叶子项目的目录名和 Rust/npm 包名统一使用 `storya-` 前缀、小写字母和 kebab-case。
 - npm 包不使用 scope，全部保持 `private: true`。
-- `apps`、`services` 和 `packages` 只负责分组，本身不是包。
-- 共享包不能反向依赖具体应用或服务。只有存在真实消费者和稳定边界时才新增共享包。
+- `apps`、`services`、`workers` 和 `packages` 只负责分组，本身不是包。
+- 共享包不能反向依赖具体运行单元。只有存在真实消费者和稳定边界时才新增共享包。
 
 ### 格式化与 lint
 
@@ -101,7 +102,7 @@ make clean
 
 - 共享包直接暴露 TypeScript 源码供 workspace 消费，不为发布场景增加额外兼容层。
 - `storya-player` 保持框架无关，不反向依赖具体 Web 应用。
-- `services/storya-edge-worker/worker-configuration.d.ts` 是忽略的生成物，不手工修改或纳入版本管理。
+- `workers/storya-websocket-transport/worker-configuration.d.ts` 是忽略的生成物，不手工修改或纳入版本管理。
 - 不在多个子项目重复安装 TypeScript、formatter 或 linter；公共版本由根 catalog 管理。
 
 ### Git 与提交
@@ -123,7 +124,7 @@ Memory 记录特定场景下需要长期保留的经验。遇到描述匹配的�
 
 - **Storya 总体设计** (`docs/design/storya.md`) - 仓库结构、组件边界、协议机制、依赖方向和当前实现范围。
 - **HLS 并行加载器设计** (`docs/design/hls-parallel-loader.md`) - `ParallelStreamController`、fLoader 兼容的 `ParallelSegmentLoader`、VirtualStream 窗口、Chunk 调度和驱离边界。
-- **HTTP Transport 设计** (`docs/design/http-transport.md`) - 通用 HTTP Transport、WebSocket 连接池、线协议和 Edge Worker relay。
+- **HTTP Transport 设计** (`docs/design/http-transport.md`) - 通用 HTTP Transport、WebSocket 连接池、线协议和 WebSocket Transport Worker relay。
 
 ## 文档维护
 

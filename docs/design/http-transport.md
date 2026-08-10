@@ -12,12 +12,12 @@ storya-transport
   |
   +---- FetchHttpTransport -------------------------> HTTP 源站
   |
-  +---- WebSocketHttpTransport ----> storya-edge-worker ----> HTTP 源站
+  +---- WebSocketHttpTransport ----> storya-websocket-transport ----> HTTP 源站
 ```
 
 - `storya-transport` 提供统一的 `HttpTransport` 接口和两种网络实现。
 - `storya-hls-loader` 的 `ParallelSegmentLoader` 持有一个 `HttpTransport`; `SegmentPlanningWork` 通过它执行 HEAD, `SegmentFetchWork` 通过它执行 GET。默认使用 Fetch, example 可以选择 WebSocket relay。HLS 语义始终留在 `storya-hls-loader` 中。
-- `storya-edge-worker` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
+- `storya-websocket-transport` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
 - WebSocket relay 的控制消息由 `storya-protocol` 中的 Protobuf schema 描述，媒体 body 使用原始二进制 frame。
 
 ## HTTP 接口
@@ -135,11 +135,11 @@ Worker 使用 Paid 计划运行，CPU time 上限为 300 秒，单次调用 subr
 
 Fetch 和 WebSocket Transport 共用 `TransportStatistics`。请求通过各自参数校验并正式进入 Transport 后开始计数, `HttpTransportResponse` 在统一边界包装 body, 因而两者按相同口径统计请求、成功、失败、取消和调用方实际消费的响应字节。统计包装流不预取 body, 未被调用方读取的数据不计入响应字节。每个具体 Transport 通过 `getStatistics()` 返回只读快照; 有变化时默认每 5 秒输出一次单行摘要。
 
-缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; Edge Worker 转发的状态表示配置在 Worker 子请求上的 Cloudflare Fetch Cache, 所以它的摘要标记为“Worker Fetch 缓存”。
+缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; WebSocket Transport Worker 转发的状态表示配置在 Worker 子请求上的 Cloudflare Fetch Cache, 所以它的摘要标记为“Worker Fetch 缓存”。
 
 WebSocket 连接池自定义 debug 回调仍然独立记录连接创建、建立和关闭，包含连接年龄、请求次数、池大小和关闭原因。正常回收原因只有 `idle` 与 `max-requests`。调用方使用内置 `debug: true` 时，控制台只额外输出连接关闭事件, 不把连接生命周期混入请求统计。
 
-Edge Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/response 热路径不输出逐请求或逐消息日志，异常异步任务才写结构化错误。
+WebSocket Transport Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/response 热路径不输出逐请求或逐消息日志，异常异步任务才写结构化错误。
 
 ## 实现状态
 
@@ -147,17 +147,18 @@ Fetch、WebSocket Transport、统一请求/流量/缓存统计、Protobuf 控制
 
 ## 修改历史
 
+- 2026-08-10: 新增顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，由目录表达 Cloudflare Worker 部署形态、叶子项目名表达 WebSocket Transport relay 职责。
 - 2026-08-10: 删除没有产品消费者且与现有网络路径能力重叠的 `ProxyHttpTransport` 和 `storya-http-proxy`; Transport 收敛为 Fetch 与 WebSocket relay。
 - 2026-08-10: 统计包装流改为零预取, 只记录调用方实际读取的 response body 字节, 避免取消请求多算一个预取 chunk。
-- 2026-08-09: Edge Worker 的 GET/HEAD 子请求启用 `cacheEverything`, 200-299 响应强制使用一年 Edge TTL, 重定向立即过期, 错误响应不缓存; WebSocket Transport 将对应统计标记为 Worker Fetch 缓存。
+- 2026-08-09: WebSocket Transport Worker 的 GET/HEAD 子请求启用 `cacheEverything`, 200-299 响应强制使用一年 Edge TTL, 重定向立即过期, 错误响应不缓存; WebSocket Transport 将对应统计标记为 Worker Fetch 缓存。
 - 2026-08-09: 删除已无消费者的 `rangeRequestMode`; 当前 Loader 的 rescue 对所有 Transport 都从原 Chunk 起点完整重下, Transport 不再暴露旧版部分续传策略。
-- 2026-08-09: WebSocket Transport 接入统一 `TransportStatistics`, 按调用方实际消费的 response body 统计请求与字节, 将 Edge Worker 转发的 `CF-Cache-Status` 明确标记为上游缓存; 三种 Transport 同时公开统计快照。
+- 2026-08-09: WebSocket Transport 接入统一 `TransportStatistics`, 按调用方实际消费的 response body 统计请求与字节, 将 WebSocket Transport Worker 转发的 `CF-Cache-Status` 明确标记为上游缓存; 三种 Transport 同时公开统计快照。
 - 2026-08-09: Loader 的 rescue 检测改为可关闭的统一策略; body 连续 2 秒无数据判定停滞, 持续有数据但明显低于同期 GET 中位速率且重试预计更快时也取消当前请求并重新领取, Transport 接口不增加慢速语义。
 - 2026-08-08: 新 Loader 改为逐段读取统一 Transport response body, 恢复响应头、流量空闲和完整请求超时; 停滞 Chunk 由 Loader 取消并重新领取, 不向 Fetch Transport 引入调度状态。
 - 2026-08-08: 新 `ParallelSegmentLoader` 接回统一 `HttpTransport`, 默认 Fetch, example 恢复 Fetch、HTTP Proxy 和 WebSocket relay 选择; 慢速补救明确为尚未迁移。
 - 2026-08-07: WebSocket relay 恢复流式 response 和 CANCEL；控制消息使用 Protobuf，body 使用 128 KiB 原始 frame；删除 `responseMode`，Loader 对所有 Transport 统一启用首字节、流量空闲和慢速补救。继续保留单连接串行 Keep-Alive、现有连接池策略，不恢复心跳和最大连接寿命。
-- 2026-08-07: Edge Worker 切换为 Paid 运行限制，CPU time 上限设为 300 秒、subrequest 上限设为 10,000，并关闭 `workers.dev` 与 Preview URL，仅保留 Dashboard 管理的 Custom Domain。
+- 2026-08-07: WebSocket Transport Worker 切换为 Paid 运行限制，CPU time 上限设为 300 秒、subrequest 上限设为 10,000，并关闭 `workers.dev` 与 Preview URL，仅保留 Dashboard 管理的 Custom Domain。
 - 2026-08-07: wire protocol 升级为 version 2；Response 删除 status text、正常响应的空 error message 和未重定向 URL，response header 改为固定 ID 白名单，Request header 长度字段同步收紧。
 - 2026-08-07: 从零重写 WebSocket relay。每个事务改为一条 Request 和一条完整 Response，删除 Protobuf、多帧 body、取消协议、心跳和最大连接寿命；连接池改为优先复用年轻连接、空闲下限回收和每连接 50 次复用，Loader 增加 buffered response 模式。
 - 2026-08-06: 增加多 Origin `ProxyHttpTransport` 和无状态 `storya-http-proxy`，采用稳定 Range descriptor 缓存媒体 Chunk。
-- 2026-08-05: 建立通用 HTTP Transport 和 Edge Worker relay。
+- 2026-08-05: 建立通用 HTTP Transport 和 WebSocket Transport Worker relay。
