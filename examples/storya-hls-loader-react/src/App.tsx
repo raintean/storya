@@ -2,10 +2,7 @@ import Hls from 'hls.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
-  DEFAULT_CHUNK_SIZE,
   DEFAULT_MAX_CONCURRENCY,
-  DEFAULT_RESCUE_OPTIONS,
-  DEFAULT_WINDOW_SIZE,
   ParallelAudioStreamController,
   ParallelSegmentLoader,
   ParallelStreamController,
@@ -13,10 +10,9 @@ import {
 import type { ParallelSegmentLoaderDiagnostics } from 'storya-hls-loader'
 import { FetchHttpTransport, WebSocketHttpTransport } from 'storya-transport'
 
+import { loadExampleSettings, saveExampleSettings } from './example-settings'
+import type { LoaderMode, LoaderParameterInputs, TransportMode } from './example-settings'
 import { VirtualStreamMap } from './virtual-stream-map'
-
-const defaultSource =
-  'https://cdn.radiantmediatechs.com/rmp/media/samples-for-rmp-site/04052024-lac-de-bimont/hls/playlist.m3u8'
 
 interface PlaybackMetrics {
   bandwidth: number
@@ -50,16 +46,6 @@ interface LogEntryOptions {
   tag?: string
 }
 
-interface LoaderParameterInputs {
-  chunkSizeMiB: string
-  maxConcurrency: string
-  rescueEnabled: boolean
-  rescueMaxAttempts: string
-  slowRateThresholdPercent: string
-  stallTimeoutMs: string
-  windowSize: string
-}
-
 interface LoaderParameters {
   chunkSize: number
   maxConcurrency: number
@@ -87,9 +73,7 @@ interface PlaybackLevel {
   width: number
 }
 
-type LoaderMode = 'native' | 'parallel'
 type LogTone = 'default' | 'error' | 'preempted' | 'rescued' | 'success'
-type TransportMode = 'fetch' | 'websocket'
 
 const websocketCancelTimeoutMs = 10_000
 const websocketConnectTimeoutMs = 10_000
@@ -98,16 +82,6 @@ const websocketIdleConnectionTimeoutMs = 30_000
 const websocketMaxConnections = DEFAULT_MAX_CONCURRENCY * 2
 const websocketMaxRequestsPerConnection = 50
 const websocketMinIdleConnections = 6
-
-const defaultLoaderParameterInputs: LoaderParameterInputs = {
-  chunkSizeMiB: String(DEFAULT_CHUNK_SIZE / (1024 * 1024)),
-  maxConcurrency: String(DEFAULT_MAX_CONCURRENCY),
-  rescueEnabled: true,
-  rescueMaxAttempts: String(DEFAULT_RESCUE_OPTIONS.maxAttempts),
-  slowRateThresholdPercent: String(DEFAULT_RESCUE_OPTIONS.slowRateThresholdRatio * 100),
-  stallTimeoutMs: String(DEFAULT_RESCUE_OPTIONS.stallTimeoutMs),
-  windowSize: String(DEFAULT_WINDOW_SIZE),
-}
 
 const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
@@ -150,16 +124,13 @@ export function App() {
   const logIdRef = useRef(0)
   const playbackLevelIndexRef = useRef(-1)
   const rescueEventOutcomesRef = useRef(new Map<number, 'pending' | 'recovered'>())
-  const [loaderMode, setLoaderMode] = useState<LoaderMode>('parallel')
-  const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
-  const [workerUrl, setWorkerUrl] = useState('')
-  const [loaderParameterInputs, setLoaderParameterInputs] = useState(defaultLoaderParameterInputs)
+  const [settings, setSettings] = useState(() => loadExampleSettings())
+  const { loaderMode, loaderParameterInputs, source, transportMode, workerUrl } = settings
   const [activeLoaderMode, setActiveLoaderMode] = useState<LoaderMode | null>(null)
   const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
   const [activeLoaderParameters, setActiveLoaderParameters] = useState<LoaderParameters | null>(
     null,
   )
-  const [source, setSource] = useState(defaultSource)
   const [qualityLevels, setQualityLevels] = useState<QualityLevel[]>([])
   const [selectedLevel, setSelectedLevel] = useState(-2)
   const [playbackLevel, setPlaybackLevel] = useState<PlaybackLevel | null>(null)
@@ -169,6 +140,10 @@ export function App() {
   const [diagnostics, setDiagnostics] = useState(emptyDiagnostics)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    saveExampleSettings(settings)
+  }, [settings])
 
   const appendLog = useCallback(
     (message: string, tone: LogTone = 'default', options: LogEntryOptions = {}) => {
@@ -512,7 +487,7 @@ export function App() {
 
   const handleLoaderModeChange = (value: string) => {
     const mode: LoaderMode = value === 'native' ? 'native' : 'parallel'
-    setLoaderMode(mode)
+    setSettings(current => ({ ...current, loaderMode: mode }))
 
     if (hlsRef.current !== null && mode !== activeLoaderMode) {
       appendLog('加载器设置已改变, 点击 LOAD STREAM 重建加载会话', 'default', {
@@ -523,7 +498,7 @@ export function App() {
 
   const handleTransportModeChange = (value: string) => {
     const mode: TransportMode = value === 'websocket' ? 'websocket' : 'fetch'
-    setTransportMode(mode)
+    setSettings(current => ({ ...current, transportMode: mode }))
     if (
       hlsRef.current !== null &&
       activeLoaderMode === 'parallel' &&
@@ -539,7 +514,10 @@ export function App() {
     name: Name,
     value: LoaderParameterInputs[Name],
   ) => {
-    setLoaderParameterInputs(current => ({ ...current, [name]: value }))
+    setSettings(current => ({
+      ...current,
+      loaderParameterInputs: { ...current.loaderParameterInputs, [name]: value },
+    }))
   }
 
   const handleLevelChange = (value: string) => {
@@ -629,7 +607,7 @@ export function App() {
           id="source"
           type="url"
           value={source}
-          onChange={event => setSource(event.target.value)}
+          onChange={event => setSettings(current => ({ ...current, source: event.target.value }))}
           placeholder="https://example.com/master.m3u8"
           required
         />
@@ -776,7 +754,9 @@ export function App() {
                     id="worker-url"
                     type="url"
                     value={workerUrl}
-                    onChange={event => setWorkerUrl(event.target.value)}
+                    onChange={event =>
+                      setSettings(current => ({ ...current, workerUrl: event.target.value }))
+                    }
                     placeholder="https://storya-websocket-transport.example.com"
                     required
                   />

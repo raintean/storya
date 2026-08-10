@@ -22,7 +22,7 @@ Cloudflare Worker  storya-websocket-transport
 
 - `storya-web` 面向最终用户，负责视频浏览、播放和用户交互。当前仅包含基础页面骨架，并已经使用 `storya-player`。
 - `storya-admin` 面向运营和管理人员。当前仅包含基础页面骨架。
-- `storya-hls-loader-react` 是 HLS 并行加载器的 React 交互示例，保留在 `examples/`，通过 Cloudflare Workers Static Assets 独立部署。
+- `storya-hls-loader-react` 是 HLS 并行加载器的 React 交互示例，保留在 `examples/`，通过 Cloudflare Workers Static Assets 独立部署。页面使用版本化 localStorage 自动保存 HLS 地址、Loader/Transport 模式、Worker 地址和并行加载参数；首次访问不内置播放地址，播放进度、清晰度、日志和诊断等会话状态不持久化。
 - `storya-api` 是中心 API 服务，负责未来的核心业务接口。当前只实现 `/health`。
 - `storya-websocket-transport` 是部署在 Cloudflare Workers 上的 WebSocket Transport 单元。当前实现 `/health` 和 `/transport`，通过流式 HTTP-over-WebSocket 协议透明转发 GET/HEAD。
 - `storya-player` 是框架无关的 Web Component。当前封装原生 `<video>` 元素及基础属性同步，尚未实现自适应码流、DRM、字幕或播放遥测。
@@ -191,6 +191,7 @@ Buf 当前禁用 `PACKAGE_DIRECTORY_MATCH` 和 `PACKAGE_VERSION_SUFFIX`，分别
 
 ## 修改历史
 
+- 2026-08-10: React 交互示例使用版本化 localStorage 自动保存用户配置，首次访问不再内置播放地址；Transport 切换只控制配置显隐，不清空 Worker 地址。
 - 2026-08-10: 为 `examples/storya-hls-loader-react` 增加 Workers Static Assets 部署入口，并明确顶层目录按项目职责而非部署平台划分。
 - 2026-08-10: 新增服务端 Worker 能力的顶层 `workers/` 分类，并将 `services/storya-edge-worker` 迁移为 `workers/storya-websocket-transport`，叶子项目名只表达具体职责。
 - 2026-08-10: 删除没有产品消费者且与 Fetch/WebSocket relay 能力重叠的 HTTP Proxy Transport 和独立 Rust proxy 服务，网络实现收敛为 Fetch 与 HTTP-over-WebSocket。
