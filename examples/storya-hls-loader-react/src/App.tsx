@@ -11,7 +11,7 @@ import {
   ParallelStreamController,
 } from 'storya-hls-loader'
 import type { ParallelSegmentLoaderDiagnostics } from 'storya-hls-loader'
-import { FetchHttpTransport, ProxyHttpTransport, WebSocketHttpTransport } from 'storya-transport'
+import { FetchHttpTransport, WebSocketHttpTransport } from 'storya-transport'
 
 import { VirtualStreamMap } from './virtual-stream-map'
 
@@ -89,7 +89,7 @@ interface PlaybackLevel {
 
 type LoaderMode = 'native' | 'parallel'
 type LogTone = 'default' | 'error' | 'preempted' | 'rescued' | 'success'
-type TransportMode = 'fetch' | 'proxy' | 'websocket'
+type TransportMode = 'fetch' | 'websocket'
 
 const websocketCancelTimeoutMs = 10_000
 const websocketConnectTimeoutMs = 10_000
@@ -153,7 +153,6 @@ export function App() {
   const [loaderMode, setLoaderMode] = useState<LoaderMode>('parallel')
   const [transportMode, setTransportMode] = useState<TransportMode>('fetch')
   const [workerUrl, setWorkerUrl] = useState('')
-  const [proxyOriginsText, setProxyOriginsText] = useState('')
   const [loaderParameterInputs, setLoaderParameterInputs] = useState(defaultLoaderParameterInputs)
   const [activeLoaderMode, setActiveLoaderMode] = useState<LoaderMode | null>(null)
   const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
@@ -305,7 +304,6 @@ export function App() {
 
       if (Hls.isSupported()) {
         let relayEndpoint: string | undefined
-        let proxyOrigins: string[] | undefined
         if (loaderMode === 'parallel' && transportMode === 'websocket') {
           try {
             relayEndpoint = resolveRelayEndpoint(workerUrl)
@@ -316,25 +314,13 @@ export function App() {
             appendLog(message, 'error', { tag: 'Transport' })
             return
           }
-        } else if (loaderMode === 'parallel' && transportMode === 'proxy') {
-          try {
-            proxyOrigins = parseProxyOrigins(proxyOriginsText)
-          } catch (cause) {
-            const message = cause instanceof Error ? cause.message : 'Proxy Origins 无效'
-            setStatus('等待有效的 Proxy Origins')
-            setError(message)
-            appendLog(message, 'error', { tag: 'Transport' })
-            return
-          }
         }
 
         const transport =
           loaderMode !== 'parallel'
             ? undefined
             : relayEndpoint === undefined
-              ? proxyOrigins === undefined
-                ? new FetchHttpTransport()
-                : new ProxyHttpTransport(proxyOrigins)
+              ? new FetchHttpTransport()
               : new WebSocketHttpTransport(relayEndpoint, {
                   cancelTimeoutMs: websocketCancelTimeoutMs,
                   connectTimeoutMs: websocketConnectTimeoutMs,
@@ -493,9 +479,7 @@ export function App() {
           appendLog(
             relayEndpoint !== undefined
               ? `并行加载器配置为 WebSocket Relay: ${relayEndpoint}`
-              : proxyOrigins !== undefined
-                ? `并行加载器配置为 HTTP Proxy Transport: ${proxyOrigins.length} 个 Origin`
-                : '并行加载器配置为 Browser Fetch Transport',
+              : '并行加载器配置为 Browser Fetch Transport',
             'default',
             { tag: 'Transport' },
           )
@@ -520,7 +504,6 @@ export function App() {
       destroyPlaybackSession,
       loaderParameterInputs,
       loaderMode,
-      proxyOriginsText,
       source,
       transportMode,
       workerUrl,
@@ -539,8 +522,7 @@ export function App() {
   }
 
   const handleTransportModeChange = (value: string) => {
-    const mode: TransportMode =
-      value === 'websocket' ? 'websocket' : value === 'proxy' ? 'proxy' : 'fetch'
+    const mode: TransportMode = value === 'websocket' ? 'websocket' : 'fetch'
     setTransportMode(mode)
     if (
       hlsRef.current !== null &&
@@ -780,15 +762,12 @@ export function App() {
                 onChange={event => handleTransportModeChange(event.target.value)}
               >
                 <option value="fetch">Browser Fetch</option>
-                <option value="proxy">HTTP Proxy</option>
                 <option value="websocket">WebSocket Relay</option>
               </select>
               <p className="transport-note">
-                {transportMode === 'proxy'
-                  ? 'Proxy 的物理请求为可缓存 200, Loader 会从响应头恢复逻辑 206.'
-                  : transportMode === 'websocket'
-                    ? '媒体请求通过 WebSocket relay, Segment 中显示上游逻辑状态.'
-                    : 'Fetch 遇到 CORS 隐藏 Content-Range 时会用一个 HEAD 200 读取长度, 不重复下载完整 Segment.'}
+                {transportMode === 'websocket'
+                  ? '媒体请求通过 WebSocket relay, Segment 中显示上游逻辑状态.'
+                  : 'Fetch 遇到 CORS 隐藏 Content-Range 时会用一个 HEAD 200 读取长度, 不重复下载完整 Segment.'}
               </p>
               {loaderMode === 'parallel' && transportMode === 'websocket' ? (
                 <div className="transport-endpoint">
@@ -802,20 +781,6 @@ export function App() {
                     required
                   />
                   <small>可填写 Worker 根 URL 或完整的 wss://.../transport 地址</small>
-                </div>
-              ) : null}
-              {loaderMode === 'parallel' && transportMode === 'proxy' ? (
-                <div className="transport-endpoint">
-                  <label htmlFor="proxy-origins">PROXY ORIGINS</label>
-                  <textarea
-                    id="proxy-origins"
-                    rows={3}
-                    value={proxyOriginsText}
-                    onChange={event => setProxyOriginsText(event.target.value)}
-                    placeholder={'https://proxy-1.example.com\nhttps://proxy-2.example.com'}
-                    required
-                  />
-                  <small>填写一个或多个 HTTP(S) Origin, 使用换行、空格或逗号分隔</small>
                 </div>
               ) : null}
               {loaderMode === 'parallel' ? (
@@ -1248,7 +1213,7 @@ function formatTransportMode(mode: TransportMode | null): string {
   if (mode === 'websocket') {
     return 'WebSocket Relay'
   }
-  return mode === 'proxy' ? 'HTTP Proxy' : 'Browser Fetch'
+  return 'Browser Fetch'
 }
 
 function formatLoaderMode(mode: LoaderMode | null): string {
@@ -1321,30 +1286,6 @@ function parseLoaderParameters(inputs: LoaderParameterInputs): LoaderParameters 
       : false,
     windowSize,
   }
-}
-
-function parseProxyOrigins(value: string): string[] {
-  const values = value
-    .split(/[\s,]+/u)
-    .map(item => item.trim())
-    .filter(item => item.length > 0)
-  if (values.length === 0) {
-    throw new Error('使用 HTTP Proxy 前需要填写至少一个 Proxy Origin')
-  }
-
-  const origins = values.map(value => {
-    let url: URL
-    try {
-      url = new URL(value)
-    } catch {
-      throw new Error(`Proxy Origin 格式无效: ${value}`)
-    }
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-      throw new Error(`Proxy Origin 必须使用 http 或 https: ${value}`)
-    }
-    return url.origin
-  })
-  return [...new Set(origins)]
 }
 
 function resolveRelayEndpoint(value: string): string {

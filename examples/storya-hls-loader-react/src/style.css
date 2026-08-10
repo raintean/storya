@@ -1005,8 +1005,7 @@ select:disabled {
   letter-spacing: 0.14em;
 }
 
-.transport-endpoint input,
-.transport-endpoint textarea {
+.transport-endpoint input {
   width: 100%;
   padding: 9px;
   color: #d9e3df;
@@ -1018,8 +1017,7 @@ select:disabled {
   resize: vertical;
 }
 
-.transport-endpoint input:focus,
-.transport-endpoint textarea:focus {
+.transport-endpoint input:focus {
   border-color: rgb(98 245 178 / 65%);
   outline: none;
 }

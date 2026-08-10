@@ -9,11 +9,10 @@ Storya 是一个由 Rust 和 TypeScript 构建的视频解决方案 monorepo。�
 - `apps/storya-web`: 面向用户的 Web 前台。
 - `apps/storya-admin`: 面向管理人员的 Web 前台。
 - `services/storya-api`: Rust 中心 API 服务。
-- `services/storya-http-proxy`: Rust 无状态 HTTP proxy，通过 Cloudflare CDN 提供多域名 GET/HEAD 直通。
 - `services/storya-edge-worker`: 基于 Cloudflare Workers 的边缘能力部署单元，当前提供通用 HTTP relay。
 - `packages/storya-player`: 框架无关的 Web Component 播放器。
 - `packages/storya-hls-loader`: 基于自定义 hls.js StreamController 和 fLoader 的 HLS 并行加载器。
-- `packages/storya-transport`: 提供 Fetch、HTTP Proxy 和 HTTP-over-WebSocket Transport。
+- `packages/storya-transport`: 提供 Fetch 和 HTTP-over-WebSocket Transport。
 - `packages/storya-protocol`: 使用 Protobuf 和 Buf 维护的 Rust/TypeScript 共用协议。
 
 ## 工作方式

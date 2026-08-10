@@ -1,6 +1,6 @@
 # HTTP Transport 设计
 
-本文描述 Storya 当前采用的通用 HTTP Transport、普通 Fetch、基于 HTTP 的多域名 Proxy，以及基于连接池的 HTTP-over-WebSocket relay。Transport 只表达 HTTP 请求与响应，不理解 HLS、Segment、Range 调度或媒体业务。
+本文描述 Storya 当前采用的通用 HTTP Transport、普通 Fetch 和基于连接池的 HTTP-over-WebSocket relay。Transport 只表达 HTTP 请求与响应，不理解 HLS、Segment、Range 调度或媒体业务。
 
 ## 组件边界
 
@@ -10,16 +10,13 @@ storya-hls-loader
         v
 storya-transport
   |
-  +---- FetchHttpTransport --------------------------------------> HTTP 源站
+  +---- FetchHttpTransport -------------------------> HTTP 源站
   |
-  +---- ProxyHttpTransport ----> Cloudflare CDN ----> storya-http-proxy ----> HTTP 源站
-  |
-  +---- WebSocketHttpTransport ---------------------> storya-edge-worker ----> HTTP 源站
+  +---- WebSocketHttpTransport ----> storya-edge-worker ----> HTTP 源站
 ```
 
-- `storya-transport` 提供统一的 `HttpTransport` 接口和三种网络实现。
-- `storya-hls-loader` 的 `ParallelSegmentLoader` 持有一个 `HttpTransport`; `SegmentPlanningWork` 通过它执行 HEAD, `SegmentFetchWork` 通过它执行 GET。默认使用 Fetch, example 可以选择 HTTP Proxy 或 WebSocket relay。HLS 语义始终留在 `storya-hls-loader` 中。
-- `storya-http-proxy` 是 Rust 实现的无状态 HTTP proxy。
+- `storya-transport` 提供统一的 `HttpTransport` 接口和两种网络实现。
+- `storya-hls-loader` 的 `ParallelSegmentLoader` 持有一个 `HttpTransport`; `SegmentPlanningWork` 通过它执行 HEAD, `SegmentFetchWork` 通过它执行 GET。默认使用 Fetch, example 可以选择 WebSocket relay。HLS 语义始终留在 `storya-hls-loader` 中。
 - `storya-edge-worker` 是无状态 WebSocket HTTP relay，每条连接串行处理请求，连接池提供并发。
 - WebSocket relay 的控制消息由 `storya-protocol` 中的 Protobuf schema 描述，媒体 body 使用原始二进制 frame。
 
@@ -34,21 +31,7 @@ interface HttpTransport {
 }
 ```
 
-Fetch、Proxy 和 WebSocket Transport 都返回流式 response。Transport 不暴露加载器调度策略；窗口失效、超时、停滞和相对慢速补救由 Loader 通过标准 `Request.signal` 与 `ReadableStream.cancel()` 表达。
-
-## HTTP Proxy Transport
-
-`ProxyHttpTransport` 接受一个或多个 HTTP(S) Proxy Origin。每个 Range 使用目标 URL 和分片位置稳定选择 Origin，域名更换时重建 Transport 即可。
-
-目标 URL、逻辑 method 和可选 Range 使用 UTF-8 与无 padding Base64URL 编码为：
-
-```text
-/proxy/<descriptor>.jpg
-```
-
-`.jpg` 后缀和 `image/jpeg` Content-Type 用于获得 Cloudflare 静态资源缓存语义。Rust proxy 将上游 206 包装为可缓存的 200，把原始 status、Content-Range、Content-Length 和 Content-Type 放入 `x-storya-proxy-*` header，由客户端恢复。
-
-Rust proxy 不建立本地缓存。HEAD、Range 未命中和错误响应不进入 CDN 缓存。当前 descriptor 没有签名，公开部署前仍需增加授权、Origin allowlist 和内网地址防护。
+Fetch 和 WebSocket Transport 都返回流式 response。Transport 不暴露加载器调度策略；窗口失效、超时、停滞和相对慢速补救由 Loader 通过标准 `Request.signal` 与 `ReadableStream.cancel()` 表达。
 
 ## WebSocket 事务
 
@@ -88,7 +71,7 @@ Worker 以 128 KiB 为目标读取上游 body。每次为 frame header 和 body 
 
 WebSocket Transport 收到 `RESPONSE_HEAD` 后立即返回 `HttpTransportResponse`，后续 `RESPONSE_BODY` 逐帧进入 `ReadableStream`，`RESPONSE_END` 关闭流。
 
-Fetch、Proxy 和 WebSocket 对 HLS Loader 统一表现为流式 Transport。HEAD 与 GET 共用 `SegmentLoadWorker` 固定并发池。`SegmentFetchWork` 使用 `ReadableStreamDefaultReader` 逐段读取 GET body, 实时更新 Chunk 已接收字节。两种 Work 都通过 Request AbortSignal 表达窗口取消和请求超时; response head 已返回的 GET 还会使用 body cancel。调度优先级只影响空闲 Worker 的下一次领取, 不取消已经发出的有效请求。
+Fetch 和 WebSocket 对 HLS Loader 统一表现为流式 Transport。HEAD 与 GET 共用 `SegmentLoadWorker` 固定并发池。`SegmentFetchWork` 使用 `ReadableStreamDefaultReader` 逐段读取 GET body, 实时更新 Chunk 已接收字节。两种 Work 都通过 Request AbortSignal 表达窗口取消和请求超时; response head 已返回的 GET 还会使用 body cancel。调度优先级只影响空闲 Worker 的下一次领取, 不取消已经发出的有效请求。
 
 连续无数据、相对同期 GET 明显过慢或请求超时由 `SegmentFetchWork` 结束当前 attempt; 救援额度内会把 Chunk 恢复为可调度状态, 后续重新领取属于 `SegmentLoadWorker` 的调度。额度耗尽后不再检测相对慢速, 但再次停滞会取消请求并快速失败 Segment。Transport 不参与这些判断。
 
@@ -150,9 +133,9 @@ Worker 使用 Paid 计划运行，CPU time 上限为 300 秒，单次调用 subr
 
 ## 可观测性
 
-Fetch、Proxy 和 WebSocket Transport 共用 `TransportStatistics`。请求通过各自参数校验并正式进入 Transport 后开始计数, `HttpTransportResponse` 在统一边界包装 body, 因而三者按相同口径统计请求、成功、失败、取消和调用方实际消费的响应字节。每个具体 Transport 通过 `getStatistics()` 返回只读快照; 有变化时默认每 5 秒输出一次单行摘要。
+Fetch 和 WebSocket Transport 共用 `TransportStatistics`。请求通过各自参数校验并正式进入 Transport 后开始计数, `HttpTransportResponse` 在统一边界包装 body, 因而两者按相同口径统计请求、成功、失败、取消和调用方实际消费的响应字节。统计包装流不预取 body, 未被调用方读取的数据不计入响应字节。每个具体 Transport 通过 `getStatistics()` 返回只读快照; 有变化时默认每 5 秒输出一次单行摘要。
 
-缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态, Proxy 表示物理 Proxy HTTP 响应的 CDN 缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; Edge Worker 转发的状态表示配置在 Worker 子请求上的 Cloudflare Fetch Cache, 所以它的摘要标记为“Worker Fetch 缓存”。
+缓存分类读取 response 的 `CF-Cache-Status`: `HIT`、`REVALIDATED`、`STALE`、`UPDATING` 计为命中, `MISS`、`EXPIRED` 计为未命中, `BYPASS`、`DYNAMIC` 单独计数, 缺失或未知值计为 unknown。Fetch 表示目标响应可见的缓存状态。WebSocket 隧道本身不参与 HTTP CDN 缓存; Edge Worker 转发的状态表示配置在 Worker 子请求上的 Cloudflare Fetch Cache, 所以它的摘要标记为“Worker Fetch 缓存”。
 
 WebSocket 连接池自定义 debug 回调仍然独立记录连接创建、建立和关闭，包含连接年龄、请求次数、池大小和关闭原因。正常回收原因只有 `idle` 与 `max-requests`。调用方使用内置 `debug: true` 时，控制台只额外输出连接关闭事件, 不把连接生命周期混入请求统计。
 
@@ -160,10 +143,12 @@ Edge Worker 保留持久化 Workers Logs 和 invocation logs。正常 request/re
 
 ## 实现状态
 
-Fetch、Proxy、WebSocket Transport、统一请求/流量/缓存统计、Rust HTTP proxy、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
+Fetch、WebSocket Transport、统一请求/流量/缓存统计、Protobuf 控制帧、128 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
 
 ## 修改历史
 
+- 2026-08-10: 删除没有产品消费者且与现有网络路径能力重叠的 `ProxyHttpTransport` 和 `storya-http-proxy`; Transport 收敛为 Fetch 与 WebSocket relay。
+- 2026-08-10: 统计包装流改为零预取, 只记录调用方实际读取的 response body 字节, 避免取消请求多算一个预取 chunk。
 - 2026-08-09: Edge Worker 的 GET/HEAD 子请求启用 `cacheEverything`, 200-299 响应强制使用一年 Edge TTL, 重定向立即过期, 错误响应不缓存; WebSocket Transport 将对应统计标记为 Worker Fetch 缓存。
 - 2026-08-09: 删除已无消费者的 `rangeRequestMode`; 当前 Loader 的 rescue 对所有 Transport 都从原 Chunk 起点完整重下, Transport 不再暴露旧版部分续传策略。
 - 2026-08-09: WebSocket Transport 接入统一 `TransportStatistics`, 按调用方实际消费的 response body 统计请求与字节, 将 Edge Worker 转发的 `CF-Cache-Status` 明确标记为上游缓存; 三种 Transport 同时公开统计快照。

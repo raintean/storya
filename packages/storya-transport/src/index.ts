@@ -8,13 +8,6 @@ export type {
   HttpTransportResponse,
 } from './http-transport'
 export type { TransportStatisticsSnapshot } from './transport-statistics'
-export {
-  createProxyUrl,
-  decodeProxyTargetUrl,
-  encodeProxyTargetUrl,
-  ProxyHttpTransport,
-} from './proxy-http-transport'
-export type { ProxyByteRange } from './proxy-http-transport'
 export { WebSocketHttpTransport } from './websocket-http-transport'
 export type {
   WebSocketFactory,

@@ -11,7 +11,7 @@
 - 窗口推进时保留重叠 Segment, 只驱离既不在窗口中、也没有正式读取者的 Segment。
 - 使用一份可直接检查的共享数据模型协调 Controller、fLoader 和 Worker, 不建立细粒度命令或回调网络。
 - 所有共享状态修改保持同步和原子, 异步 Transport 结果不能覆盖已经失效的新状态。
-- 保留 Transport 注入能力, 支持 Fetch、HTTP Proxy 和 HTTP-over-WebSocket。
+- 保留 Transport 注入能力, 支持 Fetch 和 HTTP-over-WebSocket。
 - 将多个并行 GET 的实际传输投影成 hls.js ABR 可消费的单 Fragment 等效时序。
 
 ## 非目标
@@ -519,7 +519,7 @@ failed  { failure }
 
 ## 长度发现、Chunk 规划与 Range 行为
 
-默认 Chunk 大小为 2 MiB, 与 HTTP Proxy shard 大小一致。尾部不足半个 Chunk 时合并到前一个 Chunk, 避免极小请求。
+默认 Chunk 大小为 2 MiB。尾部不足半个 Chunk 时合并到前一个 Chunk, 避免极小请求。
 
 ### m3u8 已知 HLS byte range
 
@@ -560,7 +560,7 @@ HEAD 结果允许乱序返回。后续 Segment 即使已经 planned, 只要前�
 
 ### CORS 可见性要求
 
-最佳性能要求 Origin 或 Proxy 向浏览器暴露 `Content-Range`。`206` 本身只能证明请求得到部分响应, 不能提供完整资源长度。m3u8 byte range 和 HEAD `Content-Length` 都可以作为独立可信长度来源, 但实际 GET 仍需校验状态、边界和接收字节数。
+Fetch 路径的最佳性能要求 Origin 通过 CORS 向浏览器暴露 `Content-Range`; WebSocket Relay 不受浏览器 CORS response header 可见性限制。`206` 本身只能证明请求得到部分响应, 不能提供完整资源长度。m3u8 byte range 和 HEAD `Content-Length` 都可以作为独立可信长度来源, 但实际 GET 仍需校验状态、边界和接收字节数。
 
 不同 Range response 在可用时比较 ETag 或 Last-Modified。validator 变化会使整个 Segment 失败, 避免拼接不同资源版本。
 
@@ -606,8 +606,6 @@ HEAD 和 GET 都占用 Worker 槽位并使用两类正常请求时限; GET 另�
 GET body 每产生一段数据, Work 同步更新 TransferTracker。响应头已经证明状态、Range 边界和 validator 时, 数据同时追加到共享 Chunk 的 filling data 并可供正式 fLoader 渐进读取; 否则继续保存在 Work 局部直到完整验证。完整 body 验证通过后提交精确的 ready data。rescue 会丢弃当前 attempt 的 filling data 或局部 parts, 下一次从相同 Chunk 起点完整重下, 不跨 attempt 复用部分数据。
 
 `rescue.maxAttempts > 0` 时每个 attempt 都安装停滞检测。当前 Chunk 的 `rescueAttempts < rescue.maxAttempts` 时还会安装相对慢速检测, 并允许停滞或慢速触发重新领取; 次数耗尽后不再判断相对慢速, 但停滞会快速终止 Segment, 避免单个 Chunk 等待正常完整请求时限。
-
-Proxy 为获得 CDN 缓存语义可能把上游 `206` 包装成物理 `200`; `ProxyHttpTransport` 在返回 HLS Loader 前恢复逻辑 status 和 `Content-Range`。因此浏览器 Network 面板可能显示 `200`, 诊断中仍显示逻辑 `206`。
 
 ## 错误、补救与重试
 
@@ -785,7 +783,7 @@ const diagnostics = loader.getDiagnostics()
 - ETag/Last-Modified 一致性检查。
 - canonical Segment 缓存、窗口重叠保留和确定性驱离。
 - hls.js 正式 reader 对连续 filling/ready 数据的有序渐进提交。
-- Fetch、HTTP Proxy 和 WebSocket Transport 注入。
+- Fetch 和 WebSocket Transport 注入。
 - 基于并行 GET 活跃区间的 Loader 聚合带宽估计, 以及排除缓存驻留时间的 hls.js LoaderStats 适配。
 - Stream/Segment/Chunk/Worker 诊断。
 
@@ -798,6 +796,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-10: 删除 HTTP Proxy Transport 注入路径, 保留 Browser Fetch 和 HTTP-over-WebSocket 两种网络实现。
 - 2026-08-09: main/audio Controller 在 seek 取消渐进 Fragment 后重置对应 transmuxer, 隔离同一 Fragment 重试的旧 partial parser 状态和延迟 Worker 结果。
 - 2026-08-09: fLoader 支持按 highWaterMark 有序提交已经通过响应头校验的连续 filling/ready 数据; rescue 重试依靠 reader 游标跳过已提交前缀, 最终从 canonical Segment 补齐尾部并以空 payload 完成; example 在并行模式下显式开启 hls.js progressive。
 - 2026-08-09: 全局 listener 通知改为固定 8ms 的 leading + trailing 合并调度, 保持统一 `update()` 和逐事务 revision, 限制高频 body 进度更新引起的 Worker 与 FragmentLoader 唤醒。
