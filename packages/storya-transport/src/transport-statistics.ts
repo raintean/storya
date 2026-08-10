@@ -272,27 +272,31 @@ class StatisticsHttpTransportResponse implements HttpTransportResponse {
     }
 
     const reader = response.body.getReader()
-    this.body = new ReadableStream<Uint8Array>({
-      async cancel(reason) {
-        onCancel?.()
-        await reader.cancel(reason)
-      },
-      async pull(controller) {
-        try {
-          const result = await reader.read()
-          if (result.done) {
-            onComplete?.()
-            controller.close()
-            return
+    this.body = new ReadableStream<Uint8Array>(
+      {
+        async cancel(reason) {
+          onCancel?.()
+          await reader.cancel(reason)
+        },
+        async pull(controller) {
+          try {
+            const result = await reader.read()
+            if (result.done) {
+              onComplete?.()
+              controller.close()
+              return
+            }
+            onBytes(result.value.byteLength)
+            controller.enqueue(result.value)
+          } catch (error) {
+            onError?.(error)
+            controller.error(error)
           }
-          onBytes(result.value.byteLength)
-          controller.enqueue(result.value)
-        } catch (error) {
-          onError?.(error)
-          controller.error(error)
-        }
+        },
       },
-    })
+      // 禁止包装流预取尚未由调用方消费的数据
+      { highWaterMark: 0 },
+    )
   }
 
   arrayBuffer(): Promise<ArrayBuffer> {

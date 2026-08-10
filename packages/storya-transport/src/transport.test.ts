@@ -263,6 +263,31 @@ async function testTransportStatistics(): Promise<void> {
   assert(logs.length === logCount, 'Transport 统计销毁后仍在输出日志')
 }
 
+async function testUnconsumedResponseStatistics(): Promise<void> {
+  const statistics = new TransportStatistics('TestTransport')
+  const response = statistics.startRequest().trackResponse(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]))
+        },
+      }),
+    ),
+  )
+
+  await delay(0)
+  const pending = statistics.snapshot()
+  assert(pending.responseBytes === 0, 'Transport 统计不应预先计入未消费的响应字节')
+  assert(pending.activeRequestCount === 1, '未消费的响应应保持活动状态')
+
+  await response.body?.cancel()
+  const canceled = statistics.snapshot()
+  assert(canceled.responseBytes === 0, '取消响应不应计入未消费的响应字节')
+  assert(canceled.canceledCount === 1, '未消费的响应取消后没有计入取消统计')
+  assert(canceled.activeRequestCount === 0, '取消响应后仍有活动统计')
+  statistics.destroy()
+}
+
 async function testFetchTransport(): Promise<void> {
   let requestedUrl = ''
   const transport = new FetchHttpTransport(async request => {
@@ -677,6 +702,7 @@ function assert(condition: boolean, message: string): asserts condition {
 
 testTransportFrameBodyView()
 await testTransportStatistics()
+await testUnconsumedResponseStatistics()
 await testFetchTransport()
 await testWebSocketTransportStatistics()
 await testStreamingResponse()
