@@ -1,4 +1,4 @@
-import type { HttpTransportResponse } from './http-transport'
+import type { HttpTransportResponse } from '../http-transport'
 
 export class WebSocketHttpResponse implements HttpTransportResponse {
   readonly body: ReadableStream<Uint8Array> | null

@@ -8,7 +8,7 @@ export type {
   HttpTransportResponse,
 } from './http-transport'
 export type { TransportStatisticsSnapshot } from './transport-statistics'
-export { WebSocketHttpTransport } from './websocket-http-transport'
+export { WebSocketHttpTransport } from './websocket/transport'
 export type {
   WebSocketFactory,
   WebSocketHttpTransportDebugEvent,
@@ -17,4 +17,4 @@ export type {
   WebSocketHttpTransportOptions,
   WebSocketChannelState,
   WebSocketLike,
-} from './websocket-http-transport'
+} from './websocket/transport'

@@ -80,8 +80,8 @@ const websocketConnectTimeoutMs = 10_000
 const websocketDefaultMaxResponseBytes = 32 * 1024 * 1024
 const websocketIdleConnectionTimeoutMs = 30_000
 const websocketMaxConnections = DEFAULT_MAX_CONCURRENCY * 2
-const websocketMaxRequestsPerConnection = 50
-const websocketMinIdleConnections = 6
+const websocketMaxRequestsPerConnection = 500
+const websocketRetainedIdleConnections = 6
 
 const initialMetrics: PlaybackMetrics = {
   bandwidth: 0,
@@ -304,7 +304,7 @@ export function App() {
                   idleConnectionTimeoutMs: websocketIdleConnectionTimeoutMs,
                   maxConnections: websocketMaxConnections,
                   maxRequestsPerConnection: websocketMaxRequestsPerConnection,
-                  minIdleConnections: websocketMinIdleConnections,
+                  retainedIdleConnections: websocketRetainedIdleConnections,
                 })
 
         const parallelLoader =

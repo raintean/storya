@@ -7,8 +7,8 @@
   "workers_dev": false,
   "preview_urls": false,
   "limits": {
-    "cpu_ms": 300000,
-    "subrequests": 10000,
+    "cpu_ms": 5000,
+    "subrequests": 1000,
   },
   "observability": {
     "enabled": true,

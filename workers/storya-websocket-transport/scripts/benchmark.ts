@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     idleConnectionTimeoutMs: LONG_CONNECTION_TIMEOUT_MS,
     maxConnections: options.concurrency,
     maxRequestsPerConnection: MAX_REQUESTS_PER_CONNECTION,
-    minIdleConnections: options.concurrency,
+    retainedIdleConnections: options.concurrency,
   })
 
   console.info('准备 WebSocket Worker CPU benchmark', {

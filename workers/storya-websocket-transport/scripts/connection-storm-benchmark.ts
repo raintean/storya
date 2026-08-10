@@ -43,7 +43,7 @@ const CONNECT_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 const IDLE_CONNECTION_TIMEOUT_MS = 30_000
 const MAX_REQUESTS_PER_CONNECTION = 50
-const MIN_IDLE_CONNECTIONS = 6
+const RETAINED_IDLE_CONNECTIONS = 6
 const DEFAULT_URL =
   'https://cdn.radiantmediatechs.com/rmp/media/samples-for-rmp-site/04052024-lac-de-bimont/hls/avc_2160p/1.m4s'
 
@@ -76,7 +76,7 @@ async function main(): Promise<void> {
     idleConnectionTimeoutMs: IDLE_CONNECTION_TIMEOUT_MS,
     maxConnections: options.maxConnections,
     maxRequestsPerConnection: MAX_REQUESTS_PER_CONNECTION,
-    minIdleConnections: Math.min(MIN_IDLE_CONNECTIONS, options.maxConnections),
+    retainedIdleConnections: Math.min(RETAINED_IDLE_CONNECTIONS, options.maxConnections),
   })
 
   console.info('开始 WebSocket 连接风暴 benchmark', options)

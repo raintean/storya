@@ -14,22 +14,21 @@ import {
   TransportStatistics,
   type TransportStatisticsSnapshot,
 } from './transport-statistics'
-import { WebSocketHttpTransport } from './websocket-http-transport'
+import { WebSocketHttpTransport } from './websocket/transport'
 import type {
   WebSocketFactory,
   WebSocketHttpTransportDebugEvent,
   WebSocketHttpTransportOptions,
   WebSocketLike,
-} from './websocket-http-transport'
+} from './websocket/transport'
 
 interface RelayRequest {
   readonly request: HttpRequestHead
-  readonly sequence: number
   readonly socket: FakeWebSocket
 }
 
 class FakeRelay {
-  readonly canceledSequences: number[] = []
+  canceledRequests = 0
   readonly clients: FakeWebSocket[] = []
   readonly requests: RelayRequest[] = []
   ignoreCancel = false
@@ -43,15 +42,13 @@ class FakeRelay {
   accept(socket: FakeWebSocket, data: ArrayBuffer | ArrayBufferView): void {
     const frame = decodeTransportFrame(data)
     if (frame.kind === TransportFrameKind.CANCEL) {
-      this.canceledSequences.push(frame.sequence)
+      this.canceledRequests += 1
       if (!this.ignoreCancel) {
-        const index = this.requests.findIndex(
-          entry => entry.socket === socket && entry.sequence === frame.sequence,
-        )
+        const index = this.requests.findIndex(entry => entry.socket === socket)
         if (index >= 0) {
           this.requests.splice(index, 1)
         }
-        socket.receive(encodeTransportFrame(TransportFrameKind.CANCELED, frame.sequence))
+        socket.receive(encodeTransportFrame(TransportFrameKind.CANCELED))
       }
       return
     }
@@ -60,7 +57,7 @@ class FakeRelay {
     }
 
     const request = fromBinary(HttpRequestHeadSchema, frame.payload)
-    this.requests.push({ request, sequence: frame.sequence, socket })
+    this.requests.push({ request, socket })
     if (!new URL(request.url).pathname.startsWith('/hold')) {
       this.respond(request.url)
     }
@@ -83,9 +80,7 @@ class FakeRelay {
 
   respondBody(url: string, body: Uint8Array): void {
     const entry = this.findRequest(url)
-    entry.socket.receive(
-      encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, entry.sequence, body),
-    )
+    entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, body))
   }
 
   respondEnd(url: string): void {
@@ -94,7 +89,7 @@ class FakeRelay {
     if (entry === undefined) {
       throw new Error(`测试 Relay 没有等待中的请求: ${url}`)
     }
-    entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_END, entry.sequence))
+    entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_END))
   }
 
   respondHead(
@@ -116,7 +111,6 @@ class FakeRelay {
     entry.socket.receive(
       encodeTransportFrame(
         TransportFrameKind.RESPONSE_HEAD,
-        entry.sequence,
         toBinary(HttpResponseHeadSchema, head),
       ),
     )
@@ -195,12 +189,16 @@ class FakeWebSocket implements WebSocketLike {
 
 function testTransportFrameBodyView(): void {
   const payload = new Uint8Array([1, 2, 3])
-  const message = encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, 7, payload)
+  const message = encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, payload)
   const frame = decodeTransportFrame(message)
+  assert(message.byteLength === 4, 'Transport frame 应只有 1 字节固定头')
   assert(frame.payload.buffer === message.buffer, 'Transport frame 解码不应复制 body')
   assert(frame.payload.byteLength === 3, 'Transport frame body 长度错误')
   assert(frame.payload[2] === 3, 'Transport frame body 内容错误')
-  assert(frame.sequence === 7, 'Transport frame sequence 错误')
+  assert(
+    encodeTransportFrame(TransportFrameKind.CANCEL).byteLength === 1,
+    '无 payload 的 Transport frame 应只有 kind',
+  )
 }
 
 async function testTransportStatistics(): Promise<void> {
@@ -363,6 +361,17 @@ async function testSequentialReuse(): Promise<void> {
   transport.destroy()
 }
 
+async function testIdleConnectionRejectsUnexpectedFrame(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay)
+  await (await transport.request(new Request('https://example.com/complete'))).arrayBuffer()
+  const socket = relay.clients[0]
+  assert(socket !== undefined, '状态机测试没有创建 WebSocket')
+  socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, new Uint8Array([1])))
+  assert(socket.readyState === 3, 'idle 连接收到 response frame 后没有关闭')
+  transport.destroy()
+}
+
 async function testConcurrentGrowth(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
@@ -373,6 +382,56 @@ async function testConcurrentGrowth(): Promise<void> {
   relay.respond('https://example.com/hold/one')
   relay.respond('https://example.com/hold/two')
   await Promise.all([(await first).arrayBuffer(), (await second).arrayBuffer()])
+  transport.destroy()
+}
+
+async function testPendingAbortPreservesQueueOrder(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay, { maxConnections: 1 })
+  const first = transport.request(new Request('https://example.com/hold/first'))
+  const controller = new AbortController()
+  const canceled = transport.request(
+    new Request('https://example.com/hold/canceled', { signal: controller.signal }),
+  )
+  const last = transport.request(new Request('https://example.com/hold/last'))
+  await waitFor(() => relay.requests.length === 1)
+
+  controller.abort()
+  await assertRejectsAbort(canceled, '排队请求 Abort 后没有结束')
+  relay.respond('https://example.com/hold/first')
+  await (await first).arrayBuffer()
+  await waitFor(() => relay.requests.some(entry => entry.request.url.endsWith('/hold/last')))
+  assert(
+    !relay.requests.some(entry => entry.request.url.endsWith('/hold/canceled')),
+    '已取消的排队请求仍然进入连接',
+  )
+  relay.respond('https://example.com/hold/last')
+  await (await last).arrayBuffer()
+  assert(relay.clients.length === 1, '排队请求没有复用唯一连接')
+  transport.destroy()
+}
+
+async function testPendingRequestsUseFifoOrder(): Promise<void> {
+  const relay = new FakeRelay()
+  const transport = createTransport(relay, { maxConnections: 1 })
+  const first = transport.request(new Request('https://example.com/hold/first'))
+  const second = transport.request(new Request('https://example.com/hold/second'))
+  const third = transport.request(new Request('https://example.com/hold/third'))
+  await waitFor(() => relay.requests.some(entry => entry.request.url.endsWith('/hold/first')))
+
+  relay.respond('https://example.com/hold/first')
+  await waitFor(() => relay.requests.some(entry => entry.request.url.endsWith('/hold/second')))
+  assert(
+    !relay.requests.some(entry => entry.request.url.endsWith('/hold/third')),
+    '第三个 pending 请求越过第二个请求执行',
+  )
+
+  relay.respond('https://example.com/hold/second')
+  await waitFor(() => relay.requests.some(entry => entry.request.url.endsWith('/hold/third')))
+  relay.respond('https://example.com/hold/third')
+  const responses = await Promise.all([first, second, third])
+  await Promise.all(responses.map(response => response.arrayBuffer()))
+  assert(relay.clients.length === 1, 'FIFO pending 请求没有复用唯一连接')
   transport.destroy()
 }
 
@@ -402,12 +461,30 @@ async function testAbortSendsCancelAndReusesConnection(): Promise<void> {
   await waitFor(() => relay.requests.length === 1)
   controller.abort()
   await assertRejectsAbort(response, '请求 Abort 没有结束 WebSocket 事务')
-  assert(relay.canceledSequences.length === 1, '请求 Abort 没有发送 CANCEL')
+  assert(relay.canceledRequests === 1, '请求 Abort 没有发送 CANCEL')
   assert(transport.getStatistics().canceledCount === 1, '请求 Abort 没有计入取消统计')
 
   const next = await transport.request(new Request('https://example.com/next'))
   assert(decode(await next.arrayBuffer()) === '/next', 'CANCELED 后连接没有恢复复用')
   assert(relay.clients.length === 1, 'CANCELED 后不应创建新连接')
+  transport.destroy()
+}
+
+async function testResponseEndConfirmsCancelRace(): Promise<void> {
+  const relay = new FakeRelay()
+  relay.ignoreCancel = true
+  const transport = createTransport(relay)
+  const controller = new AbortController()
+  const url = 'https://example.com/hold/cancel-end-race'
+  const response = transport.request(new Request(url, { signal: controller.signal }))
+  await waitFor(() => relay.requests.length === 1)
+
+  controller.abort()
+  await assertRejectsAbort(response, '取消请求没有立即结束')
+  relay.respondEnd(url)
+
+  await (await transport.request(new Request('https://example.com/reused-after-end'))).arrayBuffer()
+  assert(relay.clients.length === 1, 'RESPONSE_END 确认取消竞态后连接没有恢复复用')
   transport.destroy()
 }
 
@@ -419,7 +496,7 @@ async function testBodyCancelSendsCancel(): Promise<void> {
   relay.respondHead('https://example.com/hold/body-cancel', 10)
   const response = await responsePromise
   await response.body?.cancel()
-  assert(relay.canceledSequences.length === 1, 'response body cancel 没有发送 CANCEL')
+  assert(relay.canceledRequests === 1, 'response body cancel 没有发送 CANCEL')
   assert(transport.getStatistics().canceledCount === 1, 'body cancel 没有计入取消统计')
 
   await (await transport.request(new Request('https://example.com/reused'))).arrayBuffer()
@@ -440,7 +517,7 @@ async function testStreamingResponseLimit(): Promise<void> {
   assert(reader !== undefined, '超限测试没有 response body')
   relay.respondBody('https://example.com/hold/too-large', new Uint8Array([1, 2, 3, 4, 5]))
   await assertRejectsCode(reader.read(), 'response-too-large', '流式累计上限没有生效')
-  assert(relay.canceledSequences.length === 1, '流式响应超限没有发送 CANCEL')
+  assert(relay.canceledRequests === 1, '流式响应超限没有发送 CANCEL')
   transport.destroy()
 }
 
@@ -468,30 +545,30 @@ async function testMaximumReuse(): Promise<void> {
   transport.destroy()
 }
 
-async function testYoungestConnectionFirst(): Promise<void> {
+async function testMostRecentlyIdleConnectionFirst(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
   const first = transport.request(new Request('https://example.com/hold/old'))
   const second = transport.request(new Request('https://example.com/hold/young'))
   await waitFor(() => relay.requests.length === 2)
-  relay.respond('https://example.com/hold/old')
   relay.respond('https://example.com/hold/young')
+  relay.respond('https://example.com/hold/old')
   await Promise.all([first, second])
 
   const next = transport.request(new Request('https://example.com/hold/next'))
   await waitFor(() => relay.requests.some(entry => entry.request.url.endsWith('/hold/next')))
   const nextEntry = relay.requests.find(entry => entry.request.url.endsWith('/hold/next'))
-  assert(nextEntry?.socket === relay.clients[1], '新请求没有优先使用年龄最小的连接')
+  assert(nextEntry?.socket === relay.clients[0], '新请求没有优先使用最近完成请求的连接')
   relay.respond('https://example.com/hold/next')
   await next
   transport.destroy()
 }
 
-async function testIdleRetentionFloor(): Promise<void> {
+async function testRetainedIdleConnections(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay, {
     idleConnectionTimeoutMs: 5,
-    minIdleConnections: 2,
+    retainedIdleConnections: 2,
   })
   const requests = [
     transport.request(new Request('https://example.com/hold/1')),
@@ -505,17 +582,20 @@ async function testIdleRetentionFloor(): Promise<void> {
   await Promise.all(requests)
   await delay(50)
   const openConnections = relay.clients.filter(socket => socket.readyState === 1).length
-  assert(openConnections === 2, `空闲连接没有回收到 minIdleConnections, 当前 ${openConnections}`)
+  assert(
+    openConnections === 2,
+    `空闲连接没有回收到 retainedIdleConnections, 当前 ${openConnections}`,
+  )
   transport.destroy()
 }
 
-async function testMinimumIdleDoesNotPreconnect(): Promise<void> {
+async function testRetainedIdleConnectionsDoesNotPreconnect(): Promise<void> {
   const relay = new FakeRelay()
-  const transport = createTransport(relay, { minIdleConnections: 6 })
+  const transport = createTransport(relay, { retainedIdleConnections: 6 })
   await delay(5)
-  assert(countClients(relay) === 0, 'minIdleConnections 不应主动创建连接')
+  assert(countClients(relay) === 0, 'retainedIdleConnections 不应主动创建连接')
   await (await transport.request(new Request('https://example.com/one'))).arrayBuffer()
-  assert(countClients(relay) === 1, '单个请求不应创建最低空闲数量的连接')
+  assert(countClients(relay) === 1, '空闲保留数量不应导致预连接')
   transport.destroy()
 }
 
@@ -594,6 +674,24 @@ async function testConnectionFactoryFailure(): Promise<void> {
   transport.destroy()
 }
 
+async function testConnectionFactoryFailureRejectsAllPendingRequests(): Promise<void> {
+  const transport = new WebSocketHttpTransport('wss://relay.example.com/transport', {
+    ...createOptions({ maxConnections: 1 }),
+    webSocketFactory: () => {
+      throw new Error('连接创建失败')
+    },
+  })
+  const results = await Promise.allSettled([
+    transport.request(new Request('https://example.com/first')),
+    transport.request(new Request('https://example.com/second')),
+  ])
+  assert(
+    results.every(result => result.status === 'rejected'),
+    'WebSocket 工厂持续失败时仍有 pending 请求没有结束',
+  )
+  transport.destroy()
+}
+
 async function testInvalidResponseLimit(): Promise<void> {
   const relay = new FakeRelay()
   const transport = createTransport(relay)
@@ -620,7 +718,7 @@ function createOptions(
     idleConnectionTimeoutMs: 60_000,
     maxConnections: 12,
     maxRequestsPerConnection: 50,
-    minIdleConnections: 0,
+    retainedIdleConnections: 0,
     ...overrides,
   }
 }
@@ -707,17 +805,22 @@ await testFetchTransport()
 await testWebSocketTransportStatistics()
 await testStreamingResponse()
 await testSequentialReuse()
+await testIdleConnectionRejectsUnexpectedFrame()
 await testConcurrentGrowth()
+await testPendingAbortPreservesQueueOrder()
+await testPendingRequestsUseFifoOrder()
 await testHeadContentLength()
 await testAbortSendsCancelAndReusesConnection()
+await testResponseEndConfirmsCancelRace()
 await testBodyCancelSendsCancel()
 await testStreamingResponseLimit()
 await testCancelTimeoutClosesConnection()
 await testMaximumReuse()
-await testYoungestConnectionFirst()
-await testIdleRetentionFloor()
-await testMinimumIdleDoesNotPreconnect()
+await testMostRecentlyIdleConnectionFirst()
+await testRetainedIdleConnections()
+await testRetainedIdleConnectionsDoesNotPreconnect()
 await testConnectionDiagnostics()
 await testDefaultConnectionLog()
 await testConnectionFactoryFailure()
+await testConnectionFactoryFailureRejectsAllPendingRequests()
 await testInvalidResponseLimit()
