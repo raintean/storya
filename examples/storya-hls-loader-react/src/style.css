@@ -1119,6 +1119,38 @@ select:disabled {
   letter-spacing: 0.06em;
 }
 
+.progressive-parameter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px;
+  margin-top: 10px;
+  background: rgb(98 245 178 / 3%);
+  border: 1px solid rgb(98 245 178 / 17%);
+}
+
+.progressive-parameter > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.progressive-parameter > div > span {
+  color: #739e8a;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+}
+
+.progressive-parameter > div > small {
+  color: #4f6158;
+  font-family: var(--mono);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
 .rescue-parameters {
   padding: 9px;
   margin-top: 10px;
@@ -1145,20 +1177,35 @@ select:disabled {
   letter-spacing: 0.12em;
 }
 
-.rescue-toggle {
+.setting-toggle {
   display: inline-flex;
   gap: 5px;
   align-items: center;
-  color: var(--violet);
   cursor: pointer;
   font-size: 8px;
   letter-spacing: 0.08em;
 }
 
-.rescue-toggle input {
+.setting-toggle input {
   width: 12px;
   height: 12px;
   margin: 0;
+}
+
+.progressive-toggle {
+  flex: none;
+  color: var(--green);
+}
+
+.progressive-toggle input {
+  accent-color: var(--green);
+}
+
+.rescue-toggle {
+  color: var(--violet);
+}
+
+.rescue-toggle input {
   accent-color: var(--violet);
 }
 

@@ -307,6 +307,8 @@ hls.js callback 始终在 `loader.update()` 之外调用, 避免 callback 重入
 
 progressive 由 hls.js 的 `progressive: true` 开启。当前 hls.js `BaseStreamController` 使用该配置决定是否把 progress callback 传给 `FragmentLoader`; `enableStreamingMode()` 检查的是通用 `config.loader` 而不是 `fLoader`, 因此配置自定义 fLoader 不会自动开启 progressive。开启后 hls.js 向 fLoader 提供 `onProgress` 和有限的 `highWaterMark`, fLoader 为每个 reader 独立维护已提交字节游标。
 
+example 提供可持久化的渐进式加载开关, 默认开启并在下一次加载会话生效。关闭时并行预加载和 Chunk 调度保持不变, fLoader 等待完整 Segment ready 后再通过 `onSuccess` 一次性交付。
+
 GET response head 的状态、Range 边界和可用 validator 校验通过后, Work 把每段 body 数据同步追加到 filling phase 的可增长 data buffer, `loadedBytes` 表示其中可读取的有效前缀。fLoader 可以跨 ready Chunk 和当前 filling Chunk 复制最长连续数据; 后续 Chunk 乱序先完成时必须等待前缀。连续新增数据达到 highWaterMark 后可以合并一次提交, Segment 最终 ready 时无条件刷新剩余尾部。`Content-Range` 不可见等无法在读取 body 前证明边界的响应不暴露 filling data, 仍等待完整校验成为 ready。
 
 stall/slow rescue 仍把当前 filling phase 释放为 empty 并从相同 Chunk 起点完整重下。fLoader 的已提交字节游标不回退; 新 attempt 的 filling data 尚未追上游标时不会重复提交, 超过游标后只提交新后缀。因此不跨 attempt 保留共享 data, 也不改变现有 Range 请求边界。
@@ -796,6 +798,7 @@ const diagnostics = loader.getDiagnostics()
 
 ## 修改历史
 
+- 2026-08-11: example 增加可持久化的渐进式加载开关, 默认开启; 关闭时保留并行预加载, 完整 Segment ready 后再一次性交付 hls.js。
 - 2026-08-10: 删除 HTTP Proxy Transport 注入路径, 保留 Browser Fetch 和 HTTP-over-WebSocket 两种网络实现。
 - 2026-08-09: main/audio Controller 在 seek 取消渐进 Fragment 后重置对应 transmuxer, 隔离同一 Fragment 重试的旧 partial parser 状态和延迟 Worker 结果。
 - 2026-08-09: fLoader 支持按 highWaterMark 有序提交已经通过响应头校验的连续 filling/ready 数据; rescue 重试依靠 reader 游标跳过已提交前缀, 最终从 canonical Segment 补齐尾部并以空 payload 完成; example 在并行模式下显式开启 hls.js progressive。

@@ -8,6 +8,7 @@ import {
 export interface ExampleSettings {
   loaderMode: LoaderMode
   loaderParameterInputs: LoaderParameterInputs
+  progressiveEnabled: boolean
   source: string
   transportMode: TransportMode
   workerUrl: string
@@ -50,6 +51,7 @@ export function createDefaultExampleSettings(): ExampleSettings {
       stallTimeoutMs: String(DEFAULT_RESCUE_OPTIONS.stallTimeoutMs),
       windowSize: String(DEFAULT_WINDOW_SIZE),
     },
+    progressiveEnabled: true,
     source: '',
     transportMode: 'fetch',
     workerUrl: '',
@@ -130,6 +132,10 @@ function parseStoredSettings(value: unknown, defaults: ExampleSettings): Example
       ),
       windowSize: stringOrDefault(inputs.windowSize, defaults.loaderParameterInputs.windowSize),
     },
+    progressiveEnabled:
+      typeof value.progressiveEnabled === 'boolean'
+        ? value.progressiveEnabled
+        : defaults.progressiveEnabled,
     source: stringOrDefault(value.source, defaults.source),
     transportMode:
       value.transportMode === 'fetch' || value.transportMode === 'websocket'

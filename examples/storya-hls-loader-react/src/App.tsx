@@ -125,8 +125,16 @@ export function App() {
   const playbackLevelIndexRef = useRef(-1)
   const rescueEventOutcomesRef = useRef(new Map<number, 'pending' | 'recovered'>())
   const [settings, setSettings] = useState(() => loadExampleSettings())
-  const { loaderMode, loaderParameterInputs, source, transportMode, workerUrl } = settings
+  const {
+    loaderMode,
+    loaderParameterInputs,
+    progressiveEnabled,
+    source,
+    transportMode,
+    workerUrl,
+  } = settings
   const [activeLoaderMode, setActiveLoaderMode] = useState<LoaderMode | null>(null)
+  const [activeProgressiveEnabled, setActiveProgressiveEnabled] = useState<boolean | null>(null)
   const [activeTransportMode, setActiveTransportMode] = useState<TransportMode | null>(null)
   const [activeLoaderParameters, setActiveLoaderParameters] = useState<LoaderParameters | null>(
     null,
@@ -271,6 +279,7 @@ export function App() {
       setDiagnostics(emptyDiagnostics)
       rescueEventOutcomesRef.current = new Map()
       setActiveLoaderMode(null)
+      setActiveProgressiveEnabled(null)
       setActiveTransportMode(null)
       setActiveLoaderParameters(null)
       setError(null)
@@ -320,7 +329,7 @@ export function App() {
           autoStartLoad: false,
           preferManagedMediaSource: true,
           preserveManualLevelOnError: true,
-          progressive: parallelLoader !== null,
+          progressive: parallelLoader !== null && progressiveEnabled,
           ...(parallelLoader === null
             ? {}
             : {
@@ -432,6 +441,7 @@ export function App() {
         hls.attachMedia(video)
         hls.loadSource(normalizedSource)
         setActiveLoaderMode(loaderMode)
+        setActiveProgressiveEnabled(loaderMode === 'parallel' ? progressiveEnabled : null)
         setActiveTransportMode(loaderMode === 'parallel' ? transportMode : null)
         setActiveLoaderParameters(loaderParameters)
         appendLog(
@@ -447,7 +457,7 @@ export function App() {
               ? 'rescue 关闭'
               : `rescue ${String(loaderParameters.rescue.maxAttempts)} 次, 停滞 ${String(loaderParameters.rescue.stallTimeoutMs)} ms, 慢速阈值 ${formatPercent(loaderParameters.rescue.slowRateThresholdRatio)}`
           appendLog(
-            `窗口 ${String(loaderParameters.windowSize)} 个 Segment, Chunk ${formatBytes(loaderParameters.chunkSize)}, ${rescueSummary}`,
+            `窗口 ${String(loaderParameters.windowSize)} 个 Segment, Chunk ${formatBytes(loaderParameters.chunkSize)}, 渐进提交${progressiveEnabled ? '开启' : '关闭'}, ${rescueSummary}`,
             'default',
             { tag: '调度策略' },
           )
@@ -479,6 +489,7 @@ export function App() {
       destroyPlaybackSession,
       loaderParameterInputs,
       loaderMode,
+      progressiveEnabled,
       source,
       transportMode,
       workerUrl,
@@ -828,13 +839,33 @@ export function App() {
                       </div>
                     </label>
                   </div>
+                  <div className="progressive-parameter">
+                    <div>
+                      <span>PROGRESSIVE DELIVERY</span>
+                      <small>边下载边向 hls.js 提交连续数据</small>
+                    </div>
+                    <label className="setting-toggle progressive-toggle">
+                      <input
+                        form="stream-source-form"
+                        type="checkbox"
+                        checked={progressiveEnabled}
+                        onChange={event =>
+                          setSettings(current => ({
+                            ...current,
+                            progressiveEnabled: event.target.checked,
+                          }))
+                        }
+                      />
+                      <span>{progressiveEnabled ? 'ENABLED' : 'DISABLED'}</span>
+                    </label>
+                  </div>
                   <div
                     className="rescue-parameters"
                     data-disabled={!loaderParameterInputs.rescueEnabled}
                   >
                     <div className="rescue-parameters-heading">
                       <span>REQUEST RESCUE</span>
-                      <label className="rescue-toggle">
+                      <label className="setting-toggle rescue-toggle">
                         <input
                           form="stream-source-form"
                           type="checkbox"
@@ -947,6 +978,16 @@ export function App() {
                     {activeLoaderParameters === null
                       ? '—'
                       : `${String(activeLoaderParameters.windowSize - 1)} segments`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>PROGRESSIVE</dt>
+                  <dd>
+                    {activeProgressiveEnabled === null
+                      ? '—'
+                      : activeProgressiveEnabled
+                        ? 'ON'
+                        : 'OFF'}
                   </dd>
                 </div>
                 <div>
