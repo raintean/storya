@@ -80,7 +80,8 @@ class FakeRelay {
 
   respondBody(url: string, body: Uint8Array): void {
     const entry = this.findRequest(url)
-    entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, body))
+    entry.socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_BODY))
+    entry.socket.receive(body)
   }
 
   respondEnd(url: string): void {
@@ -176,8 +177,14 @@ class FakeWebSocket implements WebSocketLike {
     this.relay.accept(this, data)
   }
 
-  receive(data: Uint8Array<ArrayBuffer>): void {
-    this.emit('message', { data: data.buffer } as MessageEvent<ArrayBuffer>)
+  receive(data: Uint8Array): void {
+    const buffer =
+      data.buffer instanceof ArrayBuffer &&
+      data.byteOffset === 0 &&
+      data.byteLength === data.buffer.byteLength
+        ? data.buffer
+        : Uint8Array.from(data).buffer
+    this.emit('message', { data: buffer } as MessageEvent<ArrayBuffer>)
   }
 
   private emit(type: string, event: Event): void {
@@ -187,14 +194,14 @@ class FakeWebSocket implements WebSocketLike {
   }
 }
 
-function testTransportFrameBodyView(): void {
+function testTransportFramePayloadView(): void {
   const payload = new Uint8Array([1, 2, 3])
-  const message = encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, payload)
+  const message = encodeTransportFrame(TransportFrameKind.REQUEST_HEAD, payload)
   const frame = decodeTransportFrame(message)
   assert(message.byteLength === 4, 'Transport frame 应只有 1 字节固定头')
   assert(frame.payload.buffer === message.buffer, 'Transport frame 解码不应复制 body')
-  assert(frame.payload.byteLength === 3, 'Transport frame body 长度错误')
-  assert(frame.payload[2] === 3, 'Transport frame body 内容错误')
+  assert(frame.payload.byteLength === 3, 'Transport frame payload 长度错误')
+  assert(frame.payload[2] === 3, 'Transport frame payload 内容错误')
   assert(
     encodeTransportFrame(TransportFrameKind.CANCEL).byteLength === 1,
     '无 payload 的 Transport frame 应只有 kind',
@@ -367,7 +374,7 @@ async function testIdleConnectionRejectsUnexpectedFrame(): Promise<void> {
   await (await transport.request(new Request('https://example.com/complete'))).arrayBuffer()
   const socket = relay.clients[0]
   assert(socket !== undefined, '状态机测试没有创建 WebSocket')
-  socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_BODY, new Uint8Array([1])))
+  socket.receive(encodeTransportFrame(TransportFrameKind.RESPONSE_BODY))
   assert(socket.readyState === 3, 'idle 连接收到 response frame 后没有关闭')
   transport.destroy()
 }
@@ -798,7 +805,7 @@ function assert(condition: boolean, message: string): asserts condition {
   }
 }
 
-testTransportFrameBodyView()
+testTransportFramePayloadView()
 await testTransportStatistics()
 await testUnconsumedResponseStatistics()
 await testFetchTransport()

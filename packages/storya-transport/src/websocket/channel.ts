@@ -30,6 +30,7 @@ interface ActiveTransaction {
   reject: (reason: unknown) => void
   request: Request
   resolve: PendingWebSocketRequest['resolve']
+  responseBodyPending: boolean
   responseHeadReceived: boolean
   responseSettled: boolean
 }
@@ -106,6 +107,7 @@ export class WebSocketChannel {
       reject: pending.reject,
       request: pending.request,
       resolve: pending.resolve,
+      responseBodyPending: false,
       responseHeadReceived: false,
       responseSettled: false,
     }
@@ -225,6 +227,19 @@ export class WebSocketChannel {
   }
 
   private acceptFrame(data: ArrayBuffer | ArrayBufferView): void {
+    const active = this.active
+    if (active?.responseBodyPending === true) {
+      active.responseBodyPending = false
+      if (!active.cancelRequested) {
+        try {
+          this.acceptResponseBody(active, toUint8Array(data))
+        } catch (cause) {
+          this.closeWithError(asProtocolError(cause, '原始 response body 处理失败'))
+        }
+      }
+      return
+    }
+
     let frame
     try {
       frame = decodeTransportFrame(data)
@@ -235,18 +250,13 @@ export class WebSocketChannel {
       return
     }
 
-    const active = this.active
     if (active === undefined) {
       this.closeWithError(
         new HttpTransportFailure('protocol-error', '空闲 WebSocket 收到意外的 Transport frame'),
       )
       return
     }
-    if (
-      active.cancelRequested &&
-      (frame.kind === TransportFrameKind.RESPONSE_HEAD ||
-        frame.kind === TransportFrameKind.RESPONSE_BODY)
-    ) {
+    if (active.cancelRequested && frame.kind === TransportFrameKind.RESPONSE_HEAD) {
       return
     }
 
@@ -256,7 +266,8 @@ export class WebSocketChannel {
           this.acceptResponseHead(active, frame.payload)
           break
         case TransportFrameKind.RESPONSE_BODY:
-          this.acceptResponseBody(active, frame.payload)
+          assertEmptyPayload(frame.payload, 'RESPONSE_BODY')
+          this.acceptResponseBodyMarker(active)
           break
         case TransportFrameKind.RESPONSE_END:
           assertEmptyPayload(frame.payload, 'RESPONSE_END')
@@ -276,11 +287,7 @@ export class WebSocketChannel {
           )
       }
     } catch (cause) {
-      const error =
-        cause instanceof HttpTransportFailure
-          ? cause
-          : new HttpTransportFailure('protocol-error', 'Transport frame 处理失败', { cause })
-      this.closeWithError(error)
+      this.closeWithError(asProtocolError(cause, 'Transport frame 处理失败'))
     }
   }
 
@@ -352,6 +359,17 @@ export class WebSocketChannel {
       return
     }
     active.bodyController?.enqueue(payload)
+  }
+
+  private acceptResponseBodyMarker(active: ActiveTransaction): void {
+    if (active.cancelRequested) {
+      active.responseBodyPending = true
+      return
+    }
+    if (!active.responseHeadReceived || active.request.method === 'HEAD') {
+      throw new HttpTransportFailure('protocol-error', 'HTTP response body 早于 response head')
+    }
+    active.responseBodyPending = true
   }
 
   private acceptResponseEnd(active: ActiveTransaction): void {
@@ -519,4 +537,16 @@ function assertEmptyPayload(payload: Uint8Array, kind: string): void {
   if (payload.byteLength !== 0) {
     throw new HttpTransportFailure('protocol-error', `${kind} payload 必须为空`)
   }
+}
+
+function asProtocolError(cause: unknown, message: string): HttpTransportFailure {
+  return cause instanceof HttpTransportFailure
+    ? cause
+    : new HttpTransportFailure('protocol-error', message, { cause })
+}
+
+function toUint8Array(data: ArrayBuffer | ArrayBufferView): Uint8Array {
+  return data instanceof ArrayBuffer
+    ? new Uint8Array(data)
+    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
 }

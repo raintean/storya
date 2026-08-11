@@ -4,7 +4,6 @@ import {
   encodeTransportFrame,
   HttpRequestHeadSchema,
   HttpResponseHeadSchema,
-  TRANSPORT_FRAME_HEADER_SIZE,
   TransportErrorCode,
   TransportErrorSchema,
   TransportFrameKind,
@@ -25,7 +24,9 @@ interface RelayTransaction {
   transferredBytes: number
 }
 
-const responseBodyFrameBytes = 256 * 1024
+const responseBodyFrameBytes = 4 * 1024
+const responseBodyMaxReadBytes = 256 * 1024
+const responseBodyMarker = encodeTransportFrame(TransportFrameKind.RESPONSE_BODY)
 
 export function createWebSocketRelayResponse(request: Request, ctx: ExecutionContext): Response {
   const pair = new WebSocketPair()
@@ -194,16 +195,11 @@ class WebSocketRelaySession {
   ): Promise<void> {
     const reader = body.getReader({ mode: 'byob' })
     transaction.reader = reader
+    let readBytes = responseBodyFrameBytes
     while (this.isActive(transaction)) {
       const remainingWithOverflowByte = maxResponseBytes - transaction.transferredBytes + 1
-      const readSize = Math.min(responseBodyFrameBytes, remainingWithOverflowByte)
-
-      // 每个 frame 单次分配连续缓冲区，前 1 字节预留给协议头，避免 JS 层二次复制 body
-      const readBuffer = new Uint8Array(
-        new ArrayBuffer(TRANSPORT_FRAME_HEADER_SIZE + readSize),
-        TRANSPORT_FRAME_HEADER_SIZE,
-      )
-      const result = await reader.readAtLeast(readSize, readBuffer)
+      const readSize = Math.min(readBytes, remainingWithOverflowByte)
+      const result = await reader.readAtLeast(readSize, new Uint8Array(readSize))
       if (!this.isActive(transaction)) {
         return
       }
@@ -225,6 +221,7 @@ class WebSocketRelaySession {
         this.finish(transaction)
         return
       }
+      readBytes = Math.min(readBytes * 2, responseBodyMaxReadBytes)
     }
   }
 
@@ -286,18 +283,13 @@ class WebSocketRelaySession {
     this.socket.send(encodeTransportFrame(kind, payload))
   }
 
-  private sendResponseBody(payload: Uint8Array<ArrayBuffer>): void {
-    if (payload.byteOffset < TRANSPORT_FRAME_HEADER_SIZE) {
-      this.send(TransportFrameKind.RESPONSE_BODY, payload)
-      return
+  private sendResponseBody(payload: Uint8Array): void {
+    for (let offset = 0; offset < payload.byteLength; offset += responseBodyFrameBytes) {
+      this.socket.send(responseBodyMarker)
+      this.socket.send(
+        payload.subarray(offset, Math.min(offset + responseBodyFrameBytes, payload.byteLength)),
+      )
     }
-    const frame = new Uint8Array(
-      payload.buffer,
-      payload.byteOffset - TRANSPORT_FRAME_HEADER_SIZE,
-      payload.byteLength + TRANSPORT_FRAME_HEADER_SIZE,
-    )
-    frame[0] = TransportFrameKind.RESPONSE_BODY
-    this.socket.send(frame)
   }
 
   private sendError(code: TransportErrorCode, message: string): void {

@@ -51,22 +51,23 @@ connecting -> idle -> busy -> idle
 ```text
 client ---- REQUEST_HEAD -----------> Worker
 client <--- RESPONSE_HEAD ----------- Worker
-client <--- RESPONSE_BODY (0..N) ---- Worker
+client <--- RESPONSE_BODY marker ---- Worker
+client <--- raw body data (4 KiB) --- Worker
 client <--- RESPONSE_END ------------ Worker
 
 client ---- CANCEL -----------------> Worker
 client <--- CANCELED ---------------- Worker
 ```
 
-`ERROR` 可以在 response head 前终止请求，也可以在流式 body 期间终止响应。协议不携带 request ID 或 sequence，连接双方完全通过单事务状态机确定 frame 所属事务。客户端只有收到 `RESPONSE_END`、`ERROR` 或 `CANCELED` 后才会复用连接；Worker 在已有活动事务时收到新的 `REQUEST_HEAD` 会关闭连接。
+`RESPONSE_BODY` 是没有 payload 的 marker，其后必须紧跟一条原始二进制 body 数据消息。`ERROR` 可以在 response head 前终止请求，也可以在流式 body 期间终止响应。协议不携带 request ID 或 sequence，连接双方完全通过单事务状态机确定 frame 所属事务。客户端只有收到 `RESPONSE_END`、`ERROR` 或 `CANCELED` 后才会复用连接；Worker 在已有活动事务时收到新的 `REQUEST_HEAD` 会关闭连接。
 
 ## 二进制编码
 
-每个 frame 使用 1 字节固定头，只包含 `TransportFrameKind`。`REQUEST_HEAD`、`RESPONSE_HEAD` 和 `ERROR` payload 使用 Protobuf；`RESPONSE_BODY` payload 直接承载媒体字节；`RESPONSE_END`、`CANCEL` 和 `CANCELED` 没有 payload。
+每个控制 frame 使用 1 字节固定头，只包含 `TransportFrameKind`。`REQUEST_HEAD`、`RESPONSE_HEAD` 和 `ERROR` payload 使用 Protobuf；`RESPONSE_BODY`、`RESPONSE_END`、`CANCEL` 和 `CANCELED` 没有 payload。媒体字节作为 `RESPONSE_BODY` marker 后的独立原始二进制 WebSocket 消息传输，不经过 frame codec。
 
 `HttpRequestHead` 包含 method、URL、request headers 和 `max_response_bytes`。`HttpResponseHead` 包含 status、status text、最终 URL 和原始 response headers。协议为 `TransportError` 定义无效请求、不支持的 method、响应过大、上游失败和内部失败; 当前 Worker 实际发送无效请求、响应过大和上游失败三类。HTTP 4xx、5xx 仍然是正常 HTTP response。
 
-Worker 以 256 KiB 为目标读取上游 body。每个 frame 单次分配 header 和 body 的连续缓冲区，BYOB reader 直接写入 header 后方，填入 1 字节 kind 后将同一视图交给 WebSocket，避免在 JavaScript 层为发送 frame 再复制一次 body。该缓冲区发送后即丢弃，不尝试复用；Cloudflare runtime 和浏览器内部是否复制不属于协议保证。客户端 frame decoder 使用 `Uint8Array.subarray()` 暴露 payload，`ReadableStream` 继续传递该视图。最后一个 frame 可以小于 256 KiB。
+Worker 的 BYOB 读取目标在每个请求内从 4 KiB 开始，每次读取完成后翻倍为 8、16、32、64、128 KiB，达到 256 KiB 后保持不变。较小的首次读取用于尽早返回首个 body 数据块，后续逐步放大读取以减少异步读取次数。每次读取结果使用 `Uint8Array.subarray()` 拆分为共享同一底层 buffer 的 4 KiB 视图；每个视图先发送一条可复用的 `RESPONSE_BODY` marker，再将视图直接交给 WebSocket，不在 JavaScript 层为 body 分配 frame buffer 或复制媒体字节。Cloudflare runtime 和浏览器内部是否复制不属于协议保证。客户端收到 marker 后将下一条消息作为 body 数据直接交给 `ReadableStream`。最后一次读取可以小于当前目标，最后一条 body 数据消息可以小于 4 KiB。
 
 ## 流式 Response 与上层调度
 
@@ -84,7 +85,7 @@ Worker 在以下位置验证上限：
 
 - 上游 Content-Length 已知时，在读取 body 前拒绝超限响应。
 - Content-Length 未知或不可信时，累计读取不超过 `maxResponseBytes + 1`，多出的一个字节用于检测越界。
-- 客户端按累计收到的 body frame 字节再次验证本次请求上限。
+- 客户端按累计收到的原始 body 数据消息字节再次验证本次请求上限。
 
 HEAD 的 body 必须为空。当前生产 Chunk 默认为 2 MiB，因此正常媒体 Range 远低于协议硬上限。
 
@@ -110,7 +111,7 @@ Example 当前配置：
 
 - 最多 12 条连接。
 - 空闲连接保留数量为 6 条。
-- 每条连接最多处理 500 个请求。
+- 每条连接最多处理 100 个请求。
 - 空闲 30 秒后可以回收。
 - connect timeout 为 10 秒。
 - cancel timeout 为 10 秒。
@@ -120,7 +121,7 @@ Pending request 使用 FIFO 队列。分配 request 时优先选择最近完成�
 
 连接池只维护一个 idle timer，始终指向最久未使用且允许回收的连接；timer 到期后从最老的 idle 连接开始关闭，直到达到保留数量或剩余连接尚未超时。`retainedIdleConnections` 只表示空闲保留数量，不主动预建连接；故障或最大复用次数使连接数降低时也不补建。
 
-连接发送第 500 个 request 时标记 retiring。该 response 完成后关闭连接，不再接受新 request。连接池不再按绝对寿命回收连接，也不发送应用层心跳。
+连接发送第 100 个 request 时标记 retiring。该 response 完成后关闭连接，不再接受新 request。连接池不再按绝对寿命回收连接，也不发送应用层心跳。
 
 ## Relay 行为
 
@@ -130,7 +131,7 @@ Worker 使用带有 Cloudflare Fetch Cache 配置的 `fetch()` 回源，跟随�
 
 Worker 禁用 `permessage-deflate`。媒体通常已经压缩，重复压缩只会增加 CPU。
 
-Worker 使用 Paid 计划运行，CPU time 上限为 5 秒，单次调用 subrequest 上限为 1,000。生产入口只使用 Dashboard 管理的 Custom Domain，关闭 `workers.dev` 和 Preview URL；Wrangler 配置不声明 routes，避免覆盖 Dashboard 已有的 Custom Domain。
+Worker 使用 Paid 计划运行，CPU time 上限为 1 秒，单次调用 subrequest 上限为 200。该限制对应每条 WebSocket 最多复用 100 个请求，分别按实测平均 CPU 和正常单次 Fetch subrequest 保留约两倍容量。生产入口只使用 Dashboard 管理的 Custom Domain，关闭 `workers.dev` 和 Preview URL；Wrangler 配置不声明 routes，避免覆盖 Dashboard 已有的 Custom Domain。
 
 ## 可观测性
 
@@ -144,10 +145,15 @@ WebSocket Transport Worker 保留持久化 Workers Logs 和 invocation logs。�
 
 ## 实现状态
 
-Fetch、WebSocket Transport、统一请求/流量/缓存统计、Protobuf 控制帧、256 KiB 流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
+Fetch、WebSocket Transport、统一请求/流量/缓存统计、Protobuf 控制帧、4 KiB 到 256 KiB 动态 BYOB 读取与 4 KiB marker/raw body 消息的流式 Worker relay、CANCEL 和串行复用连接池均已实现。`ParallelSegmentLoader` 已接入统一 Transport, 并完成流式进度、响应头/完整请求超时、停滞补救和同期 GET 相对慢速补救。
 
 ## 修改历史
 
+- 2026-08-11: 每条 WebSocket 最大复用数调整为 100 后，Worker CPU time 和 subrequest 上限分别收紧为 1 秒和 200，按实测平均消耗保留约两倍容量。
+- 2026-08-11: Worker BYOB 读取改为每个请求从 4 KiB 开始逐次翻倍，最大 256 KiB，在尽早返回首个 body 数据块的同时逐步减少异步读取次数。
+- 2026-08-11: `RESPONSE_BODY` 改为可复用的空 marker，其后的 4 KiB raw body 消息直接引用 2 MiB BYOB 读取结果的子视图，移除 JavaScript 层的 body frame 分配与复制。
+- 2026-08-11: CPU 对比测试确认 `pipeTo()` 没有降低占用，Worker body relay 改为每次最多 BYOB 读取 2 MiB，再拆分为 4 KiB `RESPONSE_BODY` frame 发送。
+- 2026-08-11: Worker body relay 改用 `ReadableStream.pipeTo()` 和同步 `WritableStream.write()` 发送上游 chunk，删除显式 BYOB `readAtLeast()` 循环，用于验证减少业务代码 Promise resolve 对 CPU 占用的影响。
 - 2026-08-10: 客户端 WebSocket Transport 实现收敛到 `storya-transport/src/websocket` 子目录，与通用 HTTP 抽象、Fetch Transport 和统计实现分层。
 - 2026-08-10: WebSocket frame 删除只用于串行事务隔离的 sequence，固定头从 5 字节缩减为 1 字节；双方改由严格的单事务状态机和终止 frame 保证连接安全复用。
 - 2026-08-10: Worker body frame 从 128 KiB 调整为 256 KiB，并重构为单次分配连续缓冲区、避免 JavaScript 层二次复制；连接池改用 FIFO pending、MRU idle 和池级单 timer，`minIdleConnections` 重命名为 `retainedIdleConnections`。

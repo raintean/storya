@@ -80,7 +80,7 @@ const websocketConnectTimeoutMs = 10_000
 const websocketDefaultMaxResponseBytes = 32 * 1024 * 1024
 const websocketIdleConnectionTimeoutMs = 30_000
 const websocketMaxConnections = DEFAULT_MAX_CONCURRENCY * 2
-const websocketMaxRequestsPerConnection = 500
+const websocketMaxRequestsPerConnection = 100
 const websocketRetainedIdleConnections = 6
 
 const initialMetrics: PlaybackMetrics = {
